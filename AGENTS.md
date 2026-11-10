@@ -4,7 +4,9 @@
 - `cw.py` stays standard library only and runs on Python 3.8. Do not use 3.9+ APIs such as
   `str.removeprefix`, `Path.is_relative_to`, `zip(strict=)` or `match`.
 - `cw.py` never changes user files. Its one write is the picture from `report --svg`.
-  Session commands print numbers and paths, never transcript text.
+  Session commands print numbers and paths, never transcript text. `report`'s before and after
+  runs git through `_git` only (read-only, offline, git found on `PATH`) and writes old instruction
+  files only under a `TemporaryDirectory`, through `_rel_ok`.
 - The picture is drawn from the same dict as `report --json`, so the two never disagree.
   After changing it, run `python3 assets/make_report_demo.py` and look at both SVGs.
 - Exit codes: 0 ok, 1 a check failed, 2 bad input. A bad path must never exit 0 or 1.
@@ -38,3 +40,17 @@
   sat beside Codex's measured startup. Numbers that read as one row must come from one agent.
 - `--window` is Claude Code's window, which its logs lack. It once overrode the window Codex
   records, which hid a Codex listing over its real budget.
+- `git log --since` with a date before 1970 returns no commits, and tests use `--days 40000`
+  (1917). Leave `--since` out for windows that long.
+- A slimming found by the size of the entry files is checked against the real startup load of
+  the old commit: moving text into an `@import`ed file shrinks CLAUDE.md but loads the same.
+- A repo's own config can make read-only git run programs: `core.fsmonitor` (ls-files),
+  `log.showSignature` + `gpg.program` (log), and in a partial clone `cat-file` fetches missing
+  blobs, running `core.sshCommand`. Git older than 2.44 ignores `GIT_NO_LAZY_FETCH`, and a repo's
+  `protocol.ssh.allow=always` beats `-c protocol.allow=never`; only `GIT_ALLOW_PROTOCOL` wins.
+  `_git` turns each off; a test per hook fails without it.
+- The old-commit copy keeps in-repo links as links. Copying a linked file instead moved where its
+  `@imports` resolve and listed a self-linked rules folder twice. With `core.symlinks=false` a link
+  is a text file holding its target, and that text is what the agents read.
+- On Windows a bare `"git"` in `subprocess` runs a `git.exe` from the current folder, and a git
+  path with `\` or `C:` escapes a folder joined with it. Neither shows up on macOS or Linux.

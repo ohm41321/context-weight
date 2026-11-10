@@ -12,7 +12,9 @@ skill measures that load, cuts it, and proves the cut with numbers.
 The script is `scripts/cw.py` in this skill's directory. Resolve its absolute
 path from the location of this file. It needs Python 3.8+ and nothing else. It
 never changes the user's files, it prints numbers, never transcript content, and
-the one file it writes is the picture asked for with `--svg` or `--open`.
+the one file it writes is the picture asked for with `--svg` or `--open`. For
+`report`'s before and after it reads the repo's git history and copies an older
+commit's instruction files into a temporary folder that it deletes.
 
 **Live meter?** For "how full is my context right now", use the harness:
 Claude Code `/context`, Codex `/status`. This skill is about the repo and the
@@ -30,8 +32,12 @@ they can read the numbers at a glance; add `--open` to open it for them when the
 ask to see it. Use `--svg FILE` to choose the place, never a path inside the repo
 unless the user asks.
 
-The text output has four parts:
+The text output has up to five parts:
 
+- **Before and after**, when git shows a slimming: uncommitted changes that cut
+  the instruction files, or the newest commit or merge on the main line that
+  did. It shows this repo's files then and now, and measured startup in the
+  sessions before and after the change;
 - the instruction files each harness loads at startup, in estimated tokens;
 - the skill listing against each harness's budget;
 - measured session numbers for this repo;
@@ -108,12 +114,15 @@ re-sends everything before it.
   to CI or pre-commit. It exits 1 when the repo's instructions grow past the
   limit or when Codex would cut any of them off, and 2 when the path is wrong,
   so a typo never passes.
-- **After a few days of real use:** run
-  `cw.py sessions --project <name> --compare-at <date of the change>` and report
-  `start` and `start%` before and after.
+- **After a few days of real use:** run `cw.py report <repo>` again. It finds
+  the slimming in git by itself and prints **Before and after**. When you finish
+  slimming, tell the user: commit the change, work as usual for a few days, then
+  run `/context-weight` again to see the measured result. If the change it
+  picked is the wrong one, set the split with `--compare-at <date of the change>`.
+  A fast-forward merge keeps the branch commit's time, so pass the merge day.
 
-Do not claim realised savings until that last command has run on sessions from
-after the change.
+Do not claim realised savings while Before and after says "too early" or shows
+no sessions after the change: fewer than 3 sessions are too few to trust.
 
 ## Exit codes
 

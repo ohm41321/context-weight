@@ -3,9 +3,12 @@
 and how large its sessions grow.
 
 Harnesses: Claude Code, Codex, Gemini CLI, OpenCode.
-Reads instruction files, skill metadata and the token-usage numbers in local
-session logs. Never prints message content and never changes your files; the one
-file it writes is the picture you ask for with `report --svg`.
+Reads instruction files, skill metadata, the token-usage numbers in local
+session logs and, for `report`'s before and after, the repo's git history.
+Never prints message content and never changes your files; the one file it
+writes is the picture you ask for with `report --svg`. To weigh the instruction
+files of an older commit it copies them into a private temporary folder and
+deletes it afterwards.
 
   cw.py files    [PATH]          instruction files each harness loads at startup
   cw.py skills   [PATH]          skill listing size against each harness's budget
@@ -21,18 +24,21 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import fnmatch
 import glob
 import json
 import os
+import posixpath
 import re
 import statistics
+import subprocess
 import sys
 import tempfile
 import webbrowser
 from pathlib import Path
 from xml.sax.saxutils import escape
 
-VERSION = "0.2.2"
+VERSION = "0.3.0"
 HARNESSES = ("claude", "codex", "gemini", "opencode")
 
 CLAUDE_FILE_WARN_CHARS = 40_000   # Claude Code startup warning: "Large CLAUDE.md will impact performance"
@@ -403,16 +409,21 @@ def codex_files(cwd) -> dict:
     return {"files": out, "warnings": warnings, "notes": [f"project_doc_max_bytes={max_bytes:,}"]}
 
 
-def gemini_files(cwd) -> dict:
-    gd = home() / ".gemini"
-    names = ["GEMINI.md"]
+def _gemini_names() -> list[str]:
+    """Context file names Gemini CLI loads (settings `context.fileName`, default GEMINI.md)."""
     try:
-        settings = json.loads(read_text(gd / "settings.json") or "{}")
+        settings = json.loads(read_text(home() / ".gemini" / "settings.json") or "{}")
         fn = (settings.get("context") or {}).get("fileName") or settings.get("contextFileName")
         if fn:
-            names = [fn] if isinstance(fn, str) else [str(x) for x in fn]
+            return [fn] if isinstance(fn, str) else [str(x) for x in fn]
     except (ValueError, AttributeError):
         pass
+    return ["GEMINI.md"]
+
+
+def gemini_files(cwd) -> dict:
+    gd = home() / ".gemini"
+    names = _gemini_names()
     out, seen = [], set()
 
     def add(p: Path, role: str) -> None:
@@ -849,6 +860,668 @@ def group_sessions(sessions, since=None, until=None, project=None):
     return groups
 
 
+# --------------------------------------------------------------------------- before and after
+
+COMPARE_MIN_DROP_BYTES = 6_000  # about 2k tokens: a /retro line or a typo fix is not a slimming
+COMPARE_MIN_DROP_SHARE = 0.20   # and the files must shrink by at least a fifth
+COMPARE_MIN_SESSIONS = 3        # fewer sessions after a change are too few to trust
+_NULL_SHA = "0" * 40
+_SKIP_MODES = ("120000", "160000")  # symlinks and submodules carry no instruction text of their own
+_WIN_DEVICES = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}
+# Read-only and offline whatever the repo's own config says: no fsmonitor program, no signature
+# check program, no fetch of objects a partial clone lacks, no prompts, no pager.
+_GIT_FLAGS = ("--no-pager", "-c", "core.quotepath=off", "-c", "core.fsmonitor=false",
+              "-c", "log.showSignature=false", "-c", "protocol.allow=never")
+# GIT_ALLOW_PROTOCOL also beats a repo's protocol.<name>.allow on git older than 2.44, which
+# ignores GIT_NO_LAZY_FETCH.
+_GIT_ENV_SET = {"GIT_NO_LAZY_FETCH": "1", "GIT_ALLOW_PROTOCOL": "none", "GIT_TERMINAL_PROMPT": "0",
+                "GIT_OPTIONAL_LOCKS": "0"}
+_GIT_ENV_DROP = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_COMMON_DIR",
+                 "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_NAMESPACE", "GIT_CEILING_DIRECTORIES")
+_GIT_EXE: list = []
+
+
+def _git_exe() -> str | None:
+    """git's full path from the absolute PATH entries. A bare "git" on Windows first runs a
+    git.exe from the current folder, which may be the very repo being weighed."""
+    if not _GIT_EXE:
+        names = ("git.exe", "git") if os.name == "nt" else ("git",)
+        hit = None
+        for d in os.environ.get("PATH", "").split(os.pathsep):
+            if hit or not d or not os.path.isabs(d):
+                continue
+            for n in names:
+                p = os.path.join(d, n)
+                if os.path.isfile(p) and os.access(p, os.X_OK):
+                    hit = p
+                    break
+        _GIT_EXE.append(hit)
+    return _GIT_EXE[0]
+
+
+def _git(root, *args, data: bytes | None = None) -> bytes | None:
+    """Output of one git command run in `root`, or None when git or the repo is unavailable."""
+    exe = _git_exe()
+    if not exe:
+        return None
+    env = {k: v for k, v in os.environ.items() if k not in _GIT_ENV_DROP}
+    env.update(_GIT_ENV_SET)
+    try:
+        p = subprocess.run([exe, *_GIT_FLAGS, "-C", str(root), *args], input=data, env=env,
+                           stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=120)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return p.stdout if p.returncode == 0 else None
+
+
+def _instruction_names() -> set[str]:
+    """File names a harness loads by name, lower-cased: a case-insensitive disk (macOS, Windows)
+    loads claude.md as CLAUDE.md. A name that does not load on this disk is weeded out later,
+    when the old commit's files are scanned like the real ones."""
+    _, fallbacks = _codex_config()
+    return {n.lower() for n in ("CLAUDE.md", "CLAUDE.local.md", "AGENTS.md", "AGENTS.override.md",
+                                *fallbacks, *_gemini_names())}
+
+
+def _is_entry(rel: str, names: set[str]) -> bool:
+    low = rel.lower()
+    return posixpath.basename(low) in names or low.startswith(".claude/rules/") or "/.claude/rules/" in low
+
+
+def _load_dir(rel: str) -> str:
+    """The folder an entry file belongs to: CLAUDE.md, .claude/CLAUDE.md and .claude/rules/**
+    all belong to the folder that holds `.claude`."""
+    low = rel.lower()
+    if low.startswith(".claude/"):
+        return ""
+    i = low.find("/.claude/")
+    return rel[:i] if i >= 0 else posixpath.dirname(rel)
+
+
+class _Repo:
+    """One repo as the before and after sees it: which entry files load at startup from the
+    folder `here` (repo-relative, "" for the root), and how links are checked out."""
+
+    def __init__(self, root: Path, here: str, plain_links: bool):
+        self.root, self.here, self.plain_links = root, here, plain_links
+        self.names = _instruction_names()
+        # With core.symlinks=false (Git for Windows' default) a link is checked out as a small
+        # text file holding its target, and that text is what the agents read.
+        self.skip = ("160000",) if plain_links else ("120000", "160000")
+        self.listed = _opencode_patterns(read_text(root / "opencode.json"))  # files opencode.json lists
+
+    def on_path(self, rel: str) -> bool:
+        d = _load_dir(rel)
+        return d == "" or self.here == d or self.here.startswith(d + "/")
+
+    def loads(self, rel: str) -> bool:
+        """An entry file that loads at startup from `here`. Subfolder files load later, if at all."""
+        return (_is_entry(rel, self.names) and self.on_path(rel)) or any(rx.match(rel) for _, rx in self.listed)
+
+    def link_spot(self, rel: str) -> bool:
+        """A link here can change what loads, though its own size says nothing about it."""
+        low = rel.lower()
+        return self.loads(rel) or ((low == ".claude/rules" or low.endswith("/.claude/rules"))
+                                   and self.on_path(rel + "/x"))
+
+
+def _links_now(repo: _Repo, rels) -> dict[str, str]:
+    out = {}
+    if repo.plain_links:
+        return out
+    for rel in rels:
+        p = repo.root / rel
+        if repo.link_spot(rel) and os.path.islink(p):
+            try:
+                out[rel] = os.readlink(str(p)).replace(os.sep, "/")
+            except OSError:
+                pass
+    return out
+
+
+def _links_at(repo: _Repo, items) -> dict[str, str] | None:
+    if repo.plain_links:
+        return {}
+    ids = {rel: sha for mode, sha, rel in items if mode == "120000" and repo.link_spot(rel)}
+    blobs = _blobs(repo.root, ids.values())
+    if blobs is None:
+        return None
+    return {rel: blobs[sha].decode("utf-8", errors="replace") for rel, sha in ids.items()}
+
+
+def _rel_ok(rel: str) -> bool:
+    """A repo path that stays inside the copy on every OS: not absolute, no `.` or `..`, and no
+    backslash or colon, which Windows reads as a separator or a drive."""
+    if not rel or rel.startswith("/"):
+        return False
+    for part in rel.split("/"):
+        if part in ("", ".", "..") or "\\" in part or ":" in part or "\0" in part:
+            return False
+        if os.name == "nt" and part.split(".")[0].upper() in _WIN_DEVICES:
+            return False
+    return True
+
+
+def _in_repo(rel_dir: str, target: str) -> str | None:
+    """`target` (a link or an import, relative to `rel_dir`) as a repo path, or None when it leaves the repo."""
+    if not target or target.startswith("/") or "\\" in target:
+        return None
+    t = posixpath.normpath(posixpath.join(rel_dir, target))
+    return None if t in (".", "..") or t.startswith("../") else t
+
+
+def _glob_loose(pattern: str):
+    """A regex matching at least the repo paths glob.glob(pattern, recursive=True) matches. A
+    file it matches beyond those only costs a copy: the copy's own scan decides what loads."""
+    pattern = re.sub(r"\[[^\]/]*\]", "?", pattern)
+    rx = re.escape(pattern).replace(r"\*\*/", "(?:.*/)?").replace(r"\*", ".*").replace(r"\?", ".")
+    return re.compile(rx + r"\Z", re.S)
+
+
+def _opencode_patterns(text: str | None) -> list:
+    """(pattern, loose regex) for each repo path in opencode.json's `instructions`."""
+    try:
+        patterns = _dict(json.loads(text or "{}")).get("instructions")
+    except ValueError:
+        return []
+    out = []
+    for pat in patterns if isinstance(patterns, list) else []:
+        if isinstance(pat, str) and "://" not in pat and not pat.startswith(("~", "/")):
+            pat = posixpath.normpath(pat)
+            if pat not in (".", "..") and not pat.startswith("../"):
+                out.append((pat, _glob_loose(pat)))
+    return out
+
+
+def _tree(root, rev: str) -> list[tuple[str, str, str]] | None:
+    """(mode, blob id, path) for every file in `rev`."""
+    out = _git(root, "ls-tree", "-r", "-z", rev)
+    if out is None:
+        return None
+    items = []
+    for rec in out.split(b"\0"):
+        meta, _, path = rec.partition(b"\t")
+        bits = meta.split()
+        if len(bits) != 3 or bits[1] != b"blob":
+            continue
+        items.append((bits[0].decode(), bits[2].decode(), path.decode("utf-8", errors="replace")))
+    return items
+
+
+def _tree_size(repo: _Repo, items) -> int:
+    entries = [sha for mode, sha, rel in items if mode not in repo.skip and repo.loads(rel)]
+    sizes = _blob_sizes(repo.root, entries)
+    return sum(sizes.get(sha, 0) for sha in entries)
+
+
+def _blob_sizes(root, shas) -> dict[str, int]:
+    shas = sorted({x for x in shas if x and x != _NULL_SHA})
+    if not shas:
+        return {}
+    out = _git(root, "cat-file", "--batch-check=%(objectname) %(objectsize)", data=("\n".join(shas) + "\n").encode())
+    sizes = {}
+    for line in (out or b"").decode(errors="replace").splitlines():
+        bits = line.split()
+        if len(bits) == 2 and bits[1].isdigit():
+            sizes[bits[0]] = int(bits[1])
+    return sizes
+
+
+def _blobs(root, shas) -> dict[str, bytes] | None:
+    """Contents of blobs by id; None when git fails or any blob is missing (a partial clone)."""
+    shas = sorted(set(shas))
+    if not shas:
+        return {}
+    out = _git(root, "cat-file", "--batch", data=("\n".join(shas) + "\n").encode())
+    if out is None:
+        return None
+    blobs, i = {}, 0
+    while i < len(out):
+        nl = out.find(b"\n", i)
+        if nl < 0:
+            return None
+        head = out[i:nl].split()
+        if len(head) != 3 or not head[2].isdigit():
+            return None  # "<id> missing": weighing without it would understate the old load
+        size = int(head[2])
+        blobs[head[0].decode()] = out[nl + 1: nl + 1 + size]
+        i = nl + 1 + size + 1
+    return blobs if len(blobs) == len(shas) else None
+
+
+def _history(repo: _Repo, head_size: int, since: str | None) -> list[dict]:
+    """Main-line commits since `since` that changed an entry file, newest first, with the size
+    of the entry files that load from `here` before and after each one, and whether it changed a
+    link that can change what loads. A merge counts as one change against its first parent, so
+    a slimming reviewed on a branch lands on the day it reached the main line."""
+    specs = [f":(glob,icase)**/{n}" for n in sorted(repo.names)] + [":(glob,icase)**/.claude/rules/**",
+                                                                      ":(glob,icase)**/.claude/rules"]
+    specs += [":(glob)" + pat for pat, _ in repo.listed] + (["opencode.json"] if repo.listed else [])
+    window = [f"--since={since}"] if since else []  # git finds nothing for a date before 1970
+    out = _git(repo.root, "log", "--first-parent", "-m", "--no-renames", "--raw", "-z", "--no-abbrev", *window,
+               "--format=%x01%H %cI", "HEAD", "--", *specs)
+    if out is None:
+        return []
+    commits, cur = [], None
+    fields = out.decode("utf-8", errors="replace").split("\0")
+    i = 0
+    while i < len(fields):
+        rec = fields[i].lstrip("\n")
+        i += 1
+        if rec.startswith("\x01"):
+            sha, _, date = rec[1:].partition(" ")
+            cur = {"sha": sha, "date": date.strip(), "blobs": [], "links": False}
+            commits.append(cur)
+        elif rec.startswith(":") and cur is not None and i < len(fields):
+            bits, path = rec.split(), fields[i]
+            i += 1
+            if len(bits) < 4:
+                continue
+            old_mode, new_mode = bits[0][1:], bits[1]
+            if repo.loads(path):
+                cur["blobs"].append((old_mode, new_mode, bits[2], bits[3]))
+            if "120000" in (old_mode, new_mode) and not repo.plain_links and repo.link_spot(path):
+                cur["links"] = True
+    sizes = _blob_sizes(repo.root, [x for c in commits for b in c["blobs"] for x in (b[2], b[3])])
+    after = head_size
+    for c in commits:
+        delta = 0
+        for old_mode, new_mode, old, new in c.pop("blobs"):
+            if new_mode not in repo.skip:
+                delta += sizes.get(new, 0)
+            if old_mode not in repo.skip:
+                delta -= sizes.get(old, 0)
+        c["after"], c["before"] = after, after - delta
+        after = c["before"]
+    return commits
+
+
+def _is_cut(before: int, after: int, floor: int = COMPARE_MIN_DROP_BYTES) -> bool:
+    return before - after >= floor and after <= before * (1 - COMPARE_MIN_DROP_SHARE)
+
+
+def _work_files(root) -> tuple[set[str], set[str], list[str]] | None:
+    """Tracked files and untracked files git does not ignore, as repo paths, and the ignored
+    files and folders (folders end in "/")."""
+    tracked = _git(root, "ls-files", "-z", "--cached")
+    other = _git(root, "ls-files", "-z", "--others", "--exclude-standard")
+    ignored = _git(root, "ls-files", "-z", "--others", "--ignored", "--exclude-standard", "--directory")
+    if tracked is None or other is None or ignored is None:
+        return None
+    split = lambda b: [x.decode("utf-8", errors="replace") for x in b.split(b"\0") if x]
+    return set(split(tracked)), set(split(other)), split(ignored)
+
+
+def _work_size(repo: _Repo, rels) -> int:
+    total = 0
+    for rel in rels:
+        p = repo.root / rel
+        if repo.loads(rel) and (repo.plain_links or not os.path.islink(p)) and _is_file(p):
+            try:
+                total += p.stat().st_size
+            except OSError:
+                pass
+    return total
+
+
+def _materialize(repo: _Repo, rev: str, dest: Path) -> bool:
+    """Copy what loads at startup in `rev` under `dest`, marked as a repo root: the entry files,
+    then what they @import and what opencode.json lists, hop by hop. Links inside the repo are
+    made again as links, so imports and folders resolve as in a checkout; where the system
+    cannot make links, the linked files are copied. Nothing is written outside `dest`."""
+    root = repo.root
+    items = _tree(root, rev)
+    if items is None:
+        return False
+    files = {rel: sha for mode, sha, rel in items if mode not in repo.skip}
+    link_ids = {} if repo.plain_links else {rel: sha for mode, sha, rel in items if mode == "120000"}
+    link_text = _blobs(root, link_ids.values())
+    if link_text is None:
+        return False
+    targets = {rel: _in_repo(posixpath.dirname(rel),
+                             link_text[sha].decode("utf-8", errors="replace").strip("\n"))
+               for rel, sha in link_ids.items()}
+
+    def resolve(rel: str, hops: int = 0) -> str | None:
+        """The regular file `rel` names, following links inside the repo."""
+        if rel in files or hops > 8:
+            return rel if rel in files else None
+        parts = rel.split("/")
+        for i in range(len(parts), 0, -1):  # the file itself, then each folder above it
+            head = "/".join(parts[:i])
+            if head in targets:
+                t = targets[head]
+                return resolve("/".join([t, *parts[i:]]), hops + 1) if t else None
+        return None
+
+    want = [rel for rel in files if repo.loads(rel)] + [rel for rel in targets if repo.loads(rel)]
+    for link, t in targets.items():  # a linked folder on the load path, such as .claude/rules
+        here = posixpath.dirname(link)
+        if not t or t in files or not repo.on_path(link + "/x") or here == t or here.startswith(t + "/"):
+            continue  # a link to its own folder or above would only list the same files again
+        want += [link + rel[len(t):] for rel in files
+                 if rel.startswith(t + "/") and repo.loads(link + rel[len(t):])]
+    cfg_id = files.get("opencode.json")
+    if cfg_id:
+        want.append("opencode.json")
+        cfg = _blobs(root, [cfg_id]) or {}
+        for _, rx in _opencode_patterns(cfg.get(cfg_id, b"").decode("utf-8", errors="replace")):
+            want += [rel for rel in files if rx.match(rel)]
+
+    # 1. Pick the files: what loads, then what that imports, as far as Claude Code follows imports.
+    bodies: dict[str, bytes] = {}
+    aliases: dict[str, str] = {}  # a path that runs through a link -> the file it reaches
+    seen: set[str] = set()
+    queue = list(dict.fromkeys(want))
+    for _ in range(CLAUDE_IMPORT_DEPTH + 2):
+        todo = []
+        for rel in queue:
+            if rel not in seen and _rel_ok(rel):
+                seen.add(rel)
+                src = resolve(rel)
+                if src and _rel_ok(src):
+                    todo.append((rel, src))
+        if not todo:
+            break
+        got = _blobs(root, [files[src] for _, src in todo if src not in bodies])
+        if got is None:
+            return False
+        queue = []
+        for rel, src in todo:
+            bodies.setdefault(src, got.get(files[src], b""))
+            if rel != src:
+                aliases[rel] = src
+            body = bodies[src]
+            if b"\0" in body[:4096]:
+                continue
+            text = _INLINE.sub("", _FENCE.sub("", body.decode("utf-8", errors="replace")))
+            for m in _IMPORT.finditer(text):
+                ref = m.group(1).replace("\\ ", " ")
+                for d in {posixpath.dirname(rel), posixpath.dirname(src)}:  # either way a link may read
+                    t = _in_repo(d, ref)
+                    if t:
+                        queue.append(t)
+
+    # 2. Write the regular files. No link exists yet, so no write can pass through one.
+    base = os.path.realpath(str(dest))
+
+    def inside(p: str) -> bool:
+        try:
+            return os.path.commonpath([base, os.path.realpath(p)]) == base
+        except ValueError:  # another drive on Windows
+            return False
+
+    def put(rel: str, body: bytes) -> None:
+        p = os.path.join(base, *rel.split("/"))
+        try:
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            if inside(os.path.dirname(p)) and not os.path.lexists(p):
+                with open(p, "wb") as fh:
+                    fh.write(body)
+        except (OSError, ValueError):
+            pass
+
+    os.makedirs(os.path.join(base, ".git"), exist_ok=True)
+    for src, body in sorted(bodies.items()):
+        put(src, body)
+
+    # 3. Make the links again, shallowest first, then drop any that leads out of the copy.
+    made, failed = [], False
+    for link in sorted(targets, key=lambda r: (r.count("/"), r)):
+        t = targets[link]
+        if not t or not _rel_ok(link):
+            continue
+        p = os.path.join(base, *link.split("/"))
+        rel_target = posixpath.relpath(t, posixpath.dirname(link) or ".")
+        try:
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            if not inside(os.path.dirname(p)) or os.path.lexists(p):
+                continue
+            os.symlink(rel_target.replace("/", os.sep), p, target_is_directory=t not in files)
+            made.append(p)
+        except (OSError, NotImplementedError, ValueError):
+            failed = True
+    while True:
+        out = [p for p in made if not inside(p)]
+        if not out:
+            break
+        for p in out:
+            os.unlink(p)
+            made.remove(p)
+    if failed and not made:  # no links on this system: copy what the links would have shown
+        for rel, src in sorted(aliases.items()):
+            put(rel, bodies[src])
+    return True
+
+
+def _repo_load(scan: dict, root: Path, ignored: list[str] | None):
+    """Tokens each harness loads from the repo, and the size of each repo file, from a scan.
+    Files git ignores (CLAUDE.local.md and the like) are left out when `ignored` lists them."""
+    per_harness: dict[str, int] = {}
+    per_file: dict[str, int] = {}
+    root = root.resolve()
+    skip = set(ignored or ())
+    folders = [d for d in skip if d.endswith("/")]
+    for h in HARNESSES:
+        r = scan.get(h)
+        if not r:
+            continue
+        total = 0
+        for e in r["files"]:
+            if not _inside(e["path"], root):
+                continue
+            p = Path(e["path"])
+            try:
+                rel = p.relative_to(root).as_posix()  # a linked file keeps its own name
+            except ValueError:
+                rel = p.resolve().relative_to(root).as_posix()
+            if rel in skip or any(rel.startswith(d) for d in folders):
+                continue
+            total += e["tokens"]
+            per_file[rel] = max(per_file.get(rel, 0), e.get("file_tokens", e["tokens"]))
+        per_harness[h] = total
+    return per_harness, per_file
+
+
+def _when(ts: str) -> dt.datetime | None:
+    try:
+        t = dt.datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return t if t.tzinfo else t.replace(tzinfo=dt.timezone.utc)
+
+
+def _snapshot_load(repo: _Repo, rev: str, hs):
+    """Repo tokens each harness would load at `rev`, from its files copied to a temporary folder."""
+    seen_unreadable = len(UNREADABLE)
+    try:
+        with tempfile.TemporaryDirectory(prefix="context-weight-before-") as tmp:
+            dest = Path(tmp) / (repo.root.name or "repo")
+            if not _materialize(repo, rev, dest):
+                return None
+            cwd = dest.joinpath(*repo.here.split("/")) if repo.here else dest
+            try:
+                cwd.mkdir(parents=True, exist_ok=True)
+            except OSError:  # the folder was a link that leads nowhere in the old commit
+                cwd = dest
+            return _repo_load(scan_files(str(cwd), hs), dest, None)
+    finally:
+        del UNREADABLE[seen_unreadable:]  # the copies are gone; warn only about the real files
+
+
+def _loads_less(before: dict, after: dict) -> bool:
+    """Did some harness's startup load from the repo really shrink? Moving text into a file
+    that is still @imported, or into a CLAUDE.local.md git ignores, shrinks the entry files
+    but not what loads."""
+    return any(_is_cut(before.get(h, 0), after.get(h, 0), COMPARE_MIN_DROP_BYTES // 3) for h in before)
+
+
+def compare(path, hs, files_now: dict, sessions, days: int, threshold: int, at_date: str | None = None):
+    """Before and after the last cut of this repo's instruction files.
+
+    The cut is found in git: uncommitted changes that shrink the entry files that load from
+    `path`, else the newest main-line commits in the window that shrank them by
+    COMPARE_MIN_DROP_BYTES and a fifth or changed a link on the load path, and the first of
+    those whose startup load really dropped. `at_date` (YYYY-MM-DD) sets the split instead.
+    Sizes before come from git; session numbers on each side come from the logs. Returns None
+    when there is nothing to compare."""
+    root = git_root(path)
+    top = _git(root, "rev-parse", "--show-toplevel") if root else None
+    if top is None or Path(top.decode(errors="replace").strip()).resolve() != root.resolve() or \
+            _git(root, "rev-parse", "--verify", "-q", "HEAD^{commit}") is None:
+        if at_date:
+            raise UsageError("--compare-at needs git and a git repository with at least one commit")
+        return None
+    root = root.resolve()
+    try:
+        here = Path(path).resolve().relative_to(root).as_posix()
+    except ValueError:
+        here = "."
+    plain = (_git(root, "config", "--bool", "core.symlinks") or b"").strip() == b"false"
+    repo = _Repo(root, "" if here == "." else here, plain)
+    work = _work_files(root)
+    if work is None:
+        return None
+    tracked, other, ignored = work
+    after, after_files = _repo_load(files_now, root, ignored)
+    after_all, after_all_files = _repo_load(files_now, root, None)
+    now = dt.datetime.now().astimezone()
+    candidates = []  # (found, rev to weigh as before, split time, commit)
+    if at_date:
+        try:
+            at = dt.datetime.combine(dt.date.fromisoformat(at_date), dt.time()).astimezone()
+        except (ValueError, OverflowError, OSError):
+            raise UsageError(f"--compare-at {at_date}: date out of range")
+        rev = (_git(root, "rev-list", "-1", "--first-parent", f"--before={at.isoformat()}", "HEAD")
+               or b"").decode().strip()
+        if not rev:
+            raise UsageError(f"--compare-at {at_date}: no commit on this branch before that day")
+        candidates.append(("date", rev, at, None))
+    else:
+        head = _tree(root, "HEAD")
+        if head is None:
+            return None
+        head_size = _tree_size(repo, head)
+        relinked = _links_at(repo, head) != _links_now(repo, tracked | other)
+        if relinked or _is_cut(head_size, _work_size(repo, tracked | other)):
+            candidates.append(("uncommitted", "HEAD", now, None))
+        start = now - dt.timedelta(days=days) if days < 365 * 50 else None  # git finds nothing before 1970
+        cuts = links = 0
+        for c in _history(repo, head_size, start.isoformat() if start else None):
+            if cuts >= 3 and links >= 3:
+                break
+            is_cut = _is_cut(c["before"], c["after"])
+            if not ((is_cut and cuts < 3) or (c["links"] and not is_cut and links < 3)):
+                continue
+            parent = _git(root, "rev-parse", "--verify", "-q", c["sha"] + "^1")
+            when = _when(c["date"])
+            if parent and when:
+                cuts, links = cuts + is_cut, links + (not is_cut)
+                candidates.append(("commit", parent.decode().strip(), when, c["sha"]))
+    for found, rev, at, commit in candidates:
+        snap = _snapshot_load(repo, rev, hs)
+        if snap and (found == "date" or _loads_less(snap[0], after_all)):
+            before, before_files = snap
+            break
+    else:
+        return None
+    changed = [{"path": rel, "before": before_files.get(rel, 0), "after": after_files.get(rel, 0)}
+               for rel in set(before_files) | set(after_files)
+               if before_files.get(rel, 0) != after_files.get(rel, 0)]
+    changed.sort(key=lambda x: (-abs(x["after"] - x["before"]), x["path"]))
+    key = str(root)
+    mine = [(s, _when(s.start)) for s in sessions if s.reqs and project_key(s.cwd) == key]
+    try:
+        lo = at - dt.timedelta(days=days)
+    except OverflowError:
+        lo = dt.datetime.min.replace(tzinfo=dt.timezone.utc)
+    sess = {}
+    for h in hs:
+        b = [s for s, t in mine if s.harness == h and t and lo <= t < at]
+        a = [s for s, t in mine if s.harness == h and t and t >= at]
+        if b or a:
+            sess[h] = {"before": summarize(b, threshold), "after": summarize(a, threshold)}
+    return {
+        "found": found,
+        "at": at.isoformat(timespec="minutes"),  # a commit keeps the offset it was made in
+        "commit": commit[:7] if commit else None,
+        "before_ref": "HEAD" if found == "uncommitted" else rev[:7],
+        "files": {h: {"before": before.get(h, 0), "after": after.get(h, 0)} for h in hs
+                  if before.get(h, 0) or after.get(h, 0)},
+        "changed": changed[:5],
+        "untracked": sorted(rel for rel in after_files if rel in other) if found != "uncommitted" else [],
+        "ignored": [{"path": rel, "tokens": after_all_files[rel]} for rel in sorted(after_all_files)
+                    if rel not in after_files],
+        "sessions": sess,
+        "days": days,
+        "min_sessions": COMPARE_MIN_SESSIONS,
+    }
+
+
+def _compare_label(c: dict) -> str:
+    when = c["at"][:16].replace("T", " ")
+    if c["found"] == "uncommitted":
+        return "uncommitted changes against the last commit"
+    if c["found"] == "commit":
+        return f"commit {c['commit']}, {when}"
+    return f"split at {c['at'][:10]}, --compare-at"
+
+
+def _compare_agents(c: dict) -> list[str]:
+    return [h for h in HARNESSES if h in c["files"] or h in c["sessions"]]
+
+
+def _compare_status(c: dict, h: str) -> tuple[str | None, str]:
+    """(badge kind or None, words) for one agent's sessions on each side of the change."""
+    s = c["sessions"].get(h) or {}
+    b, a = s.get("before"), s.get("after")
+    if not (b or a):
+        return None, "no sessions on either side"
+    if not a:
+        return None, "no sessions after the change yet"
+    n = a["sessions"]
+    if n < c["min_sessions"]:
+        return "warn", f"{n} session{'' if n == 1 else 's'} after: too early to trust"
+    if not b:
+        return None, f"{n} sessions after, none before in this window"
+    m = b["sessions"]
+    return "good", f"{m} session{'' if m == 1 else 's'} before, {n} after"
+
+
+def _compare_hint(c: dict) -> str | None:
+    if c["found"] == "uncommitted":
+        return "Commit the change, work as usual for a few days, then run the report again."
+    if any(_compare_status(c, h)[0] != "good" for h in c["sessions"]):
+        return "Work as usual for a few days, then run the report again for the measured numbers."
+    return None
+
+
+def print_compare(c: dict) -> None:
+    print(f"## Before and after ({_compare_label(c)})")
+    print(f"files = this repo's instruction files, estimated tokens; startup and median = measured "
+          f"sessions, the {c['days']} days before the change against everything since")
+    for h in _compare_agents(c):
+        f = c["files"].get(h, {"before": 0, "after": 0})
+        line = f"{h:8} files {fmt_k(f['before'])} -> {fmt_k(f['after'])}"
+        s = c["sessions"].get(h) or {}
+        b, a = s.get("before"), s.get("after")
+        if b and a:
+            line += (f"   startup {fmt_k(b['baseline_median'])} -> {fmt_k(a['baseline_median'])}"
+                     f"   median {fmt_k(b['ctx_median'])} -> {fmt_k(a['ctx_median'])}")
+        print(f"{line}   ({_compare_status(c, h)[1]})")
+    if c["changed"]:
+        print("changed: " + ", ".join(f"{x['path']} {fmt_k(x['before'])} -> {fmt_k(x['after'])}"
+                                      for x in c["changed"]))
+    if c["untracked"]:
+        print("not committed yet, so teammates do not get it: " + ", ".join(c["untracked"]))
+    if c["ignored"]:
+        print("left out because git ignores them, so the old commit cannot show them: " +
+              ", ".join(f"{x['path']} {fmt_k(x['tokens'])}" for x in c["ignored"]))
+    hint = _compare_hint(c)
+    if hint:
+        print(hint)
+
+
 # --------------------------------------------------------------------------- output
 
 def print_files(result: dict) -> None:
@@ -1116,6 +1789,45 @@ def render_svg(rep: dict, theme: str = "auto") -> str:
         g.text(x, y + 74, _fit(note, tile_w - 20, 12, left=False), 12, "s")
     y = hero_top + 118
     g.line(L, y, R, y, "hl")
+
+    # before and after the last slimming, when git shows one
+    c = rep.get("compare")
+    if c:
+        y += 38
+        g.text(L, y, "Before and after", 17, "b")
+        g.text(R, y, _fit(_compare_label(c), 420, 13), 13, "m r")
+        y += 20
+        g.text(L, y, f"This repo's instruction files before the change and now. Sessions: the {c['days']} days "
+                     "before it against everything since.", 13, "m")
+        y += 30
+        cx_files, cx_start, cx_status = L + 130, L + 340, L + 560
+        for x, label in ((L, "Agent"), (cx_files, "Instruction files"), (cx_start, "Startup, measured"),
+                         (cx_status, "Sessions")):
+            g.text(x, y, label, 12, "m")
+        g.line(L, y + 10, R, y + 10, "hl")
+        for h in _compare_agents(c):
+            y += 34
+            f = c["files"].get(h, {"before": 0, "after": 0})
+            g.text(L, y, AGENT_NAMES[h], 14)
+            g.text(cx_files, y, f"~{fmt_k(f['before'])} → ~{fmt_k(f['after'])}", 14, "b n")
+            sd = c["sessions"].get(h) or {}
+            b, a = sd.get("before"), sd.get("after")
+            if b and a:
+                g.text(cx_start, y, f"~{fmt_k(b['baseline_median'])} → ~{fmt_k(a['baseline_median'])}", 14, "b n")
+            elif b:
+                g.text(cx_start, y, f"~{fmt_k(b['baseline_median'])} before", 14, "n")
+            kind, words = _compare_status(c, h)
+            x = cx_status
+            if kind:
+                g.badge(x + 7, y - 5, kind)
+                x += 22
+            g.text(x, y, _fit(words, R - x, 13, left=False), 13, "s" if kind else "m")
+        hint = _compare_hint(c)
+        if hint:
+            y += 30
+            g.text(L, y, hint, 13, "m")
+        y += 30
+        g.line(L, y, R, y, "hl")
 
     # startup load per agent: stacked bar, this repo vs everything outside it
     y += 38
@@ -1488,6 +2200,8 @@ def _main(argv=None) -> int:
     p.add_argument("--threshold", type=int, default=150_000)
     p.add_argument("--window", type=int, help=window_help)
     p.add_argument("--target", type=int, default=5_000, help="target tokens for repo instructions (default 5000)")
+    p.add_argument("--compare-at", help="YYYY-MM-DD, compare before and after this day instead of the "
+                   "slimming the report finds in git by itself")
     p.add_argument("--svg", nargs="?", const="", metavar="FILE",
                    help="also draw the report as a picture (SVG); without FILE it goes to the temp folder")
     p.add_argument("--theme", choices=("auto", "light", "dark"), default="auto",
@@ -1570,11 +2284,15 @@ def _main(argv=None) -> int:
         since = (dt.date.today() - dt.timedelta(days=a.days)).isoformat()
         files = scan_files(a.path, hs)
         skills = scan_skills(a.path, hs, a.window)
-        groups = {k: v for k, v in group_sessions(load_sessions(hs), since=since).items() if k[1] == root}
+        all_sessions = load_sessions(hs)
+        groups = {k: v for k, v in group_sessions(all_sessions, since=since).items() if k[1] == root}
         stats = {h: summarize(v, a.threshold) for (h, _), v in groups.items()}
         found = findings(files, skills, stats, a.target)
+        cmp = compare(a.path, hs, files, all_sessions, a.days, a.threshold, a.compare_at)
         rep = {"project": root, "since": since, "files": files, "skills": skills,
                "sessions": stats, "findings": found}
+        if cmp:
+            rep["compare"] = cmp
         picture = None
         if a.svg is not None or a.open:
             out = a.svg
@@ -1595,6 +2313,9 @@ def _main(argv=None) -> int:
             _emit(rep, True, None)
             return 0
         print(f"project {short(root)}   sessions since {since}\n")
+        if cmp:
+            print_compare(cmp)
+            print()
         print("## Instruction files loaded at startup (estimated tokens)")
         print_files(files)
         print("\n## Skill listing")

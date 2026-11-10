@@ -213,6 +213,325 @@ class CwTest(unittest.TestCase):
         self.assertIn("## Findings", out)
         self.assertIn("would have saved", out)
 
+    # ------------------------------------------------------------------ before and after
+    def _git(self, *args, date=None):
+        env = dict(self.env, GIT_CONFIG_NOSYSTEM="1")
+        if date:
+            env.update(GIT_AUTHOR_DATE=date, GIT_COMMITTER_DATE=date)
+        p = subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@example.com",
+                            "-c", "init.defaultBranch=main", "-c", "commit.gpgsign=false", *args],
+                           cwd=str(self.repo), env=env, capture_output=True, text=True)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        return p.stdout.strip()
+
+    def _git_repo(self):
+        (self.repo / ".git").rmdir()  # the fake marker from setUp
+        self._git("init", "-q")
+
+    def _commit(self, msg, date):
+        self._git("add", "-A")
+        self._git("commit", "-q", "-m", msg, date=date)
+        return self._git("rev-parse", "--short=7", "HEAD")
+
+    def test_compare_uncommitted_slimming(self):
+        self._git_repo()
+        write(self.repo / "CLAUDE.md", "a" * 60_000)
+        self._commit("rules", "2026-01-01T00:00:00+00:00")
+        write(self.repo / "CLAUDE.md", "@AGENTS.md\n")
+        write(self.repo / "AGENTS.md", "keep tests green\n")
+        self._claude_log("s", self.repo, "2026-01-05T00:00:00Z", [90_000])
+        c = self.cw_json("report", str(self.repo), "--days", "40000")["compare"]
+        self.assertEqual(c["found"], "uncommitted")
+        self.assertEqual(c["files"]["claude"]["before"], 20_000)
+        self.assertLess(c["files"]["claude"]["after"], 100)
+        self.assertEqual((c["files"]["codex"]["before"], c["files"]["codex"]["after"] > 0), (0, True))
+        self.assertIsNone(c["sessions"]["claude"]["after"])            # nothing ran on the new files yet
+        self.assertEqual(c["sessions"]["claude"]["before"]["sessions"], 1)
+        out = self.run_cw("report", str(self.repo), "--days", "40000")
+        self.assertIn("## Before and after", out)
+        self.assertIn("20.0k -> ", out)
+
+    def test_compare_finds_the_slimming_commit_and_ignores_later_growth(self):
+        self._git_repo()
+        write(self.repo / "CLAUDE.md", "a" * 60_000)
+        self._commit("rules", "2026-01-01T00:00:00+00:00")
+        write(self.repo / "CLAUDE.md", "@AGENTS.md\n")
+        write(self.repo / "AGENTS.md", "keep tests green\n")
+        write(self.repo / "docs" / "agent-notes" / "build.md", "a" * 59_000)
+        slim = self._commit("slim", "2026-02-01T12:00:00+00:00")
+        write(self.repo / "AGENTS.md", "keep tests green\nlesson: run the linter\n")  # a /retro line
+        self._commit("retro", "2026-02-05T00:00:00+00:00")
+        for i, day in enumerate(("10", "12", "14")):
+            self._claude_log(f"b{i}", self.repo, f"2026-01-{day}T00:00:00Z", [90_000, 95_000])
+            self._claude_log(f"a{i}", self.repo, f"2026-02-{day}T00:00:00Z", [30_000, 31_000])
+        self._claude_log("x", self.repo, "2026-02-01T06:00:00Z", [91_000])  # same day, before the commit
+        c = self.cw_json("report", str(self.repo), "--days", "40000")["compare"]
+        self.assertEqual((c["found"], c["commit"]), ("commit", slim))
+        self.assertTrue(c["at"].startswith("2026-02-01T12:00"))
+        self.assertEqual(c["files"]["claude"]["before"], 20_000)
+        self.assertLess(c["files"]["claude"]["after"], 100)
+        b, a = c["sessions"]["claude"]["before"], c["sessions"]["claude"]["after"]
+        self.assertEqual((b["sessions"], a["sessions"]), (4, 3))                 # x counts as before
+        self.assertEqual((b["baseline_median"], a["baseline_median"]), (90_000, 30_000))  # of 90k, 90k, 90k, 91k
+        out = self.run_cw("report", str(self.repo), "--days", "40000")
+        self.assertIn(f"commit {slim}", out)
+        self.assertNotIn("too early", out)
+
+    def test_compare_flags_too_few_sessions_after(self):
+        self._git_repo()
+        write(self.repo / "CLAUDE.md", "a" * 60_000)
+        self._commit("rules", "2026-01-01T00:00:00+00:00")
+        write(self.repo / "CLAUDE.md", "short\n")
+        self._commit("slim", "2026-02-01T00:00:00+00:00")
+        self._claude_log("b", self.repo, "2026-01-10T00:00:00Z", [90_000])
+        self._claude_log("a", self.repo, "2026-02-10T00:00:00Z", [30_000])
+        out = self.run_cw("report", str(self.repo), "--days", "40000")
+        self.assertIn("too early", out)
+
+    def test_compare_uses_the_merge_of_a_slimming_branch(self):
+        # Team flow: slim on a branch, merge the PR later. The change reaches main at the merge.
+        self._git_repo()
+        write(self.repo / "CLAUDE.md", "a" * 60_000)
+        self._commit("rules", "2026-01-01T00:00:00+00:00")
+        self._git("checkout", "-q", "-b", "slim")
+        write(self.repo / "CLAUDE.md", "short\n")
+        self._commit("slim", "2026-01-20T00:00:00+00:00")
+        self._git("checkout", "-q", "main")
+        self._git("merge", "-q", "--no-ff", "-m", "merge slim", "slim", date="2026-02-01T00:00:00+00:00")
+        merge = self._git("rev-parse", "--short=7", "HEAD")
+        c = self.cw_json("report", str(self.repo), "--days", "40000")["compare"]
+        self.assertEqual((c["found"], c["commit"]), ("commit", merge))
+        self.assertEqual(c["files"]["claude"]["before"], 20_000)
+
+    def test_compare_at_date_and_no_compare_without_a_cut(self):
+        self._git_repo()
+        write(self.repo / "CLAUDE.md", "a" * 3_000)
+        self._commit("rules", "2026-01-01T00:00:00+00:00")
+        write(self.repo / "CLAUDE.md", "a" * 3_300)                      # growth, not a cut
+        self._commit("more", "2026-01-10T00:00:00+00:00")
+        self.assertNotIn("compare", self.cw_json("report", str(self.repo), "--days", "40000"))
+        c = self.cw_json("report", str(self.repo), "--days", "40000", "--compare-at", "2026-01-05")["compare"]
+        self.assertEqual(c["found"], "date")
+        self.assertEqual((c["files"]["claude"]["before"], c["files"]["claude"]["after"]), (1_000, 1_100))
+
+    def test_compare_skips_a_move_into_an_imported_file(self):
+        # The entry file shrinks, but @import still loads every line: nothing to compare.
+        self._git_repo()
+        write(self.repo / "CLAUDE.md", "a" * 60_000)
+        self._commit("rules", "2026-01-01T00:00:00+00:00")
+        write(self.repo / "CLAUDE.md", "@docs/rules.md\n")
+        write(self.repo / "docs" / "rules.md", "a" * 60_000)
+        self._commit("move", "2026-02-01T00:00:00+00:00")
+        self.assertNotIn("compare", self.cw_json("report", str(self.repo), "--days", "40000", "--harness", "claude"))
+
+    @unittest.skipIf(os.name == "nt", "the hook below is a POSIX shell command")
+    def test_compare_never_runs_the_repo_fsmonitor_hook(self):
+        self._git_repo()
+        write(self.repo / "CLAUDE.md", "a" * 60_000)
+        self._commit("rules", "2026-01-01T00:00:00+00:00")
+        write(self.repo / "CLAUDE.md", "short\n")
+        ran = self.tmp_path / "hook-ran"
+        self._git("config", "core.fsmonitor", f"touch {ran}; false")
+        c = self.cw_json("report", str(self.repo), "--days", "40000")["compare"]
+        self.assertEqual(c["found"], "uncommitted")
+        self.assertFalse(ran.exists())
+
+    def _slim_history(self):
+        write(self.repo / "CLAUDE.md", "a" * 60_000)
+        self._commit("rules", "2026-01-01T00:00:00+00:00")
+        write(self.repo / "CLAUDE.md", "short\n")
+        return self._commit("slim", "2026-02-01T00:00:00+00:00")
+
+    def _marker_script(self, name):
+        ran = self.tmp_path / f"{name}-ran"
+        script = write(self.tmp_path / f"{name}.sh", f"#!/bin/sh\ntouch '{ran}'\nexit 1\n")
+        script.chmod(0o755)
+        return script, ran
+
+    def test_compare_follows_imports_that_are_not_markdown(self):
+        self._git_repo()
+        write(self.repo / "CLAUDE.md", "See @package.json\n" + "a" * 30_000)
+        write(self.repo / "package.json", "b" * 9_000)
+        old = self.cw_json("files", str(self.repo), "--harness", "claude")["claude"]["repo_tokens"]
+        self._commit("rules", "2026-01-01T00:00:00+00:00")
+        write(self.repo / "CLAUDE.md", "short\n")
+        self._commit("slim", "2026-02-01T00:00:00+00:00")
+        c = self.cw_json("report", str(self.repo), "--days", "40000", "--harness", "claude")["compare"]
+        self.assertEqual(c["files"]["claude"]["before"], old)
+        self.assertEqual({x["path"]: (x["before"], x["after"]) for x in c["changed"]}["package.json"],
+                         (3_000, 0))  # weighed at the old commit, no longer imported now
+
+    def test_compare_copy_never_leaves_its_folder(self):
+        spec = importlib.util.spec_from_file_location("cw_under_test", str(CW))
+        cw = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cw)
+        for bad in ("..\\..\\.claude\\CLAUDE.md", "\\Users\\me\\.claude\\CLAUDE.md", "C:/x/CLAUDE.md",
+                    "a/../../CLAUDE.md", "/etc/CLAUDE.md", "a//CLAUDE.md", "./CLAUDE.md"):
+            self.assertFalse(cw._rel_ok(bad), bad)
+        self.assertTrue(cw._rel_ok("docs/sub/CLAUDE.md"))
+
+    @unittest.skipIf(os.name == "nt", "needs POSIX symlinks")
+    def test_compare_reads_a_linked_rules_folder_in_the_old_commit(self):
+        self._git_repo()
+        write(self.repo / "CLAUDE.md", "core\n")
+        write(self.repo / "shared" / "rules" / "big.md", "a" * 60_000)
+        (self.repo / ".claude").mkdir()
+        os.symlink("../shared/rules", str(self.repo / ".claude" / "rules"))
+        old = self.cw_json("files", str(self.repo), "--harness", "claude")["claude"]["repo_tokens"]
+        self.assertGreater(old, 20_000)
+        self._commit("rules", "2026-01-01T00:00:00+00:00")
+        os.remove(str(self.repo / ".claude" / "rules"))
+        self._commit("slim", "2026-02-01T00:00:00+00:00")
+        c = self.cw_json("report", str(self.repo), "--days", "40000", "--harness", "claude")["compare"]
+        self.assertEqual(c["files"]["claude"]["before"], old)
+
+    @unittest.skipIf(os.name == "nt", "the hook below is a POSIX shell script")
+    def test_compare_never_runs_a_signature_program(self):
+        self._git_repo()
+        slim = self._slim_history()
+        raw = self._git("cat-file", "commit", "HEAD")
+        head, _, msg = raw.partition("\n\n")
+        signed = head + "\ngpgsig -----BEGIN PGP SIGNATURE-----\n \n -----END PGP SIGNATURE-----\n\n" + msg + "\n"
+        p = subprocess.run(["git", "hash-object", "-t", "commit", "-w", "--stdin"], cwd=str(self.repo),
+                           input=signed, capture_output=True, text=True, env=self.env)
+        self._git("update-ref", "refs/heads/main", p.stdout.strip())
+        script, ran = self._marker_script("gpg")
+        self._git("config", "log.showSignature", "true")
+        self._git("config", "gpg.program", str(script))
+        c = self.cw_json("report", str(self.repo), "--days", "40000")["compare"]
+        self.assertEqual(c["found"], "commit")
+        self.assertFalse(ran.exists())
+
+    @unittest.skipIf(os.name == "nt", "the hook below is a POSIX shell script")
+    def test_compare_never_fetches_in_a_partial_clone(self):
+        self._git_repo()
+        self._slim_history()
+        self._git("config", "uploadpack.allowFilter", "true")
+        clone = self.tmp_path / "work" / "clone"
+        self._git("clone", "-q", "--filter=blob:none", "--no-local", self.repo.as_uri(), str(clone))
+        script, ran = self._marker_script("ssh")
+        self._git("-C", str(clone), "remote", "set-url", "origin", "ssh://example.invalid/x")
+        self._git("-C", str(clone), "config", "core.sshCommand", str(script))
+        self._git("-C", str(clone), "config", "protocol.ssh.allow", "always")  # beats protocol.allow=never
+        packs = sorted(os.listdir(str(clone / ".git" / "objects" / "pack")))
+        res = self.cw_json("report", str(clone), "--days", "40000")
+        self.assertFalse(ran.exists())
+        self.assertEqual(sorted(os.listdir(str(clone / ".git" / "objects" / "pack"))), packs)
+        self.assertNotIn("compare", res)  # the old blobs are not here, so there is nothing honest to show
+
+    @unittest.skipIf(os.name == "nt", "a POSIX stand-in for git.exe in the current folder")
+    def test_compare_never_runs_a_git_from_the_current_folder(self):
+        self._git_repo()
+        self._slim_history()
+        here = self.tmp_path / "untrusted"
+        here.mkdir()
+        fake = write(here / "git", f"#!/bin/sh\ntouch '{here / 'fake-git-ran'}'\nexit 1\n")
+        fake.chmod(0o755)
+        env = dict(self.env, PATH="." + os.pathsep + self.env.get("PATH", ""))
+        p = subprocess.run([sys.executable, str(CW), "report", str(self.repo), "--days", "40000", "--json"],
+                           cwd=str(here), env=env, capture_output=True, text=True)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertFalse((here / "fake-git-ran").exists())
+        self.assertEqual(json.loads(p.stdout)["compare"]["found"], "commit")
+
+    def test_compare_at_out_of_range_exits_2(self):
+        self._git_repo()
+        self._slim_history()
+        self.run_cw("report", str(self.repo), "--compare-at", "0001-01-01", code=2)
+
+    def _load_at_commit(self, *args):
+        return self.cw_json("files", str(self.repo), *args)
+
+    @unittest.skipIf(os.name == "nt", "needs POSIX symlinks")
+    def test_compare_plain_link_checkout_is_not_a_change(self):
+        # Git for Windows' default core.symlinks=false checks a link out as a text file.
+        self._git_repo()
+        write(self.repo / "AGENTS.md", "a" * 60_000)
+        os.symlink("AGENTS.md", str(self.repo / "CLAUDE.md"))
+        self._commit("rules", "2026-01-01T00:00:00+00:00")
+        clone = self.tmp_path / "work" / "plain"
+        self._git("clone", "-q", "-c", "core.symlinks=false", str(self.repo), str(clone))
+        self.assertFalse(os.path.islink(str(clone / "CLAUDE.md")))
+        self.assertNotIn("compare", self.cw_json("report", str(clone), "--days", "40000"))
+
+    @unittest.skipIf(os.name == "nt", "needs POSIX symlinks")
+    def test_compare_links_elsewhere_do_not_hide_the_slimming(self):
+        self._git_repo()
+        slim = self._slim_history()
+        write(self.repo / "AGENTS.md", "keep tests green\n")
+        for i in range(4):  # links in subfolders never load from the root
+            (self.repo / f"p{i}").mkdir()
+            os.symlink("../AGENTS.md", str(self.repo / f"p{i}" / "CLAUDE.md"))
+            self._commit(f"link {i}", f"2026-02-0{i + 2}T00:00:00+00:00")
+        c = self.cw_json("report", str(self.repo), "--days", "40000")["compare"]
+        self.assertEqual((c["found"], c["commit"]), ("commit", slim))
+
+    def test_compare_opencode_globs_match_like_glob(self):
+        self._git_repo()
+        write(self.repo / "opencode.json", json.dumps({"instructions": ["docs/**/*.md"]}))
+        write(self.repo / "docs" / "a.md", "a" * 30_000)
+        write(self.repo / "docs" / "sub" / "b.md", "b" * 60_000)
+        old = self._load_at_commit("--harness", "opencode")["opencode"]["repo_tokens"]
+        self._commit("rules", "2026-01-01T00:00:00+00:00")
+        write(self.repo / "docs" / "sub" / "b.md", "short\n")
+        self._commit("slim", "2026-02-01T00:00:00+00:00")
+        c = self.cw_json("report", str(self.repo), "--days", "40000", "--harness", "opencode")["compare"]
+        self.assertEqual(c["files"]["opencode"]["before"], old)
+        self.assertNotIn("docs/a.md", [x["path"] for x in c["changed"]])
+
+    @unittest.skipIf(os.name == "nt", "needs POSIX symlinks")
+    def test_compare_linked_file_imports_from_where_it_lives(self):
+        self._git_repo()
+        write(self.repo / "docs" / "AGENTS.md", "@rules.md\n")
+        write(self.repo / "docs" / "rules.md", "a" * 60_000)
+        os.symlink("docs/AGENTS.md", str(self.repo / "CLAUDE.md"))
+        old = self._load_at_commit("--harness", "claude")["claude"]["repo_tokens"]
+        self._commit("rules", "2026-01-01T00:00:00+00:00")
+        os.remove(str(self.repo / "CLAUDE.md"))
+        write(self.repo / "CLAUDE.md", "short\n")
+        self._commit("slim", "2026-02-01T00:00:00+00:00")
+        c = self.cw_json("report", str(self.repo), "--days", "40000", "--harness", "claude")["compare"]
+        self.assertEqual(c["files"]["claude"]["before"], old)
+        self.assertNotIn("docs/rules.md", [x["path"] for x in c["changed"] if x["before"] == 0])
+
+    def test_compare_a_move_into_an_ignored_local_file_is_not_a_slimming(self):
+        self._git_repo()
+        write(self.repo / ".gitignore", "CLAUDE.local.md\n")
+        write(self.repo / "CLAUDE.md", "a" * 60_000)
+        self._commit("rules", "2026-01-01T00:00:00+00:00")
+        write(self.repo / "CLAUDE.md", "short\n")
+        write(self.repo / "CLAUDE.local.md", "a" * 60_000)
+        self._commit("move", "2026-02-01T00:00:00+00:00")
+        self.assertNotIn("compare", self.cw_json("report", str(self.repo), "--days", "40000", "--harness", "claude"))
+
+    @unittest.skipIf(os.name == "nt", "needs POSIX symlinks")
+    def test_compare_folder_link_to_itself_counts_once(self):
+        self._git_repo()
+        write(self.repo / "CLAUDE.md", "core\n")
+        write(self.repo / ".claude" / "rules" / "a.md", "a" * 30_000)
+        write(self.repo / ".claude" / "rules" / "b.md", "b" * 60_000)
+        os.symlink(".", str(self.repo / ".claude" / "rules" / "again"))
+        old = self._load_at_commit("--harness", "claude")["claude"]["repo_tokens"]
+        self._commit("rules", "2026-01-01T00:00:00+00:00")
+        os.remove(str(self.repo / ".claude" / "rules" / "b.md"))
+        self._commit("slim", "2026-02-01T00:00:00+00:00")
+        c = self.cw_json("report", str(self.repo), "--days", "40000", "--harness", "claude")["compare"]
+        self.assertEqual(c["files"]["claude"]["before"], old)
+
+    def test_compare_section_in_the_picture(self):
+        self._git_repo()
+        write(self.repo / "CLAUDE.md", "a" * 60_000)
+        self._commit("rules", "2026-01-01T00:00:00+00:00")
+        write(self.repo / "CLAUDE.md", "short\n")
+        self._commit("slim", "2026-02-01T00:00:00+00:00")
+        self._claude_log("b", self.repo, "2026-01-10T00:00:00Z", [90_000])
+        out = self.tmp_path / "pic.svg"
+        self.run_cw("report", str(self.repo), "--days", "40000", "--svg", str(out))
+        _, texts = self._svg_texts(out)
+        self.assertIn("Before and after", texts)
+        self.assertIn("~20.0k → ~2", texts)
+        self.assertIn("no sessions after the change yet", texts)
+
     # ------------------------------------------------------------------ picture
     def _svg_texts(self, path):
         root = ET.parse(str(path)).getroot()  # raises if the SVG is not well-formed XML

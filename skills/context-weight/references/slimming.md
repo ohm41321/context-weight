@@ -98,5 +98,6 @@ means an input could not be read. Do not hand back work while it fails.
 
 - Add the `--max-tokens` check to pre-commit or CI.
 - New lessons go in as one rule line plus a note file, not as a pasted log.
-- After a few days of use, measure the real effect:
-  `python3 $CW sessions --project <name> --compare-at <date of the change>`.
+- After a few days of use, measure the real effect with `python3 $CW report .`.
+  Its Before and after finds the slimming commit in git by itself; pass
+  `--compare-at <date of the change>` to set the split yourself.

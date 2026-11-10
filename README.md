@@ -99,6 +99,7 @@ cw.py report . --open
 | Part | What it tells you |
 | --- | --- |
 | Big number | The largest instruction-file load at startup, in tokens. It is sent again with every request. |
+| Before and after | Shown once you have slimmed. The report finds the change in git by itself (uncommitted, or the commit or merge that cut the files) and sets this repo's files then and now beside measured startup in the sessions before and after it. Fewer than 3 sessions after the change are marked too early. |
 | Tiles | Measured: the real first request (instruction files plus system prompt, tools and skill listing), how much of all input that load is, and what slimming would save. |
 | Loaded at startup | Each agent's load, split into this repo and everything outside it (your global files, plugins). The thin line is your target. |
 | Heaviest files | What to slim first. A red mark means Codex cuts the file off and never reads the rest. |
@@ -114,7 +115,7 @@ cw.py report . --open
 
 | Command | Answers |
 | --- | --- |
-| `cw.py report [PATH]` | Everything for one repo, plus ranked findings. `--svg` or `--open` draws it |
+| `cw.py report [PATH]` | Everything for one repo, plus ranked findings and the before and after of your last slimming. `--svg` or `--open` draws it; `--compare-at DATE` sets the split |
 | `cw.py files [PATH]` | Which instruction files each agent loads at startup, in tokens |
 | `cw.py skills [PATH]` | Size of the skill listing against each agent's budget |
 | `cw.py sessions` | Context size per project, measured from logs. `--compare-at DATE` shows before and after |
@@ -136,7 +137,7 @@ flowchart LR
   D --> E{"verify-split<br/>exit 0?"}
   E -- "no" --> B
   E -- "yes" --> F["files --max-tokens<br/>CI gate"]
-  F --> G["sessions --compare-at<br/>measured savings"]
+  F --> G["report again after a few days<br/>measured before and after"]
 ```
 
 `verify-split` is strict where strictness matters:
@@ -278,7 +279,10 @@ context-weight/
 
 - **Read-only.** `cw.py` never changes, deletes or uploads your files, and it
   makes no network calls. The one file it writes is the picture you ask for with
-  `--svg` or `--open`. `install.py` writes only into skill folders.
+  `--svg` or `--open`. For the before and after, `report` reads the repo's git
+  history with read-only git commands, and weighs an older commit by copying its
+  instruction files into a private temporary folder that it deletes afterwards.
+  `install.py` writes only into skill folders.
 - **No transcript content.** Session commands print numbers and paths only.
   `verify-split` prints lines from your own instruction files, because
   comparing them is its job.
