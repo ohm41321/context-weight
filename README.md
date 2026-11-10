@@ -98,7 +98,8 @@ cw.py report . --open
 
 | Part | What it tells you |
 | --- | --- |
-| Big number | The heaviest startup load, in tokens. It is sent again with every request. |
+| Big number | The largest instruction-file load at startup, in tokens. It is sent again with every request. |
+| Tiles | Measured: the real first request (instruction files plus system prompt, tools and skill listing), how much of all input that load is, and what slimming would save. |
 | Loaded at startup | Each agent's load, split into this repo and everything outside it (your global files, plugins). The thin line is your target. |
 | Heaviest files | What to slim first. A red mark means Codex cuts the file off and never reads the rest. |
 | Skill listing | The installed skills' names and descriptions against each agent's budget. Red means over budget: descriptions get dropped and skills stop triggering. |
