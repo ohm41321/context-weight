@@ -27,17 +27,74 @@ import statistics
 import sys
 from pathlib import Path
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 HARNESSES = ("claude", "codex", "gemini", "opencode")
 
 CLAUDE_FILE_WARN_CHARS = 40_000   # Claude Code startup warning: "Large CLAUDE.md will impact performance"
 CLAUDE_FILE_LINES = 200           # Claude Code docs: target under 200 lines per CLAUDE.md
 CLAUDE_IMPORT_DEPTH = 4           # Claude Code docs: imports recurse at most four hops
 CLAUDE_DESC_CAP = 1_536           # Claude Code: description + when_to_use truncated in the listing
+CLAUDE_LISTING_FRACTION = 0.01    # Claude Code: skill listing gets 1% of the context window, in characters
+CHARS_PER_WINDOW_TOKEN = 4        # 1% of a 200k window = the 8,000-character fallback older docs gave
 CODEX_DOC_MAX_DEFAULT = 32 * 1024 # Codex: project_doc_max_bytes default
+CODEX_LISTING_FRACTION = 0.02     # Codex: skill listing gets 2% of the context window
+CODEX_LISTING_FALLBACK_CHARS = 8_000  # Codex: listing budget when the window is unknown
+DEFAULT_WINDOW = 200_000          # assumed when neither --window nor a log gives the window
+EXIT_OK, EXIT_FAIL, EXIT_USAGE = 0, 1, 2
 
 
 # --------------------------------------------------------------------------- helpers
+
+class UsageError(Exception):
+    """Bad input from the user (missing path, unreadable file). Exits 2, never 1,
+    so a CI gate cannot mistake it for 'over the limit' or for 'passed'."""
+
+
+def _is_file(p) -> bool:
+    # Path.is_file() raises PermissionError on Python <= 3.13 when a parent folder can't be read.
+    try:
+        return Path(p).is_file()
+    except (OSError, ValueError):
+        return False
+
+
+def _is_dir(p) -> bool:
+    try:
+        return Path(p).is_dir()
+    except (OSError, ValueError):
+        return False
+
+
+def _exists(p) -> bool:
+    try:
+        return Path(p).exists()
+    except (OSError, ValueError):
+        return False
+
+
+def _dict(x) -> dict:
+    return x if isinstance(x, dict) else {}
+
+
+def _int(x) -> int:
+    try:
+        return int(x or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _md_files(directory: Path) -> list[Path]:
+    """*.md files under directory. Follows symlinked folders (Claude Code supports them in
+    .claude/rules/), visiting each real folder once so a symlink loop cannot recurse."""
+    out, seen = [], set()
+    for top, dirs, files in os.walk(directory, followlinks=True):
+        real = os.path.realpath(top)
+        if real in seen:
+            dirs[:] = []
+            continue
+        seen.add(real)
+        out += [Path(top) / f for f in files if f.lower().endswith(".md")]
+    return sorted(out)
 
 def est_tokens(text: str) -> int:
     """Rough token count: ~3 ASCII chars per token, ~1 token per other char (Thai, CJK).
@@ -51,8 +108,9 @@ def est_tokens(text: str) -> int:
 
 
 def read_text(path) -> str | None:
+    """UTF-8 text with any byte-order mark removed (a BOM would hide `---` frontmatter)."""
     try:
-        return Path(path).read_text(encoding="utf-8", errors="replace")
+        return Path(path).read_bytes().decode("utf-8-sig", errors="replace")
     except (OSError, ValueError):
         return None
 
@@ -81,7 +139,7 @@ def git_root(path) -> Path | None:
     try:
         p = p.resolve()
         for d in [p, *p.parents]:
-            if (d / ".git").exists():
+            if _exists(d / ".git"):
                 root = d
                 break
     except OSError:
@@ -188,15 +246,15 @@ def _claude_imports(path: Path, text: str, depth: int, seen: set, out: list, rol
         ref = m.group(1).replace("\\ ", " ")
         if ref.startswith("~"):
             target = Path(os.path.expanduser(ref))
-        elif ref.startswith("/"):
+        elif ref.startswith("/") or Path(ref).is_absolute():
             target = Path(ref)
         else:
             target = path.parent / ref
         try:
-            if not target.is_file() or not _is_text(target):
+            if not _is_file(target) or not _is_text(target):
                 continue
             target = target.resolve()
-        except OSError:
+        except (OSError, RuntimeError):
             continue
         if str(target) in seen:
             continue
@@ -209,10 +267,10 @@ def _claude_imports(path: Path, text: str, depth: int, seen: set, out: list, rol
 
 def _rules(directory: Path) -> tuple[list[Path], int]:
     """Claude Code rules: files without `paths:` frontmatter load at launch."""
-    if not directory.is_dir():
+    if not _is_dir(directory):
         return [], 0
     eager, scoped = [], 0
-    for p in sorted(directory.rglob("*.md")):
+    for p in _md_files(directory):
         if "paths" in frontmatter(read_text(p) or ""):
             scoped += 1
         else:
@@ -227,10 +285,10 @@ def claude_files(cwd) -> dict:
 
     def add(p: Path, role: str) -> None:
         try:
-            if not p.is_file():
+            if not _is_file(p):
                 return
             rp = str(p.resolve())
-        except OSError:
+        except (OSError, RuntimeError):
             return
         if rp in seen:
             return
@@ -255,7 +313,7 @@ def claude_files(cwd) -> dict:
     # Auto memory: Claude Code loads the start of MEMORY.md (first 200 lines / 25 KB).
     slug = re.sub(r"[^A-Za-z0-9]", "-", str(project_root(cwd)))
     mem = cd / "projects" / slug / "memory" / "MEMORY.md"
-    text = read_text(mem) if mem.is_file() else None
+    text = read_text(mem) if _is_file(mem) else None
     if text:
         head = "\n".join(text.splitlines()[:200]).encode("utf-8")[:25_000].decode("utf-8", errors="ignore")
         out.append({"path": str(mem), "role": "user memory", "via": None, "bytes": len(head.encode("utf-8")),
@@ -298,9 +356,10 @@ def codex_files(cwd) -> dict:
     out: list[dict] = []
     for name in ("AGENTS.override.md", "AGENTS.md"):
         p = codex_dir() / name
-        if p.is_file() and (read_text(p) or "").strip():
+        if _is_file(p) and (read_text(p) or "").strip():
             out.append(file_entry(p, "global"))
             break
+    out = [e for e in out if e]
     max_bytes, fallbacks = _codex_config()
     root = project_root(cwd)
     dirs = [d for d in top_down(cwd) if d == root or root in d.parents]
@@ -309,7 +368,7 @@ def codex_files(cwd) -> dict:
     for d in dirs:
         for name in ["AGENTS.override.md", "AGENTS.md", *fallbacks]:
             p = d / name
-            text = read_text(p) if p.is_file() else None
+            text = read_text(p) if _is_file(p) else None
             if not (text and text.strip()):
                 continue
             entry = file_entry(p, "project")
@@ -318,6 +377,7 @@ def codex_files(cwd) -> dict:
             used += kept
             if kept < len(raw):
                 entry["truncated_bytes"] = len(raw) - kept
+                entry["file_tokens"] = entry["tokens"]  # the whole file, for the --max-tokens gate
                 entry["tokens"] = est_tokens(raw[:kept].decode("utf-8", errors="ignore"))
                 warnings.append(f"{short(p)}: {len(raw) - kept:,} bytes past project_doc_max_bytes "
                                 f"({max_bytes:,}) - Codex never sees them")
@@ -339,7 +399,7 @@ def gemini_files(cwd) -> dict:
     out, seen = [], set()
 
     def add(p: Path, role: str) -> None:
-        if p.is_file() and str(p.resolve()) not in seen:
+        if _is_file(p) and str(p.resolve()) not in seen:
             seen.add(str(p.resolve()))
             e = file_entry(p, role)
             if e:
@@ -347,7 +407,12 @@ def gemini_files(cwd) -> dict:
 
     for n in names:
         add(gd / n, "global")
-    for d in top_down(cwd):
+    # Gemini CLI walks up from the working directory to the project root (the folder with .git).
+    root = git_root(cwd)
+    dirs = top_down(cwd)
+    if root:
+        dirs = [d for d in dirs if d == root or root in d.parents]
+    for d in dirs:
         for n in names:
             add(d / n, "project")
     return {"files": out, "warnings": [],
@@ -358,25 +423,26 @@ def opencode_files(cwd) -> dict:
     oc = home() / ".config" / "opencode"
     no_claude = bool(os.environ.get("OPENCODE_DISABLE_CLAUDE_CODE"))
     out: list[dict | None] = []
-    if (oc / "AGENTS.md").is_file():
+    if _is_file(oc / "AGENTS.md"):
         out.append(file_entry(oc / "AGENTS.md", "global"))
-    elif not no_claude and (claude_dir() / "CLAUDE.md").is_file():
+    elif not no_claude and _is_file(claude_dir() / "CLAUDE.md"):
         out.append(file_entry(claude_dir() / "CLAUDE.md", "global (CLAUDE.md fallback)"))
     root = project_root(cwd)
     here = Path(cwd).resolve()
     upward = [d for d in [here, *here.parents] if d == root or root in d.parents]
     for name in ["AGENTS.md"] + ([] if no_claude else ["CLAUDE.md"]):
-        hit = next((d / name for d in upward if (d / name).is_file()), None)
+        hit = next((d / name for d in upward if _is_file(d / name)), None)
         if hit:
             out.append(file_entry(hit, "project" if name == "AGENTS.md" else "project (CLAUDE.md fallback)"))
             break
     for cfg_path, base in ((oc / "opencode.json", oc), (root / "opencode.json", root)):
         try:
-            cfg = json.loads(read_text(cfg_path) or "{}")
+            cfg = _dict(json.loads(read_text(cfg_path) or "{}"))
         except ValueError:
             continue
-        for pattern in cfg.get("instructions") or []:
-            if "://" in str(pattern):
+        patterns = cfg.get("instructions")
+        for pattern in patterns if isinstance(patterns, list) else []:
+            if not isinstance(pattern, str) or "://" in pattern:
                 continue
             for m in sorted(glob.glob(str(base / os.path.expanduser(str(pattern))), recursive=True)):
                 out.append(file_entry(m, "instructions"))
@@ -391,9 +457,11 @@ def scan_files(cwd, harnesses) -> dict:
     result = {}
     for h in harnesses:
         r = FILE_SCANNERS[h](cwd)
+        repo = [e for e in r["files"]
+                if Path(e["path"]).resolve() == root or root in Path(e["path"]).resolve().parents]
         r["total_tokens"] = sum(e["tokens"] for e in r["files"])
-        r["repo_tokens"] = sum(e["tokens"] for e in r["files"]
-                               if Path(e["path"]).resolve() == root or root in Path(e["path"]).resolve().parents)
+        r["repo_tokens"] = sum(e["tokens"] for e in repo)                          # what the harness loads
+        r["repo_file_tokens"] = sum(e.get("file_tokens", e["tokens"]) for e in repo)  # what the files hold
         result[h] = r
     # Same repo, different instructions per harness?
     c = [e for e in result.get("claude", {}).get("files", []) if e["role"] in ("project", "local")]
@@ -433,38 +501,106 @@ def _skill_dirs(cwd) -> dict[str, list[tuple[Path, str]]]:
     }
 
 
+def _json_file(path) -> dict:
+    try:
+        return _dict(json.loads(read_text(path) or "{}"))
+    except ValueError:
+        return {}
+
+
 def _claude_plugin_skill_dirs() -> list[tuple[Path, str]]:
     cd = claude_dir()
-    try:
-        enabled = [k for k, v in (json.loads(read_text(cd / "settings.json") or "{}").get("enabledPlugins") or {}).items() if v]
-    except (ValueError, AttributeError):
-        enabled = []
-    try:
-        installed = json.loads(read_text(cd / "plugins" / "installed_plugins.json") or "{}").get("plugins") or {}
-    except (ValueError, AttributeError):
-        installed = {}
+    enabled = [k for k, v in _dict(_json_file(cd / "settings.json").get("enabledPlugins")).items() if v]
+    installed = _dict(_json_file(cd / "plugins" / "installed_plugins.json").get("plugins"))
     dirs = []
     for key in sorted(enabled):
         plugin, _, market = key.partition("@")
-        entries = installed.get(key) or []
-        candidates = [Path(e["installPath"]) for e in entries if isinstance(e, dict) and e.get("installPath")]
-        candidates += [cd / "plugins" / "cache" / market / plugin / e["version"]
-                       for e in entries if isinstance(e, dict) and e.get("version")]
-        hit = next((c for c in candidates if (c / "skills").is_dir()), None)
+        entries = installed.get(key)
+        entries = [e for e in entries if isinstance(e, dict)] if isinstance(entries, list) else []
+        candidates = [Path(str(e["installPath"])) for e in entries if e.get("installPath")]
+        candidates += [cd / "plugins" / "cache" / market / plugin / str(e["version"])
+                       for e in entries if e.get("version")]
+        hit = next((c for c in candidates if _is_dir(c / "skills")), None)
         if hit:
             dirs.append((hit / "skills", plugin + ":"))
     return dirs
 
 
-def scan_skills(cwd, harnesses, window: int) -> dict:
+def _claude_settings(cwd) -> dict:
+    """User, project and local settings, later files winning, as Claude Code merges them."""
+    root = project_root(cwd)
+    merged: dict = {}
+    for p in (claude_dir() / "settings.json", root / ".claude" / "settings.json",
+              root / ".claude" / "settings.local.json"):
+        merged.update(_json_file(p))
+    return merged
+
+
+def _codex_window() -> int | None:
+    """model_context_window from the newest Codex rollouts, if any."""
+    files = []
+    for sub in ("sessions", "archived_sessions"):
+        d = codex_dir() / sub
+        if _is_dir(d):
+            try:
+                files += list(d.rglob("rollout-*.jsonl"))
+            except OSError:
+                pass
+    for f in sorted(files, key=lambda p: p.name, reverse=True)[:20]:
+        try:
+            with open(f, encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    if '"model_context_window"' not in line:
+                        continue
+                    m = re.search(r'"model_context_window"\s*:\s*(\d+)', line)
+                    if m and int(m.group(1)) > 0:
+                        return int(m.group(1))
+        except OSError:
+            continue
+    return None
+
+
+def _listing_budget(h: str, cwd, window: int | None) -> dict:
+    """Budget for one harness's skill listing, with where each number came from."""
+    if h == "claude":
+        fixed = _int(os.environ.get("SLASH_COMMAND_TOOL_CHAR_BUDGET"))
+        w, w_src = (window, "--window") if window else (DEFAULT_WINDOW, "default")
+        if fixed > 0:
+            return {"budget": fixed, "budget_unit": "chars", "window": w, "window_source": w_src,
+                    "basis": "SLASH_COMMAND_TOOL_CHAR_BUDGET"}
+        try:
+            frac = float(_claude_settings(cwd).get("skillListingBudgetFraction") or CLAUDE_LISTING_FRACTION)
+        except (TypeError, ValueError):
+            frac = CLAUDE_LISTING_FRACTION
+        return {"budget": int(w * CHARS_PER_WINDOW_TOKEN * frac), "budget_unit": "chars", "window": w,
+                "window_source": w_src, "basis": f"{frac * 100:g}% of a {fmt_k(w)}-token window"}
+    if h == "codex":
+        if window:
+            w, w_src = window, "--window"
+        else:
+            w, w_src = _codex_window(), "codex logs"
+        if not w:
+            return {"budget": CODEX_LISTING_FALLBACK_CHARS, "budget_unit": "chars", "window": None,
+                    "window_source": "unknown", "basis": "window unknown"}
+        return {"budget": int(w * CODEX_LISTING_FRACTION), "budget_unit": "tokens", "window": w,
+                "window_source": w_src, "basis": f"2% of a {fmt_k(w)}-token window"}
+    return {"budget": None, "budget_unit": None, "window": None, "window_source": None, "basis": "no published budget"}
+
+
+def scan_skills(cwd, harnesses, window: int | None = None) -> dict:
     result = {}
     all_dirs = _skill_dirs(cwd)
+    desc_cap = _int(_claude_settings(cwd).get("skillListingMaxDescChars")) or CLAUDE_DESC_CAP
     for h in harnesses:
         found: dict[str, dict] = {}
         for directory, prefix in all_dirs[h]:
-            if not directory.is_dir():
+            if not _is_dir(directory):
                 continue
-            for sm in sorted(directory.glob("*/SKILL.md")):
+            try:
+                manifests = sorted(directory.glob("*/SKILL.md"))
+            except OSError:
+                continue
+            for sm in manifests:
                 if sm.parent.name.startswith("."):
                     continue
                 fm = frontmatter(read_text(sm) or "")
@@ -475,22 +611,18 @@ def scan_skills(cwd, harnesses, window: int) -> dict:
                 if fm.get("when_to_use"):
                     desc += " " + fm["when_to_use"]
                 if h == "claude":
-                    desc = desc[:CLAUDE_DESC_CAP]
-                found[name] = {"path": str(sm), "desc_chars": len(desc),
-                               "tokens": est_tokens(f"- {name}: {desc}\n")}
+                    desc = desc[:desc_cap]
+                line = f"- {name}: {desc}\n"
+                found[name] = {"path": str(sm), "desc_chars": len(desc), "chars": len(line),
+                               "tokens": est_tokens(line)}
         tokens = sum(s["tokens"] for s in found.values())
-        chars = sum(s["desc_chars"] for s in found.values())
-        if h == "claude":
-            budget, unit = window // 100, "tokens (1% of window)"
-            over = tokens > budget
-        elif h == "codex":
-            budget, unit = window // 50, "tokens (2% of window)"
-            over = tokens > budget
-        else:
-            budget, unit, over = None, "no published budget", False
+        chars = sum(s["chars"] for s in found.values())
+        b = _listing_budget(h, cwd, window)
+        used = chars if b["budget_unit"] == "chars" else tokens
+        over = b["budget"] is not None and used > b["budget"]
         heaviest = sorted(found.items(), key=lambda kv: -kv[1]["tokens"])[:5]
-        result[h] = {"count": len(found), "tokens": tokens, "desc_chars": chars, "budget": budget,
-                     "budget_unit": unit, "over_budget": over,
+        result[h] = {"count": len(found), "tokens": tokens, "chars": chars,
+                     "desc_chars": sum(s["desc_chars"] for s in found.values()), **b, "over_budget": over,
                      "heaviest": [{"name": k, "tokens": v["tokens"]} for k, v in heaviest]}
     return result
 
@@ -526,7 +658,11 @@ def claude_sessions(include_subagents=False):
     base = claude_dir() / "projects"
     pattern = "*/**/*.jsonl" if include_subagents else "*/*.jsonl"
     parsed = []
-    for f in sorted(base.glob(pattern)):
+    try:
+        logs = sorted(base.glob(pattern)) if _is_dir(base) else []
+    except OSError:
+        logs = []
+    for f in logs:
         cwd, local, rows, compacted = None, set(), [], False
         try:
             fh = open(f, encoding="utf-8", errors="replace")
@@ -542,17 +678,21 @@ def claude_sessions(include_subagents=False):
                     d = json.loads(line)
                 except ValueError:
                     continue
-                if cwd is None and d.get("cwd"):
+                if not isinstance(d, dict):
+                    continue
+                if cwd is None and isinstance(d.get("cwd"), str) and d["cwd"]:
                     cwd = d["cwd"]
                 if d.get("type") != "assistant" or (d.get("isSidechain") and not include_subagents):
                     continue
-                msg = d.get("message") or {}
+                msg = _dict(d.get("message"))
                 mid = msg.get("id") or d.get("requestId") or d.get("uuid")
+                if not isinstance(mid, str):
+                    continue
                 if mid in local:  # one API response is logged once per content block
                     continue
                 local.add(mid)
-                u = msg.get("usage") or {}
-                ctx = sum(int(u.get(k) or 0) for k in
+                u = _dict(msg.get("usage"))
+                ctx = sum(_int(u.get(k)) for k in
                           ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"))
                 if ctx > 0:
                     rows.append((str(d.get("timestamp", "")), ctx, mid))
@@ -569,10 +709,24 @@ def claude_sessions(include_subagents=False):
             yield Session("claude", f, cwd, reqs, continued=compacted or repeated)
 
 
+def _codex_is_subagent(meta: dict) -> bool:
+    """Spawned agents and guardian reviewers carry `source: {"subagent": ...}`. Older logs mark
+    them with thread_source "subagent" or "guardian_review". User threads have thread_source
+    "user", "chatgpt_handoff" or none, with source "cli", "vscode" and so on."""
+    source = meta.get("source")
+    if isinstance(source, dict) and "subagent" in source:
+        return True
+    return meta.get("thread_source") in ("subagent", "guardian_review")
+
+
 def codex_sessions(include_subagents=False):
     files = []
     for sub in ("sessions", "archived_sessions"):
-        files += sorted((codex_dir() / sub).rglob("rollout-*.jsonl"))
+        d = codex_dir() / sub
+        try:
+            files += sorted(d.rglob("rollout-*.jsonl")) if _is_dir(d) else []
+        except OSError:
+            pass
     for f in files:
         cwd, reqs, window, last_total, is_sub = None, [], None, None, False
         try:
@@ -587,20 +741,23 @@ def codex_sessions(include_subagents=False):
                     d = json.loads(line)
                 except ValueError:
                     continue
-                p = d.get("payload") or {}
+                if not isinstance(d, dict):
+                    continue
+                p = _dict(d.get("payload"))
                 if d.get("type") == "session_meta":
-                    cwd = cwd or p.get("cwd")
-                    is_sub = is_sub or p.get("thread_source") == "subagent"
+                    if not cwd and isinstance(p.get("cwd"), str):
+                        cwd = p["cwd"]
+                    is_sub = is_sub or _codex_is_subagent(p)
                     continue
-                if p.get("type") != "token_count" or not p.get("info"):
+                info = _dict(p.get("info"))
+                if p.get("type") != "token_count" or not info:
                     continue
-                info = p["info"]
-                total = (info.get("total_token_usage") or {}).get("total_tokens")
+                total = _dict(info.get("total_token_usage")).get("total_tokens")
                 if total is not None and total == last_total:  # repeated rate-limit update
                     continue
                 last_total = total
-                ctx = int((info.get("last_token_usage") or {}).get("input_tokens") or 0)
-                window = info.get("model_context_window") or window
+                ctx = _int(_dict(info.get("last_token_usage")).get("input_tokens"))
+                window = _int(info.get("model_context_window")) or window
                 if ctx > 0:
                     reqs.append((str(d.get("timestamp", "")), ctx))
         if is_sub and not include_subagents:
@@ -647,7 +804,7 @@ def summarize(sessions: list[Session], threshold: int) -> dict | None:
 def project_key(cwd: str) -> str:
     """Git root of the session's cwd; a deleted subdirectory folds into its repo."""
     p = Path(cwd)
-    while not p.exists() and p.parent != p:
+    while not _exists(p) and p.parent != p:
         p = p.parent
     root = git_root(p)
     return str(root) if root else cwd
@@ -675,7 +832,8 @@ def print_files(result: dict) -> None:
         if h not in result:
             continue
         r = result[h]
-        print(f"{h:9} ~{fmt_k(r['total_tokens'])} tokens at startup ({len(r['files'])} files, "
+        n = len(r["files"])
+        print(f"{h:9} ~{fmt_k(r['total_tokens'])} tokens at startup ({n} file{'' if n == 1 else 's'}, "
               f"~{fmt_k(r['repo_tokens'])} from this repo)")
         for e in r["files"]:
             extra = f"  [-{e['truncated_bytes']:,} bytes]" if e.get("truncated_bytes") else ""
@@ -689,12 +847,22 @@ def print_files(result: dict) -> None:
 
 
 def print_skills(result: dict) -> None:
+    assumed = False
     for h, r in result.items():
-        budget = f"budget {fmt_k(r['budget'])} {r['budget_unit']}" if r["budget"] else r["budget_unit"]
+        if r["budget"]:
+            used = r["chars"] if r["budget_unit"] == "chars" else r["tokens"]
+            budget = f"{fmt_k(used)} of {fmt_k(r['budget'])} {r['budget_unit']}: {r['basis']}"
+            if r["window_source"] == "default":
+                budget += " (assumed)"
+                assumed = True
+        else:
+            budget = r["basis"]
         flag = "  OVER: descriptions get dropped, names stay" if r["over_budget"] else ""
         print(f"{h:9} {r['count']:4} skills  ~{fmt_k(r['tokens'])} tokens listing  ({budget}){flag}")
         if r["heaviest"]:
             print("          heaviest: " + ", ".join(f"{x['name']} {fmt_k(x['tokens'])}" for x in r["heaviest"]))
+    if assumed:
+        print(f"  · window assumed {fmt_k(DEFAULT_WINDOW)} tokens; pass --window 1000000 for a 1M-context model")
 
 
 def _name(key: str, width: int) -> str:
@@ -751,36 +919,97 @@ def findings(files: dict, skills: dict, stats: dict, target: int) -> list[str]:
         out.append(f"[all] {w}. Keep one canonical AGENTS.md and import it from CLAUDE.md")
     for h, r in skills.items():
         if r["over_budget"]:
-            out.append(f"[{h}] {r['count']} skills need ~{fmt_k(r['tokens'])} tokens, budget {fmt_k(r['budget'])}: "
-                       "the least-used lose their descriptions and stop triggering reliably. "
-                       "Uninstall unused skills or plugins")
+            used = r["chars"] if r["budget_unit"] == "chars" else r["tokens"]
+            out.append(f"[{h}] {r['count']} skills need ~{fmt_k(used)} {r['budget_unit']} of listing, budget "
+                       f"{fmt_k(r['budget'])} ({r['basis']}): the least-used lose their descriptions and stop "
+                       "triggering reliably. Uninstall unused skills or plugins")
     return out
 
 
 # --------------------------------------------------------------------------- verify-split
 
+_FENCE_LINE = re.compile(r"^(\s*)(`{3,}|~{3,})")
+
+
+def _split_lines(text: str) -> list[str]:
+    """Lines that carry content, normalised for comparison.
+
+    Prose: surrounding whitespace dropped and inner runs collapsed, so re-wrapping or
+    re-indenting a sentence is fine. Inside fenced code: indentation relative to the fence
+    is kept, because it carries meaning there (YAML, Python). Fence markers and lines with
+    no letter or digit (rules, table separators) are structure and are skipped."""
+    out: list[str] = []
+    fence = None  # (marker char, fence indent) while inside a code block
+    for raw in text.splitlines():
+        line = raw.expandtabs(4)
+        m = _FENCE_LINE.match(line)
+        if m:
+            if fence is None:
+                fence = (m.group(2)[0], len(m.group(1)))
+                continue
+            if m.group(2)[0] == fence[0] and not line.strip().strip(fence[0]):
+                fence = None
+                continue
+        if not any(c.isalnum() for c in line):
+            continue
+        if fence is None:
+            out.append(re.sub(r"\s+", " ", line.strip()))
+        else:
+            body = line[min(fence[1], len(line) - len(line.lstrip(" "))):].rstrip()
+            indent = len(body) - len(body.lstrip(" "))
+            out.append(" " * indent + re.sub(r"\s+", " ", body.strip()))
+    return out
+
+
 def _norm(line: str) -> str:
     return re.sub(r"\s+", " ", line.strip())
 
 
-def _trivial(line: str) -> bool:
-    return len(line) < 4 or set(line) <= set("-|:*=#`~ >")
+def verify_split(original: str, new_paths: list[str], allow: str | None) -> dict:
+    """Every content line of ORIGINAL must appear in the new files at least as many times as
+    it did in ORIGINAL, unless the allow list names it."""
+    from collections import Counter
 
-
-def verify_split(original: str, new_paths: list[str], allow: str | None) -> tuple[list[str], int]:
     text = read_text(original)
     if text is None:
-        raise SystemExit(f"cannot read {original}")
-    want = list(dict.fromkeys(n for n in (_norm(x) for x in text.splitlines()) if n and not _trivial(n)))
-    have: set[str] = set()
+        raise UsageError(f"cannot read {original}")
+    want = Counter(_split_lines(text))
+    try:
+        orig_real = Path(original).resolve()
+    except (OSError, RuntimeError):
+        orig_real = None
+    have: Counter = Counter()
+    read = []
     for p in new_paths:
-        path = Path(p)
-        targets = sorted(path.rglob("*.md")) if path.is_dir() else [path]
+        if _is_dir(p):
+            targets = _md_files(Path(p))
+        elif _is_file(p):
+            targets = [Path(p)]
+        else:
+            raise UsageError(f"cannot read {p}")
         for t in targets:
-            have.update(_norm(x) for x in (read_text(t) or "").splitlines())
-    allowed = {_norm(x) for x in (read_text(allow) or "").splitlines()} if allow else set()
-    missing = [x for x in want if x not in have and x not in allowed]
-    return missing, len(want)
+            if orig_real is not None and t.resolve() == orig_real:
+                continue  # the backup itself never counts as the new copy
+            body = read_text(t)
+            if body is None:
+                raise UsageError(f"cannot read {t}")
+            have.update(_split_lines(body))
+            read.append(str(t))
+    allowed: set[str] = set()
+    if allow:
+        listed = read_text(allow)
+        if listed is None:
+            raise UsageError(f"cannot read {allow}")
+        allowed = {_norm(x) for x in listed.splitlines()}
+    missing, copies = [], {}
+    for line, n in want.items():
+        short_by = n - have[line]
+        if short_by > 0 and _norm(line) not in allowed:
+            missing.append(line)
+            if n > 1:
+                copies[line] = [short_by, n]
+    return {"checked": sum(want.values()), "unique": len(want), "files_read": len(read),
+            "missing": missing, "missing_copies": copies}
 
 
 # --------------------------------------------------------------------------- CLI
@@ -788,11 +1017,27 @@ def verify_split(original: str, new_paths: list[str], allow: str | None) -> tupl
 def _harnesses(arg: str) -> list[str]:
     if arg == "all":
         return list(HARNESSES)
-    hs = [h.strip() for h in arg.split(",")]
+    hs = [h.strip() for h in arg.split(",") if h.strip()]
     bad = [h for h in hs if h not in HARNESSES]
-    if bad:
-        raise SystemExit(f"unknown harness: {', '.join(bad)} (use {', '.join(HARNESSES)} or all)")
+    if bad or not hs:
+        raise UsageError(f"unknown harness: {', '.join(bad) or arg!r} (use {', '.join(HARNESSES)} or all)")
     return hs
+
+
+def _project_dir(path: str) -> str:
+    """A project path must be an existing directory: a typo must not pass a CI gate."""
+    if not _is_dir(path):
+        raise UsageError(f"not a directory: {path}" if _exists(path) else f"no such directory: {path}")
+    return path
+
+
+def _date(s: str | None, flag: str) -> str | None:
+    if s is None:
+        return None
+    try:
+        return dt.date.fromisoformat(s).isoformat()
+    except ValueError:
+        raise UsageError(f"{flag} wants YYYY-MM-DD, got {s!r}")
 
 
 def _emit(obj, as_json: bool, printer) -> None:
@@ -804,6 +1049,25 @@ def _emit(obj, as_json: bool, printer) -> None:
 
 
 def main(argv=None) -> int:
+    for stream in (sys.stdout, sys.stderr):
+        try:  # a Windows console in cp1252 must not crash on a Thai or CJK path
+            stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError):
+            pass
+    try:
+        return _main(argv)
+    except UsageError as e:
+        print(f"cw.py: error: {e}", file=sys.stderr)
+        return EXIT_USAGE
+    except BrokenPipeError:  # `cw.py sessions | head`
+        try:
+            sys.stdout = open(os.devnull, "w")
+        except OSError:
+            pass
+        return EXIT_OK
+
+
+def _main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="cw.py", description=__doc__.split("\n\n")[0])
     ap.add_argument("--version", action="version", version=VERSION)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -816,11 +1080,14 @@ def main(argv=None) -> int:
 
     p = sub.add_parser("files", help="instruction files each harness loads at startup")
     common(p)
-    p.add_argument("--max-tokens", type=int, help="exit 1 if this repo's instructions exceed N tokens for any harness")
+    p.add_argument("--max-tokens", type=int, help="exit 1 if this repo's instructions exceed N tokens for any "
+                   "harness, or if Codex would cut any of them off; exit 2 on a bad path")
 
+    window_help = ("model context window in tokens (default: Codex reads it from its logs, "
+                   f"otherwise {DEFAULT_WINDOW} is assumed)")
     p = sub.add_parser("skills", help="skill listing size against budgets")
     common(p)
-    p.add_argument("--window", type=int, default=200_000, help="model context window in tokens (default 200000)")
+    p.add_argument("--window", type=int, help=window_help)
 
     p = sub.add_parser("sessions", help="context size per project from session logs")
     common(p, path=False)
@@ -836,7 +1103,7 @@ def main(argv=None) -> int:
     common(p)
     p.add_argument("--days", type=int, default=30, help="session window in days (default 30)")
     p.add_argument("--threshold", type=int, default=150_000)
-    p.add_argument("--window", type=int, default=200_000)
+    p.add_argument("--window", type=int, help=window_help)
     p.add_argument("--target", type=int, default=5_000, help="target tokens for repo instructions (default 5000)")
 
     p = sub.add_parser("verify-split", help="every line of OLD must exist in NEW files (or the allow list)")
@@ -846,20 +1113,40 @@ def main(argv=None) -> int:
     p.add_argument("--json", action="store_true")
 
     a = ap.parse_args(argv)
+    if getattr(a, "path", None) is not None:
+        _project_dir(a.path)
+    for flag in ("since", "until", "compare_at"):
+        if getattr(a, flag, None):
+            setattr(a, flag, _date(getattr(a, flag), "--" + flag.replace("_", "-")))
+    for flag in ("max_tokens", "window", "threshold", "days", "top"):
+        v = getattr(a, flag, None)
+        if v is not None and v < 0:
+            raise UsageError(f"--{flag.replace('_', '-')} must not be negative")
 
     if a.cmd == "files":
         res = scan_files(a.path, _harnesses(a.harness))
         _emit(res, a.json, print_files)
         if a.max_tokens is not None:
-            over = {h: r["repo_tokens"] for h, r in res.items() if h in HARNESSES and r["repo_tokens"] > a.max_tokens}
-            for h, n in over.items():
-                print(f"FAIL {h}: repo instructions ~{fmt_k(n)} tokens > {fmt_k(a.max_tokens)}", file=sys.stderr)
-            return 1 if over else 0
-        return 0
+            failed = False
+            for h in HARNESSES:
+                r = res.get(h)
+                if not r:
+                    continue
+                if r["repo_file_tokens"] > a.max_tokens:
+                    failed = True
+                    print(f"FAIL {h}: repo instructions ~{fmt_k(r['repo_file_tokens'])} tokens > "
+                          f"{fmt_k(a.max_tokens)}", file=sys.stderr)
+                for e in r["files"]:
+                    if e.get("truncated_bytes"):
+                        failed = True
+                        print(f"FAIL {h}: {short(e['path'])} has {e['truncated_bytes']:,} bytes past "
+                              "project_doc_max_bytes - Codex never sees them", file=sys.stderr)
+            return EXIT_FAIL if failed else EXIT_OK
+        return EXIT_OK
 
     if a.cmd == "skills":
         _emit(scan_skills(a.path, _harnesses(a.harness), a.window), a.json, print_skills)
-        return 0
+        return EXIT_OK
 
     if a.cmd == "sessions":
         sessions = load_sessions(_harnesses(a.harness), a.include_subagents)
@@ -910,17 +1197,23 @@ def main(argv=None) -> int:
         return 0
 
     if a.cmd == "verify-split":
-        missing, total = verify_split(a.old, a.new, a.allow)
+        res = verify_split(a.old, a.new, a.allow)
+        missing = res["missing"]
         if a.json:
-            _emit({"checked": total, "missing": missing}, True, None)
+            _emit(res, True, None)
         else:
-            print(f"checked {total} lines of {a.old}: {len(missing)} missing")
+            print(f"checked {res['checked']} lines of {a.old} against {res['files_read']} file(s): "
+                  f"{len(missing)} missing")
             for m in missing[:40]:
-                print(f"  - {m[:160]}")
+                extra = ""
+                if m in res["missing_copies"]:
+                    short_by, n = res["missing_copies"][m]
+                    extra = f"  ({short_by} of {n} copies)"
+                print(f"  - {m[:160]}{extra}")
             if len(missing) > 40:
                 print(f"  … {len(missing) - 40} more")
-        return 1 if missing else 0
-    return 2
+        return EXIT_FAIL if missing else EXIT_OK
+    return EXIT_USAGE
 
 
 if __name__ == "__main__":

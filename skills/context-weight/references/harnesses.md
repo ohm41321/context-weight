@@ -13,7 +13,10 @@ Source: https://code.claude.com/docs/en/memory and https://code.claude.com/docs/
 - `~/.claude/CLAUDE.md`.
 - `CLAUDE.md`, `.claude/CLAUDE.md` and `CLAUDE.local.md` in the working
   directory and in every directory above it.
-- `.claude/rules/*.md` files that have no `paths:` frontmatter.
+- `.claude/rules/*.md` files that have no `paths:` frontmatter, user-level
+  `~/.claude/rules/` first. Symlinked files and folders inside `rules/` are
+  followed; loops are detected. A symlink whose target is outside the working
+  directory loads only after the user approves external imports.
 
 **Loaded on demand**
 
@@ -46,9 +49,17 @@ structure; they save no context.
 
 - Only the name and description are listed at startup. The body loads when the
   skill is used.
-- `description` plus `when_to_use` is cut at 1,536 characters.
-- The whole listing gets about 1% of the context window. Past that, the
-  least-used skills lose their descriptions; their names stay.
+- `description` plus `when_to_use` is cut at 1,536 characters
+  (`skillListingMaxDescChars` changes it).
+- The whole listing has a **character** budget of 1% of the model's context
+  window. `skillListingBudgetFraction` in settings (for example `0.02`) or the
+  `SLASH_COMMAND_TOOL_CHAR_BUDGET` environment variable (a fixed character
+  count) raises it. Past the budget, the least-used skills lose their
+  descriptions; their names stay.
+- `cw.py` converts the window to characters at 4 per token: older docs gave an
+  8,000-character fallback, which is 1% of a 200k window at that rate. The
+  window is not in Claude Code's logs, so `cw.py` assumes 200k unless
+  `--window` says otherwise (use `--window 1000000` for 1M-context models).
 - Skill folders: `~/.claude/skills`, `.claude/skills` from the working
   directory up to the repo root, and `skills/` inside each plugin.
 
@@ -60,6 +71,8 @@ structure; they save no context.
 - A file that opens with `compact_boundary` continues an earlier file and
   repeats some of its requests, with their original timestamps. Deduplicate
   across files, and leave that file's first request out of the startup baseline.
+  Claude Code 2.1.3xx writes compactions mid-file instead; message ids are still
+  unique across files, so the cross-file dedup is a guard, not a correction.
 - Context for one request = `input_tokens + cache_read_input_tokens + cache_creation_input_tokens`.
 
 **Live meter:** `/context`.
@@ -94,7 +107,8 @@ across nested directories. `cw.py` applies the cap to the project chain.
   `~/.agents/skills`, `/etc/codex/skills`, and bundled system skills. Older
   installs also used `~/.codex/skills`.
 - The listing budget is 2% of the context window, or 8,000 characters when the
-  window is unknown.
+  window is unknown. `cw.py` reads the window from the newest rollout
+  (`model_context_window`).
 
 **Logs:** `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`.
 
@@ -102,7 +116,11 @@ across nested directories. `cw.py` applies the cap to the project chain.
   which is the context for that request and includes cached tokens.
 - The same totals are re-emitted on rate-limit updates. Deduplicate them by
   `total_token_usage.total_tokens`.
-- Subagent threads have `session_meta.payload.thread_source == "subagent"`.
+- Subagent threads: `session_meta.payload.source` is an object with a
+  `subagent` key (spawned agents: `thread_spawn`; guardian reviewers:
+  `other: "guardian"`). `thread_source` is `"subagent"` or `"guardian_review"`
+  for them, and `"user"`, `"chatgpt_handoff"` or absent for user threads.
+  Counting guardian threads as sessions roughly doubles the session count.
 
 **Live meter:** `/status`.
 
@@ -114,8 +132,10 @@ The docs say Gemini CLI was replaced by Antigravity CLI on 2026-06-18.
 Antigravity's loading rules are not verified here.
 
 - **Global:** `~/.gemini/GEMINI.md`.
-- **Project:** `GEMINI.md` in the workspace directories and their parents.
-  Subdirectory files load just in time, when a tool touches that directory.
+- **Project:** `GEMINI.md` in the working directory and each parent up to the
+  project root (the folder with `.git`). Subdirectory files load just in time,
+  when a tool touches that directory. `cw.py` walks to the filesystem root when
+  there is no `.git`.
 - **File names:** `context.fileName` in `~/.gemini/settings.json` can list
   other names, for example `["AGENTS.md", "GEMINI.md"]`.
 - **Skills:** `~/.gemini/skills`, `~/.agents/skills`, `.gemini/skills`,

@@ -76,10 +76,23 @@ python3 $CW files .                      # compare with step 0
 python3 $CW files . --max-tokens 6000    # exit 0
 ```
 
-`verify-split` compares lines after collapsing whitespace. When you rewrite a
-rule tersely, the old wording shows up as missing. Either keep the original
-line in a notes file, or add it to `dropped.txt` with the user's agreement.
-Exit 0 is the gate. Do not hand back work while it fails.
+How `verify-split` compares:
+
+- Every line with a letter or digit counts, however short (`No.` counts).
+  Horizontal rules, table separators and code fences are structure and are
+  skipped.
+- Prose lines are compared after collapsing whitespace, so re-wrapping and
+  re-indenting are fine.
+- Inside fenced code, indentation relative to the fence is kept: flattening
+  YAML or Python shows up as missing.
+- A line that appears twice in the old file must appear twice in the new set.
+  Removing a duplicate is a drop: list it in `dropped.txt`.
+- The old file never counts as its own copy, even inside a folder you pass.
+
+When you rewrite a rule tersely, the old wording shows up as missing. Either
+keep the original line in a notes file, or add it to `dropped.txt` with the
+user's agreement. Exit 0 is the gate; exit 1 means lines are missing; exit 2
+means an input could not be read. Do not hand back work while it fails.
 
 ## 6. Keep it slim
 

@@ -28,8 +28,11 @@ class CwTest(unittest.TestCase):
         self.repo = t / "work" / "repo"
         (self.repo / ".git").mkdir(parents=True)
         self.env = {k: v for k, v in os.environ.items()
-                    if k not in ("CLAUDE_CONFIG_DIR", "CODEX_HOME", "OPENCODE_DISABLE_CLAUDE_CODE")}
+                    if k not in ("CLAUDE_CONFIG_DIR", "CODEX_HOME", "OPENCODE_DISABLE_CLAUDE_CODE",
+                                 "SLASH_COMMAND_TOOL_CHAR_BUDGET")}
         self.env["HOME"] = str(self.home)
+        self.env["USERPROFILE"] = str(self.home)  # Windows: expanduser reads USERPROFILE, not HOME
+        self.env["PYTHONIOENCODING"] = "utf-8"
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -206,6 +209,7 @@ class CwTest(unittest.TestCase):
         self.assertEqual(s["continued_sessions"], 1)
         self.assertEqual(s["baseline_median"], 40_000)
 
+    @unittest.skipIf(os.name == "nt", "Windows ignores TZ names such as Asia/Bangkok")
     def test_dates_are_local_not_utc(self):
         self.env["TZ"] = "Asia/Bangkok"
         self._claude_log("late", self.repo, "2026-11-04T19:00:00Z", [10_000])  # 02:00 on 5 Nov in UTC+7
@@ -240,6 +244,181 @@ class CwTest(unittest.TestCase):
         self.assertIn("dropped dup", out)
         allow = write(self.repo / "allow.txt", "dropped dup\n")
         self.run_cw("verify-split", str(old), str(new), str(self.repo / "notes"), "--allow", str(allow))
+
+    def test_verify_split_counts_repeated_lines(self):
+        old = write(self.repo / "old.md", "## Backend\n- Run tests: make check\n## Frontend\n- Run tests: make check\n")
+        new = write(self.repo / "AGENTS.md", "## Backend\n- Run tests: make check\n## Frontend\n")
+        res = self.cw_json("verify-split", str(old), str(new), code=1)
+        self.assertEqual(res["missing"], ["- Run tests: make check"])
+
+    def test_verify_split_keeps_short_lines_with_words(self):
+        old = write(self.repo / "old.md", "Deploy on Fridays?\nNo.\n---\n|---|\n")
+        new = write(self.repo / "AGENTS.md", "Deploy on Fridays?\n")
+        res = self.cw_json("verify-split", str(old), str(new), code=1)
+        self.assertEqual(res["missing"], ["No."])  # rules and table separators carry no words
+
+    def test_verify_split_keeps_indentation_inside_code_blocks(self):
+        old = write(self.repo / "old.md", "```yaml\nenv:\n  prod: blue\n  dev: green\n```\n")
+        new = write(self.repo / "AGENTS.md", "```yaml\nenv:\nprod: blue\ndev: green\n```\n")
+        res = self.cw_json("verify-split", str(old), str(new), code=1)
+        self.assertEqual(sorted(res["missing"]), ["  dev: green", "  prod: blue"])
+        write(self.repo / "AGENTS.md", "~~~yaml\nenv:\n  prod:   blue\n  dev: green\n~~~\n")  # inner spacing may change
+        self.run_cw("verify-split", str(old), str(new))
+
+    def test_verify_split_ignores_the_old_file_inside_a_new_directory(self):
+        old = write(self.repo / "notes" / "CLAUDE.md.bak", "only in the backup\n")
+        write(self.repo / "notes" / "CLAUDE.md.bak.md", "only in the backup\n")  # a copy that does count
+        self.run_cw("verify-split", str(old), str(self.repo / "notes"))
+        (self.repo / "notes" / "CLAUDE.md.bak.md").unlink()
+        old_md = write(self.repo / "notes" / "old.md", "kept nowhere else\n")
+        self.run_cw("verify-split", str(old_md), str(self.repo / "notes"), code=1)
+
+    def test_verify_split_unreadable_inputs_exit_2(self):
+        new = write(self.repo / "AGENTS.md", "x\n")
+        self.run_cw("verify-split", str(self.repo / "missing.md"), str(new), code=2)
+        old = write(self.repo / "old.md", "rule\n")
+        self.run_cw("verify-split", str(old), str(self.repo / "nope"), code=2)
+        self.run_cw("verify-split", str(old), str(new), "--allow", str(self.repo / "nope.txt"), code=2)
+
+    # ------------------------------------------------------------------ gate and paths
+    def test_missing_or_file_path_exits_2(self):
+        for cmd in ("files", "skills", "report"):
+            self.run_cw(cmd, str(self.repo / "no-such-dir"), code=2)
+        f = write(self.repo / "CLAUDE.md", "x")
+        self.run_cw("files", str(f), "--max-tokens", "1", code=2)
+
+    def test_max_tokens_gate_counts_text_codex_cuts_off(self):
+        write(self.repo / "AGENTS.md", "a" * 100 * 1024)  # ~34k tokens, Codex keeps 32 KiB of it
+        p = subprocess.run([sys.executable, str(CW), "files", str(self.repo), "--harness", "codex", "--max-tokens", "15000"],
+                           env=self.env, capture_output=True, text=True)
+        self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+        self.assertIn("never sees", p.stderr)
+
+    # ------------------------------------------------------------------ robustness
+    def test_bom_does_not_hide_frontmatter(self):
+        write(self.repo / ".claude" / "rules" / "scoped.md", "﻿---\npaths:\n  - src/**\n---\nonly src")
+        write(self.home / ".claude" / "skills" / "dir-name" / "SKILL.md", "﻿---\nname: real-name\ndescription: hi\n---\n")
+        r = self.cw_json("files", str(self.repo), "--harness", "claude")["claude"]
+        self.assertEqual(r["files"], [])
+        s = self.cw_json("skills", str(self.repo), "--harness", "claude")["claude"]
+        self.assertEqual([h["name"] for h in s["heaviest"]], ["real-name"])
+
+    @unittest.skipIf(os.name == "nt" or (hasattr(os, "geteuid") and os.geteuid() == 0), "needs POSIX permissions")
+    def test_unreadable_folder_does_not_crash(self):
+        locked = Path(self.tmp.name) / "locked"
+        write(locked / "codex" / "AGENTS.md", "x")
+        self.env["CODEX_HOME"] = str(locked / "codex")
+        self.env["CLAUDE_CONFIG_DIR"] = str(locked / "claude")
+        locked.chmod(0)
+        try:
+            self.cw_json("files", str(self.repo))
+            self.cw_json("skills", str(self.repo))
+            self.cw_json("sessions")
+        finally:
+            locked.chmod(0o755)
+
+    def test_malformed_log_lines_are_skipped(self):
+        good = {"type": "assistant", "cwd": str(self.repo), "timestamp": "2026-10-01T00:00:00Z",
+                "message": {"id": "ok", "usage": {"input_tokens": 1_000}}}
+        bad = ["[]", '"assistant"', "42", "null",
+               json.dumps({"type": "assistant", "message": []}),
+               json.dumps({"type": "assistant", "message": {"id": "s", "usage": {"input_tokens": "lots"}}}),
+               json.dumps({"type": "assistant", "message": {"id": "u", "usage": []}}),
+               '{"type": "assistant", "cut off']
+        write(self.home / ".claude" / "projects" / "-repo" / "x.jsonl", "\n".join(bad + [json.dumps(good)]) + "\n")
+        meta = {"type": "session_meta", "payload": {"cwd": str(self.repo)}}
+        tok = {"type": "event_msg", "timestamp": "2026-10-01T00:00:00Z", "payload": {"type": "token_count", "info": {
+            "total_token_usage": {"total_tokens": 5}, "last_token_usage": {"input_tokens": 2_000}}}}
+        cbad = ['["token_count"]', '{"type": "session_meta", "payload": []}',
+                json.dumps({"type": "event_msg", "payload": {"type": "token_count", "info": []}}),
+                json.dumps({"type": "event_msg", "payload": {"type": "token_count",
+                                                              "info": {"last_token_usage": {"input_tokens": None}}}})]
+        write(self.home / ".codex" / "sessions" / "2026" / "10" / "01" / "rollout-x.jsonl",
+              "\n".join([json.dumps(meta)] + cbad + [json.dumps(tok)]) + "\n")
+        res = self.cw_json("sessions")
+        self.assertEqual(res[f"claude {self.repo.resolve()}"]["requests"], 1)
+        self.assertEqual(res[f"codex {self.repo.resolve()}"]["requests"], 1)
+
+    def test_codex_guardian_and_spawned_threads_count_as_subagents(self):
+        def rollout(name, thread_source, source):
+            payload = {"cwd": str(self.repo), "source": source}
+            if thread_source is not None:
+                payload["thread_source"] = thread_source
+            jsonl(self.home / ".codex" / "sessions" / "2026" / "11" / "01" / f"rollout-{name}.jsonl", [
+                {"type": "session_meta", "timestamp": "2026-11-01T00:00:00Z", "payload": payload},
+                {"type": "event_msg", "timestamp": "2026-11-01T00:00:00Z", "payload": {"type": "token_count", "info": {
+                    "total_token_usage": {"total_tokens": 1}, "last_token_usage": {"input_tokens": 10_000}}}}])
+        rollout("user-cli", "user", "cli")
+        rollout("old-desktop", None, "vscode")
+        rollout("handoff", "chatgpt_handoff", "vscode")
+        rollout("guardian", "guardian_review", {"subagent": {"other": "guardian"}})
+        rollout("spawned", "subagent", {"subagent": {"thread_spawn": {"depth": 1}}})
+        rollout("guardian-new-label", "reviewer_v2", {"subagent": {"other": "guardian"}})
+        key = f"codex {self.repo.resolve()}"
+        self.assertEqual(self.cw_json("sessions", "--harness", "codex")[key]["sessions"], 3)
+        self.assertEqual(self.cw_json("sessions", "--harness", "codex", "--include-subagents")[key]["sessions"], 6)
+
+    @unittest.skipIf(os.name == "nt", "symlinks need extra rights on Windows")
+    def test_symlinked_rules_folder_is_counted_once(self):
+        shared = write(Path(self.tmp.name) / "shared-rules" / "style.md", "shared rule")
+        (self.repo / ".claude" / "rules").mkdir(parents=True)
+        os.symlink(shared.parent, self.repo / ".claude" / "rules" / "shared", target_is_directory=True)
+        os.symlink(self.repo / ".claude" / "rules", self.repo / ".claude" / "rules" / "loop", target_is_directory=True)
+        r = self.cw_json("files", str(self.repo), "--harness", "claude")["claude"]
+        self.assertEqual([Path(f["path"]).name for f in r["files"]], ["style.md"])
+
+    def test_gemini_stops_at_the_git_root(self):
+        write(self.repo.parent / "GEMINI.md", "outside the repo")
+        write(self.repo / "GEMINI.md", "inside")
+        r = self.cw_json("files", str(self.repo), "--harness", "gemini")["gemini"]
+        self.assertEqual([f["role"] for f in r["files"]], ["project"])
+
+    def test_skill_budget_uses_codex_window_from_logs(self):
+        write(self.home / ".agents" / "skills" / "one" / "SKILL.md", "---\nname: one\ndescription: hi\n---\n")
+        jsonl(self.home / ".codex" / "sessions" / "2026" / "11" / "01" / "rollout-w.jsonl", [
+            {"type": "event_msg", "timestamp": "2026-11-01T00:00:00Z", "payload": {"type": "token_count", "info": {
+                "total_token_usage": {"total_tokens": 1}, "last_token_usage": {"input_tokens": 1},
+                "model_context_window": 400_000}}}])
+        s = self.cw_json("skills", str(self.repo), "--harness", "claude,codex")
+        self.assertEqual(s["codex"]["budget"], 8_000)              # 2% of the window Codex reported
+        self.assertEqual(s["claude"]["window_source"], "default")  # no window in Claude logs: assumed
+        s = self.cw_json("skills", str(self.repo), "--harness", "claude,codex", "--window", "1000000")
+        # Claude Code budgets the listing in characters: 1% of the window at ~4 chars per token
+        self.assertEqual((s["claude"]["budget"], s["claude"]["budget_unit"]), (40_000, "chars"))
+        self.assertEqual((s["codex"]["budget"], s["codex"]["budget_unit"]), (20_000, "tokens"))
+        write(self.home / ".claude" / "settings.json", json.dumps({"skillListingBudgetFraction": 0.02}))
+        self.assertEqual(self.cw_json("skills", str(self.repo), "--harness", "claude")["claude"]["budget"], 16_000)
+        self.env["SLASH_COMMAND_TOOL_CHAR_BUDGET"] = "123456"
+        s = self.cw_json("skills", str(self.repo), "--harness", "claude")["claude"]
+        self.assertEqual((s["budget"], s["basis"]), (123_456, "SLASH_COMMAND_TOOL_CHAR_BUDGET"))
+
+    # ------------------------------------------------------------------ installer
+    def run_install(self, *args, code=0):
+        p = subprocess.run([sys.executable, str(CW.parents[3] / "install.py"), *args],
+                           env=self.env, capture_output=True, text=True)
+        self.assertEqual(p.returncode, code, p.stdout + p.stderr)
+        return p.stdout
+
+    def test_install_links_every_harness_and_uninstalls(self):
+        self.run_install()
+        for d in (self.home / ".agents" / "skills", self.home / ".claude" / "skills"):
+            self.assertTrue((d / "context-weight" / "SKILL.md").is_file(), d)
+        self.run_install()  # idempotent
+        self.run_install("--uninstall")
+        self.assertFalse((self.home / ".claude" / "skills" / "context-weight").exists())
+
+    def test_install_into_one_repo_copies(self):
+        self.run_install("--project", str(self.repo))
+        for d in (".agents/skills", ".claude/skills"):
+            sk = self.repo / d / "context-weight"
+            self.assertTrue((sk / "scripts" / "cw.py").is_file())
+            self.assertFalse(sk.is_symlink())  # a copy, so it can be committed with the repo
+
+    def test_install_never_replaces_a_real_folder(self):
+        write(self.home / ".claude" / "skills" / "context-weight" / "SKILL.md", "user's own")
+        out = self.run_install()
+        self.assertIn("skip", out)
+        self.assertEqual((self.home / ".claude" / "skills" / "context-weight" / "SKILL.md").read_text(), "user's own")
 
 
 if __name__ == "__main__":

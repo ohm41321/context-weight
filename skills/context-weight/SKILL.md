@@ -43,7 +43,9 @@ When you report to the user, give:
 - the findings.
 
 Say which numbers are estimates (`files`, `skills`) and which are measured
-(`sessions`).
+(`sessions`). The Claude Code skill budget depends on the model's context
+window, which the logs do not record: `cw.py` assumes 200k and says so. If the
+user runs a 1M-context model, rerun with `--window 1000000`.
 
 ## 2. Pick the lever the numbers point at
 
@@ -97,13 +99,19 @@ re-sends everything before it.
   `verify-split` exits 0.
 - **Stop regrowth:** add `python3 <skill-dir>/scripts/cw.py files . --max-tokens 6000`
   to CI or pre-commit. It exits 1 when the repo's instructions grow past the
-  limit.
+  limit or when Codex would cut any of them off, and 2 when the path is wrong,
+  so a typo never passes.
 - **After a few days of real use:** run
   `cw.py sessions --project <name> --compare-at <date of the change>` and report
   `start` and `start%` before and after.
 
 Do not claim realised savings until that last command has run on sessions from
 after the change.
+
+## Exit codes
+
+`0` ok, `1` a check failed (`--max-tokens`, `verify-split`), `2` bad input
+(missing path, unreadable file, bad date). Errors go to stderr.
 
 ## Reference
 
