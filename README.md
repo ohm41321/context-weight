@@ -99,7 +99,7 @@ cw.py report . --open
 | Part | What it tells you |
 | --- | --- |
 | Big number | The largest instruction-file load at startup, in tokens. It is sent again with every request. |
-| Before and after | Shown once you have slimmed. The report finds the change in git by itself (uncommitted, or the commit or merge that cut the files) and sets this repo's files then and now beside measured startup in the sessions before and after it. Fewer than 3 sessions after the change are marked too early. |
+| Before and after | Shown once you have slimmed. The report finds the change in git by itself (uncommitted, or the commit or merge that cut the files) and sets this repo's files before and right after it (and now, if they grew back) beside measured startup in the sessions before and after it. Fewer than 3 sessions after the change are marked too early. |
 | Tiles | Measured: the real first request (instruction files plus system prompt, tools and skill listing), how much of all input that load is, and what slimming would save. |
 | Loaded at startup | Each agent's load, split into this repo and everything outside it (your global files, plugins). The thin line is your target. |
 | Heaviest files | What to slim first. A red mark means Codex cuts the file off and never reads the rest. |
@@ -115,7 +115,7 @@ cw.py report . --open
 
 | Command | Answers |
 | --- | --- |
-| `cw.py report [PATH]` | Everything for one repo, plus ranked findings and the before and after of your last slimming. `--svg` or `--open` draws it; `--compare-at DATE` sets the split |
+| `cw.py report [PATH]` | Everything for one repo, plus ranked findings and the before and after of your last slimming. `--svg` or `--open` draws it; `--compare-at` takes a commit id, a date or a time to set the split |
 | `cw.py files [PATH]` | Which instruction files each agent loads at startup, in tokens |
 | `cw.py skills [PATH]` | Size of the skill listing against each agent's budget |
 | `cw.py sessions` | Context size per project, measured from logs. `--compare-at DATE` shows before and after |

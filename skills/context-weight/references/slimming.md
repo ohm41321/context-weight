@@ -100,4 +100,4 @@ means an input could not be read. Do not hand back work while it fails.
 - New lessons go in as one rule line plus a note file, not as a pasted log.
 - After a few days of use, measure the real effect with `python3 $CW report .`.
   Its Before and after finds the slimming commit in git by itself; pass
-  `--compare-at <date of the change>` to set the split yourself.
+  `--compare-at <commit id>` (or a time just before the change) to set the split yourself.

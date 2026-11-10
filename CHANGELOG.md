@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.3.1 (2026-11-10)
+
+Fixes from running 0.3.0 on four real repos.
+
+- A slimming is now judged against its own parent commit, not against today's files. Before, a
+  CLAUDE.md that grew past its old size after the cut hid the slimming, with no Before and
+  after at all.
+- `files` in `compare` has three sizes: `before` and `after` the change, and `now`. `after` used
+  to be today's size; today's size is now `now`, and `changed` lists what the change itself
+  changed. When the cut files grew back by 2,000 tokens or more, the report says so.
+- A slimming merged from a branch still splits the sessions at the merge, but `commit` now names
+  the branch commit that removed most of the lines the merge itself removed from the files the
+  agents asked load; `merge` names the merge. Removing text the branch added itself, a cut the
+  branch put back, and what the main line changed meanwhile earn no credit, and when no single
+  commit removed at least 6,000 bytes of them the merge is named. `subject` gives the commit's whole
+  subject line without control or format characters, so it cannot send terminal escapes; the
+  text and the picture shorten it.
+- `report --compare-at` also takes a time (`YYYY-MM-DDTHH:MM`, local unless it has an offset)
+  or a commit id, SHA-1 or SHA-256. A commit is compared with its parent; `found` is then
+  `"commit"` with `picked: true`, and `before_ref` is `null` for a root commit. For a day or a
+  time, each agent's `after` is its own first main-line cut since then, found the way the
+  report finds one by itself, so another agent's cut, a file growing or a small trim is
+  skipped; an agent with no cut is weighed as today. A split where nothing
+  shrank says so. A day after 2099, which git cannot read, now splits after the last commit.
+- When the before side has fewer than 3 sessions and the oldest Claude Code log on this machine
+  is newer than the window, `compare.logs_from` gives its date and `cleanup_days` the
+  `cleanupPeriodDays` in effect (30 when unset). Only when the oldest log is about that old
+  (`logs_deleted`) does the report say Claude Code deleted older transcripts.
+
 ## 0.3.0 (2026-11-10)
 
 - `report` shows **Before and after** once you have slimmed. It finds the change in git by

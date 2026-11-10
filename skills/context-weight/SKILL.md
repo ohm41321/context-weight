@@ -36,8 +36,8 @@ The text output has up to five parts:
 
 - **Before and after**, when git shows a slimming: uncommitted changes that cut
   the instruction files, or the newest commit or merge on the main line that
-  did. It shows this repo's files then and now, and measured startup in the
-  sessions before and after the change;
+  did. It shows this repo's files before and right after the change (and now,
+  when they grew back), and measured startup in the sessions before and after it;
 - the instruction files each harness loads at startup, in estimated tokens;
 - the skill listing against each harness's budget;
 - measured session numbers for this repo;
@@ -118,11 +118,17 @@ re-sends everything before it.
   the slimming in git by itself and prints **Before and after**. When you finish
   slimming, tell the user: commit the change, work as usual for a few days, then
   run `/context-weight` again to see the measured result. If the change it
-  picked is the wrong one, set the split with `--compare-at <date of the change>`.
-  A fast-forward merge keeps the branch commit's time, so pass the merge day.
+  picked is the wrong one, set the split with `--compare-at`: a commit id is the
+  most exact, and `YYYY-MM-DDTHH:MM` works for a time just before the change. A
+  fast-forward merge keeps the branch commit's time, so pass the merge time.
 
 Do not claim realised savings while Before and after says "too early" or shows
-no sessions after the change: fewer than 3 sessions are too few to trust.
+no sessions after the change: fewer than 3 sessions are too few to trust. When
+it says the files grew back, say so: the sessions after the change include that
+growth. When it says Claude Code logs start later than the change, older
+sessions were deleted (`cleanupPeriodDays`, 30 days by default); suggest a
+higher value in `~/.claude/settings.json` only if the user wants longer
+measurements, since it keeps more transcripts on disk.
 
 ## Exit codes
 

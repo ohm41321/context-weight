@@ -44,6 +44,17 @@
   (1917). Leave `--since` out for windows that long.
 - A slimming found by the size of the entry files is checked against the real startup load of
   the old commit: moving text into an `@import`ed file shrinks CLAUDE.md but loads the same.
+  Check it against the commit itself, not today's files: 0.3.0 compared with today, so a repo
+  whose CLAUDE.md grew past its old size after the cut (common with `/retro` lines) lost the
+  slimming without a word.
+- Claude Code deletes transcripts under `~/.claude/projects/` older than `cleanupPeriodDays`
+  (30 days by default), so "no sessions before" for an older change usually means deleted logs.
+- To name the branch commit behind a merged slimming, credit each branch cut with the lines it
+  removed that the merge's own diff (against the main line) removes too. Weighing loads fails
+  three ways, each seen in a review: a commit's own drop names the removal of text the branch
+  pasted in; overlap with the merge's drop in totals names a cut the branch later put back
+  (drop B, drop A, restore B); and main-line growth during the branch shifts the totals.
+  Test fixtures need real lines: a file of one long line makes every edit remove "the" line.
 - A repo's own config can make read-only git run programs: `core.fsmonitor` (ls-files),
   `log.showSignature` + `gpg.program` (log), and in a partial clone `cat-file` fetches missing
   blobs, running `core.sshCommand`. Git older than 2.44 ignores `GIT_NO_LAZY_FETCH`, and a repo's
