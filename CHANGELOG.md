@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- The picture's top row now describes one agent. The big number, measured startup, startup
+  share and possible saving all belong to the agent with the heaviest startup load. Before,
+  the tiles could take Codex's measured numbers beside Claude Code's load and saving.
+- `--window` sets Claude Code's window only. Codex keeps the window its logs record and uses
+  `--window` only when they record none. Before, `--window 1000000` also raised Codex's skill
+  budget to 20k tokens, so a Codex listing over its real budget showed as within it.
+
 ## 0.2.1 (2026-11-10)
 
 - The check that Claude Code and Codex follow the same rules now also fires when one side has

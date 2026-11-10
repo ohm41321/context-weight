@@ -239,6 +239,21 @@ class CwTest(unittest.TestCase):
         self.assertIn(f"Picture: {out}", text_out)
         self.assertIn("prefers-color-scheme: dark", out.read_text(encoding="utf-8"))  # auto follows the viewer
 
+    def test_report_svg_hero_row_describes_one_agent(self):
+        # Claude has the heavy file; Codex has more input. The tiles once mixed the two.
+        write(self.repo / "CLAUDE.md", "a" * 60_000)
+        write(self.repo / "AGENTS.md", "short")
+        self._claude_log("s", self.repo, "2099-01-01T00:00:00Z", [90_000, 95_000])
+        self._codex_log("c", self.repo, "2099-01-01T00:00:00Z", [300_000, 300_000, 300_000])
+        out = self.tmp_path / "pic.svg"
+        self.cw_json("report", str(self.repo), "--days", "40000", "--svg", str(out))
+        _, texts = self._svg_texts(out)
+        self.assertIn("startup in Claude Code", texts)
+        self.assertIn("median, Claude Code", texts)
+        self.assertIn("of Claude Code input", texts)
+        self.assertNotIn("median, Codex", texts)
+        self.assertNotIn("of Codex input", texts)
+
     def test_report_svg_escapes_paths_and_works_without_sessions(self):
         repo = self.tmp_path / "work" / "R&D <x>" if os.name != "nt" else self.tmp_path / "work" / "R&D"
         (repo / ".git").mkdir(parents=True)
@@ -488,6 +503,11 @@ class CwTest(unittest.TestCase):
         r = self.cw_json("files", str(self.repo), "--harness", "gemini")["gemini"]
         self.assertEqual([f["role"] for f in r["files"]], ["project"])
 
+    def test_window_fills_in_for_codex_only_without_logs(self):
+        write(self.home / ".agents" / "skills" / "one" / "SKILL.md", "---\nname: one\ndescription: hi\n---\n")
+        s = self.cw_json("skills", str(self.repo), "--harness", "codex", "--window", "1000000")
+        self.assertEqual((s["codex"]["budget"], s["codex"]["window_source"]), (20_000, "--window"))
+
     def test_skill_budget_uses_codex_window_from_logs(self):
         write(self.home / ".agents" / "skills" / "one" / "SKILL.md", "---\nname: one\ndescription: hi\n---\n")
         jsonl(self.home / ".codex" / "sessions" / "2026" / "11" / "01" / "rollout-w.jsonl", [
@@ -500,7 +520,9 @@ class CwTest(unittest.TestCase):
         s = self.cw_json("skills", str(self.repo), "--harness", "claude,codex", "--window", "1000000")
         # Claude Code budgets the listing in characters: 1% of the window at ~4 chars per token
         self.assertEqual((s["claude"]["budget"], s["claude"]["budget_unit"]), (40_000, "chars"))
-        self.assertEqual((s["codex"]["budget"], s["codex"]["budget_unit"]), (20_000, "tokens"))
+        # Codex records its own window; --window must not override it (it once did: 20,000)
+        self.assertEqual((s["codex"]["budget"], s["codex"]["budget_unit"]), (8_000, "tokens"))
+        self.assertEqual(s["codex"]["window_source"], "codex logs")
         write(self.home / ".claude" / "settings.json", json.dumps({"skillListingBudgetFraction": 0.02}))
         self.assertEqual(self.cw_json("skills", str(self.repo), "--harness", "claude")["claude"]["budget"], 16_000)
         self.env["SLASH_COMMAND_TOOL_CHAR_BUDGET"] = "123456"

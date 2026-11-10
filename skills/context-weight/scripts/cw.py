@@ -599,10 +599,10 @@ def _listing_budget(h: str, cwd, window: int | None) -> dict:
         return {"budget": int(w * CHARS_PER_WINDOW_TOKEN * frac), "budget_unit": "chars", "window": w,
                 "window_source": w_src, "basis": f"{frac * 100:g}% of a {fmt_k(w)}-token window"}
     if h == "codex":
-        if window:
+        # Codex records its own window; --window is Claude Code's and only fills in when the logs have none.
+        w, w_src = _codex_window(), "codex logs"
+        if not w and window:
             w, w_src = window, "--window"
-        else:
-            w, w_src = _codex_window(), "codex logs"
         if not w:
             return {"budget": CODEX_LISTING_FALLBACK_CHARS, "budget_unit": "chars", "window": None,
                     "window_source": "unknown", "basis": "window unknown"}
@@ -1089,27 +1089,23 @@ def render_svg(rep: dict, theme: str = "auto") -> str:
         caption = f"tokens of instruction files load at startup in {AGENT_NAMES[heavy]}"
         for j, ln in enumerate(_wrap(caption, 300, 14)[:2]):
             g.text(L, y + 80 + 18 * j, ln, 14, "s")
+    # Every tile describes the hero's agent: mixing agents in one row reads as one agent's numbers.
     tiles = []
     measured = {h: s for h, s in stats.items() if s}
-    if measured:
-        big = max(measured, key=lambda h: measured[h]["input_tokens"])
-        s = measured[big]
-        tiles.append(("Measured startup", f"~{fmt_k(s['baseline_median'])}", f"median, {AGENT_NAMES[big]}"))
-        tiles.append(("Startup share", pct(s["startup_share"]), f"of {AGENT_NAMES[big]} input"))
-        best = None
-        for h, s2 in measured.items():
-            f = files.get(h)
-            cut = (f["repo_tokens"] - target) if f else 0
-            if cut > 2_000:
-                saved = cut * s2["requests"]
-                if not best or saved > best[0]:
-                    best = (saved, saved / s2["input_tokens"])
-        if best:
-            tiles.append(("Could save", f"~{fmt_k(best[0])}", f"tokens, {pct(best[1])} of input"))
+    s = measured.get(heavy)
+    if s:
+        name = AGENT_NAMES[heavy]
+        tiles.append(("Measured startup", f"~{fmt_k(s['baseline_median'])}", f"median, {name}"))
+        tiles.append(("Startup share", pct(s["startup_share"]), f"of {name} input"))
+        cut = files[heavy]["repo_tokens"] - target
+        if cut > 2_000 and s["input_tokens"]:
+            saved = cut * s["requests"]
+            tiles.append(("Could save", f"~{fmt_k(saved)}", f"tokens, {pct(saved / s['input_tokens'])} of input"))
         else:
-            sessions_n = sum(x["sessions"] for x in measured.values())
-            tiles.append(("Requests", f"{sum(x['requests'] for x in measured.values()):,}",
-                          f"in {sessions_n:,} session{'' if sessions_n == 1 else 's'}"))
+            n = s["sessions"]
+            tiles.append(("Requests", f"{s['requests']:,}", f"in {n:,} session{'' if n == 1 else 's'}"))
+    elif heavy:
+        tiles.append(("Sessions", "none", f"{AGENT_NAMES[heavy]}, last {days} days"))
     else:
         tiles.append(("Sessions", "none", f"in the last {days} days"))
     tile_w = 186
@@ -1470,8 +1466,8 @@ def _main(argv=None) -> int:
     p.add_argument("--max-tokens", type=int, help="exit 1 if this repo's instructions exceed N tokens for any "
                    "harness, or if Codex would cut any of them off; exit 2 on a bad path")
 
-    window_help = ("model context window in tokens (default: Codex reads it from its logs, "
-                   f"otherwise {DEFAULT_WINDOW} is assumed)")
+    window_help = (f"Claude Code's context window in tokens, which its logs do not record (default {DEFAULT_WINDOW}). "
+                   "Codex reads its own window from its logs and uses this only when they have none")
     p = sub.add_parser("skills", help="skill listing size against budgets")
     common(p)
     p.add_argument("--window", type=int, help=window_help)

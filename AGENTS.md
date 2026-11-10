@@ -34,3 +34,7 @@
 - The Claude/Codex divergence check once ran only when both harnesses had project files
   (`if c and x`), so a large CLAUDE.md with no AGENTS.md, the worst case, went unflagged.
   A comparison must decide what an empty side means instead of skipping it.
+- The picture's top row once took each tile's agent from a different maximum, so Claude's load
+  sat beside Codex's measured startup. Numbers that read as one row must come from one agent.
+- `--window` is Claude Code's window, which its logs lack. It once overrode the window Codex
+  records, which hid a Codex listing over its real budget.

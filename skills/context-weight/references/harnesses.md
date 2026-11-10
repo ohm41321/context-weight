@@ -108,7 +108,8 @@ across nested directories. `cw.py` applies the cap to the project chain.
   installs also used `~/.codex/skills`.
 - The listing budget is 2% of the context window, or 8,000 characters when the
   window is unknown. `cw.py` reads the window from the newest rollout
-  (`model_context_window`).
+  (`model_context_window`). `--window` is Claude Code's window and never
+  overrides this; it fills in only when no rollout records a window.
 
 **Logs:** `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`.
 
