@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.1 (2026-11-10)
 
 - The check that Claude Code and Codex follow the same rules now also fires when one side has
   no project instructions at all, such as a large CLAUDE.md with no AGENTS.md. Before, it ran

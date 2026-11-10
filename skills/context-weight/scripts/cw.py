@@ -32,7 +32,7 @@ import webbrowser
 from pathlib import Path
 from xml.sax.saxutils import escape
 
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 HARNESSES = ("claude", "codex", "gemini", "opencode")
 
 CLAUDE_FILE_WARN_CHARS = 40_000   # Claude Code startup warning: "Large CLAUDE.md will impact performance"
