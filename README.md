@@ -289,7 +289,7 @@ context-weight/
 - **Assumptions are printed.** Claude Code's logs do not record the model's
   context window, so the skill budget assumes 200k and says so. Use
   `--window 1000000` for 1M-context models. Codex reads its window from its
-  own logs.
+  own logs, and `--window` does not override it.
 
 ## FAQ
 
