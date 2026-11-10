@@ -69,44 +69,51 @@ npx skills add ohm41321/context-weight
 git clone https://github.com/ohm41321/context-weight.git && python3 context-weight/install.py
 ```
 
-Restart your agent and ask it to **"weigh this repo's context"**.
+Restart your agent and ask it to **"weigh this repo's context"**. It runs the report and
+hands you a picture of it.
 
-To try it without installing anything, run the script straight from GitHub. It only reads files:
+To try it without installing anything, run the script straight from GitHub. It never changes
+your files: it writes the picture to a new folder in the temp folder and opens it.
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ohm41321/context-weight/main/skills/context-weight/scripts/cw.py | python3 - report .
+curl -fsSL https://raw.githubusercontent.com/ohm41321/context-weight/main/skills/context-weight/scripts/cw.py | python3 - report . --open
 ```
 
 ## What you get
 
-```text
-$ cw.py report ~/repo --days 120 --harness claude,codex
-claude   ~157.0k tokens at startup (5 files, ~154.4k from this repo)
-  project                       154.4k  ~/repo/CLAUDE.md
-  ! ~/repo/CLAUDE.md: 222,696 chars > 40,000 (Claude Code shows 'Large CLAUDE.md will impact performance')
-...
-harness  project   sess   req  start  median ... start%   input
-claude   ~/repo       9  2261 175.7k  262.0k ...    65%  613.4M
-...
-1. [claude] repo instructions ~154.4k tokens are re-sent on every request. Slimming to ~5.0k would
-   have saved ~337.9M of 613.4M input tokens in this window (55%, estimated at today's file size).
+One picture of everything that loads before your agent starts work, and what it costs:
+
+```bash
+cw.py report . --open
 ```
 
-| Column | Meaning |
-| --- | --- |
-| `start` | Median context of a session's first request: what loads before any work. |
-| `start%` | Share of all input tokens that is that startup load being re-sent. |
-| `>150k tok` | Share of input that came from requests above the threshold, which means long sessions. |
-| `input` | Total input tokens in the window, as the provider reported them. |
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/report-dark.svg">
+    <img alt="Sample context-weight report. Claude Code loads about 157k tokens of instruction files at startup; its measured first request is 176k tokens, and startup load is 68% of its input. Slimming would save about 346M tokens. Bars per agent, the heaviest files, the skill listing at 5.1 times its budget, measured sessions and six ranked fixes." src="assets/report-light.svg" width="100%">
+  </picture>
+</p>
 
-The findings are ranked. Each one names the cause, the size of the effect and
-the change that fixes it.
+<p align="center"><sub>Sample drawn from made-up data by <code>assets/make_report_demo.py</code>.</sub></p>
+
+| Part | What it tells you |
+| --- | --- |
+| Big number | The heaviest startup load, in tokens. It is sent again with every request. |
+| Loaded at startup | Each agent's load, split into this repo and everything outside it (your global files, plugins). The thin line is your target. |
+| Heaviest files | What to slim first. A red mark means Codex cuts the file off and never reads the rest. |
+| Skill listing | The installed skills' names and descriptions against each agent's budget. Red means over budget: descriptions get dropped and skills stop triggering. |
+| Sessions | Measured from your local logs. *Startup* is the median first request; *startup share* is how much of all input was that load being re-sent. |
+| What to do | Ranked fixes. Each names the cause, the size of the effect and the change that fixes it. |
+
+`--svg FILE` writes the picture to FILE, and `--svg` alone puts it in the temp folder.
+`--theme light` or `dark` fixes the colors; the default follows the viewer. Leave out
+`--svg` and the same numbers print as plain text; `--json` gives them to scripts.
 
 ### Commands
 
 | Command | Answers |
 | --- | --- |
-| `cw.py report [PATH]` | Everything for one repo, plus ranked findings |
+| `cw.py report [PATH]` | Everything for one repo, plus ranked findings. `--svg` or `--open` draws it |
 | `cw.py files [PATH]` | Which instruction files each agent loads at startup, in tokens |
 | `cw.py skills [PATH]` | Size of the skill listing against each agent's budget |
 | `cw.py sessions` | Context size per project, measured from logs. `--compare-at DATE` shows before and after |
@@ -256,6 +263,7 @@ context-weight/
 │   └── references/
 │       ├── harnesses.md           loading rules per agent, with sources
 │       └── slimming.md            the slimming procedure
+├── assets/make_report_demo.py     draws the sample report pictures from made-up data
 ├── tests/test_cw.py               unit tests on a synthetic HOME
 └── .github/workflows/ci.yml       Linux, macOS, Windows; Python 3.8 to 3.13
 ```
@@ -263,8 +271,9 @@ context-weight/
 
 ## Accuracy and privacy
 
-- **Read-only.** `cw.py` never writes, deletes or uploads anything, and it
-  makes no network calls. Only `install.py` writes, and only into skill folders.
+- **Read-only.** `cw.py` never changes, deletes or uploads your files, and it
+  makes no network calls. The one file it writes is the picture you ask for with
+  `--svg` or `--open`. `install.py` writes only into skill folders.
 - **No transcript content.** Session commands print numbers and paths only.
   `verify-split` prints lines from your own instruction files, because
   comparing them is its job.
@@ -316,6 +325,7 @@ Pull requests are welcome.
 
 ```bash
 python3 -m unittest discover -s tests -v
+python3 assets/make_report_demo.py      # redraw the sample pictures in this README
 ```
 
 CI runs the tests and the installer on Linux, macOS and Windows with Python

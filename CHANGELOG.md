@@ -4,6 +4,9 @@
 
 Fixes from two pre-release reviews. Every review finding has a test that failed before its fix.
 
+- `report --svg` draws the report as one picture: the startup load per agent, the heaviest
+  files, the skill listing against its budget, measured sessions and ranked fixes. It follows
+  the viewer's light or dark mode (`--theme`), and `--open` opens it. Standard library only.
 - Installable in one step: as a Claude Code plugin (`/plugin install context-weight --marketplace
   ohm41321/context-weight`), as a Codex plugin, or with `npx skills add ohm41321/context-weight`.
 - `verify-split` no longer passes when content is lost. It counts repeated lines, keeps short

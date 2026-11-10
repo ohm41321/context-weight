@@ -28,9 +28,16 @@ jobs:
       - name: Unit tests
         run: python -m unittest discover -s tests -v
       - name: Script runs end to end on this repo
+        shell: bash
         run: |
           python skills/context-weight/scripts/cw.py report . --days 1
           python skills/context-weight/scripts/cw.py report . --days 1 --json
+      - name: Report picture draws as valid SVG
+        shell: bash
+        run: |
+          python skills/context-weight/scripts/cw.py report . --days 1 --svg report.svg
+          python assets/make_report_demo.py
+          python -c "import sys, xml.etree.ElementTree as E; [E.parse(f) for f in sys.argv[1:]]" report.svg assets/report-light.svg assets/report-dark.svg
       - name: Instruction budget gate (dogfood)
         run: python skills/context-weight/scripts/cw.py files . --max-tokens 6000
       - name: Installer, personal and per-repo

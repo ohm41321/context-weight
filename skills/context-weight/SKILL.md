@@ -10,8 +10,9 @@ Whatever loads at startup is re-sent with every request in the session. A
 skill measures that load, cuts it, and proves the cut with numbers.
 
 The script is `scripts/cw.py` in this skill's directory. Resolve its absolute
-path from the location of this file. It needs Python 3.8+ and nothing else, it
-only reads, and it prints numbers, never transcript content.
+path from the location of this file. It needs Python 3.8+ and nothing else. It
+never changes the user's files, it prints numbers, never transcript content, and
+the one file it writes is the picture asked for with `--svg` or `--open`.
 
 **Live meter?** For "how full is my context right now", use the harness:
 Claude Code `/context`, Codex `/status`. This skill is about the repo and the
@@ -20,10 +21,16 @@ history.
 ## 1. Weigh (read-only)
 
 ```bash
-python3 <skill-dir>/scripts/cw.py report <repo> --days 30
+python3 <skill-dir>/scripts/cw.py report <repo> --days 30 --svg
 ```
 
-This prints four things:
+`--svg` also draws the report as one picture in the system temp folder and
+prints its path on the last line (`Picture: ...`). Give the user that path so
+they can read the numbers at a glance; add `--open` to open it for them when they
+ask to see it. Use `--svg FILE` to choose the place, never a path inside the repo
+unless the user asks.
+
+The text output has four parts:
 
 - the instruction files each harness loads at startup, in estimated tokens;
 - the skill listing against each harness's budget;

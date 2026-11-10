@@ -3,7 +3,10 @@
 - Test: `python3 -m unittest discover -s tests -v`. Every bug fix starts with a test that fails.
 - `cw.py` stays standard library only and runs on Python 3.8. Do not use 3.9+ APIs such as
   `str.removeprefix`, `Path.is_relative_to`, `zip(strict=)` or `match`.
-- `cw.py` only reads. Session commands print numbers and paths, never transcript text.
+- `cw.py` never changes user files. Its one write is the picture from `report --svg`.
+  Session commands print numbers and paths, never transcript text.
+- The picture is drawn from the same dict as `report --json`, so the two never disagree.
+  After changing it, run `python3 assets/make_report_demo.py` and look at both SVGs.
 - Exit codes: 0 ok, 1 a check failed, 2 bad input. A bad path must never exit 0 or 1.
 - Loading rules live in `skills/context-weight/references/harnesses.md` and in `cw.py`.
   Change both together, with a source and the date you checked it.
@@ -22,3 +25,7 @@
   is not in Claude Code's logs, so it is assumed and printed as assumed.
 - `verify-split` once passed while content was lost: it compared sets, skipped lines under 4
   characters and flattened code indentation. It now compares counts and keeps code shape.
+- A fixed picture name in the shared temp folder (`/tmp/context-weight-<repo>.svg`) let another
+  user plant a symlink and have `--svg` overwrite their target. The default now goes into a fresh
+  `tempfile.mkdtemp` folder. SVG text also drops control characters and lone surrogates, which
+  XML cannot hold.

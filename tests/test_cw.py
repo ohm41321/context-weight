@@ -1,4 +1,5 @@
 """Tests for cw.py on a synthetic HOME. Run: python3 -m unittest discover -s tests -v"""
+import importlib.util
 import json
 import os
 import re
@@ -6,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 CW = Path(__file__).resolve().parents[1] / "skills" / "context-weight" / "scripts" / "cw.py"
@@ -25,12 +27,13 @@ class CwTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         t = Path(self.tmp.name)
+        self.tmp_path = t
         self.home = t / "home"
         self.repo = t / "work" / "repo"
         (self.repo / ".git").mkdir(parents=True)
         self.env = {k: v for k, v in os.environ.items()
                     if k not in ("CLAUDE_CONFIG_DIR", "CODEX_HOME", "OPENCODE_DISABLE_CLAUDE_CODE",
-                                 "SLASH_COMMAND_TOOL_CHAR_BUDGET")}
+                                 "SLASH_COMMAND_TOOL_CHAR_BUDGET", "BROWSER")}
         self.env["HOME"] = str(self.home)
         self.env["USERPROFILE"] = str(self.home)  # Windows: expanduser reads USERPROFILE, not HOME
         self.env["PYTHONIOENCODING"] = "utf-8"
@@ -192,6 +195,100 @@ class CwTest(unittest.TestCase):
         out = self.run_cw("report", str(self.repo), "--days", "40000")
         self.assertIn("## Findings", out)
         self.assertIn("would have saved", out)
+
+    # ------------------------------------------------------------------ picture
+    def _svg_texts(self, path):
+        root = ET.parse(str(path)).getroot()  # raises if the SVG is not well-formed XML
+        self.assertEqual(root.tag, "{http://www.w3.org/2000/svg}svg")
+        return root, " ".join("".join(t.itertext()) for t in root.iter("{http://www.w3.org/2000/svg}text"))
+
+    def test_report_svg_draws_the_same_numbers(self):
+        write(self.repo / "CLAUDE.md", "a" * 60_000)
+        write(self.repo / "AGENTS.md", "b" * 40_000)  # past Codex's 32 KiB default
+        self._claude_log("s", self.repo, "2099-01-01T00:00:00Z", [90_000, 95_000])
+        out = self.tmp_path / "pic.svg"
+        res = self.cw_json("report", str(self.repo), "--days", "40000", "--svg", str(out), "--theme", "light")
+        self.assertEqual(Path(res["picture"]), out)
+        root, texts = self._svg_texts(out)
+        self.assertEqual(root.get("role"), "img")
+        self.assertIn("~20.0k", texts)                       # 60,000 ASCII chars / 3, as in `files`
+        self.assertIn("Claude Code", texts)
+        self.assertIn("Codex cuts 7,232 bytes", texts)
+        self.assertIn("of Claude Code input", texts)
+        self.assertIn("Requests", texts)
+        self.assertIn("would have saved", texts)
+        self.assertNotIn("prefers-color-scheme", out.read_text(encoding="utf-8"))
+        text_out = self.run_cw("report", str(self.repo), "--days", "40000", "--svg", str(out))
+        self.assertIn(f"Picture: {out}", text_out)
+        self.assertIn("prefers-color-scheme: dark", out.read_text(encoding="utf-8"))  # auto follows the viewer
+
+    def test_report_svg_escapes_paths_and_works_without_sessions(self):
+        repo = self.tmp_path / "work" / "R&D <x>" if os.name != "nt" else self.tmp_path / "work" / "R&D"
+        (repo / ".git").mkdir(parents=True)
+        write(repo / "CLAUDE.md", "rules\n")
+        out = self.tmp_path / "pic.svg"
+        self.run_cw("report", str(repo), "--svg", str(out))
+        _, texts = self._svg_texts(out)
+        self.assertIn("R&D", texts)
+        self.assertIn("No session logs", texts)
+
+    def test_report_svg_default_path_goes_to_temp(self):
+        tmp = self.tmp_path / "tmpdir"
+        tmp.mkdir()
+        self.env.update(TMPDIR=str(tmp), TEMP=str(tmp), TMP=str(tmp))
+        write(self.repo / "CLAUDE.md", "rules\n")
+        res = self.cw_json("report", str(self.repo), "--svg")
+        pic = Path(res["picture"]).resolve()
+        self.assertIn(tmp.resolve(), pic.parents)
+        self.assertEqual(pic.name, "context-weight-repo.svg")
+        self._svg_texts(pic)
+        again = Path(self.cw_json("report", str(self.repo), "--svg")["picture"]).resolve()
+        self.assertNotEqual(pic.parent, again.parent)  # a fresh private folder each run
+
+    @unittest.skipIf(os.name == "nt", "needs POSIX symlinks")
+    def test_report_svg_default_path_ignores_a_planted_symlink(self):
+        tmp = self.tmp_path / "tmpdir"
+        tmp.mkdir()
+        self.env.update(TMPDIR=str(tmp), TEMP=str(tmp), TMP=str(tmp))
+        victim = write(self.tmp_path / "victim.txt", "keep me")
+        for name in ("context-weight-repo.svg", "repo.svg"):
+            os.symlink(str(victim), str(tmp / name))
+        res = self.cw_json("report", str(self.repo), "--svg")
+        self.assertEqual(victim.read_text(), "keep me")
+        self._svg_texts(res["picture"])
+
+    def test_svg_drops_characters_xml_cannot_hold(self):
+        spec = importlib.util.spec_from_file_location("cw_under_test", str(CW))
+        cw = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cw)
+        bad = "/x/caf\udce9 a\x01b\ufffe"
+        rep = {"project": bad, "since": "2026-01-01", "days": 30, "target": 5000, "sessions": {},
+               "files": {"claude": {"files": [{"path": bad + "/CLAUDE.md", "role": "project", "tokens": 9000}],
+                                    "total_tokens": 9000, "repo_tokens": 9000, "warnings": [], "notes": []}},
+               "skills": {"claude": {"budget": 8000, "budget_unit": "chars", "chars": 8320, "tokens": 2000,
+                                     "window_source": "window"}},
+               "findings": ["[claude] odd \x03 character"]}
+        out = cw.write_picture(rep, str(self.tmp_path / "odd.svg"), "auto")
+        _, texts = self._svg_texts(out)
+        self.assertIn("4% over budget", texts)
+        self.assertIn("odd \ufffd character", texts)
+
+    def test_report_svg_unwritable_exits_2(self):
+        bad = self.tmp_path / "no" / "such" / "dir" / "a.svg"
+        p = subprocess.run([sys.executable, str(CW), "report", str(self.repo), "--svg", str(bad)],
+                           env=self.env, capture_output=True, text=True)
+        self.assertEqual(p.returncode, 2, p.stderr)
+        self.assertIn("cannot write", p.stderr)
+
+    @unittest.skipIf(os.name == "nt", "BROWSER command lines are POSIX-quoted")
+    def test_report_open_hands_the_picture_to_a_viewer(self):
+        seen = self.tmp_path / "opened.txt"
+        viewer = write(self.tmp_path / "viewer.py",
+                       "import sys, pathlib\npathlib.Path(sys.argv[1]).write_text(sys.argv[2])\n")
+        self.env["BROWSER"] = f"{sys.executable} {viewer} {seen} %s"
+        out = self.tmp_path / "pic.svg"
+        self.run_cw("report", str(self.repo), "--svg", str(out), "--open")
+        self.assertEqual(seen.read_text(), out.resolve().as_uri())
 
     def test_continued_session_counted_once_and_kept_out_of_baseline(self):
         def rec(mid, ts, ctx):
