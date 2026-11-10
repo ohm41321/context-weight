@@ -1,0 +1,50 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="420" viewBox="0 0 1280 420" role="img" aria-label="context-weight: weigh what your coding agent loads before any work starts">
+  <rect x="0.5" y="0.5" width="1279" height="419" rx="18" fill="#11151B" stroke="#222933"/>
+  <g font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace">
+    <text x="72" y="150" font-size="60" font-weight="700" fill="#E8ECF1" letter-spacing="-1">context<tspan fill="#FF7A3D">-</tspan>weight</text>
+  </g>
+  <g font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="22" fill="#98A2B0">
+    <text x="74" y="204">Weigh what your coding agent loads</text>
+    <text x="74" y="236">before any work starts. Cut it without</text>
+    <text x="74" y="268">losing a line, and prove the savings.</text>
+  </g>
+  <g font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="16" fill="#E8ECF1">
+    <text x="74" y="340">Claude Code  <tspan fill="#98A2B0">·</tspan>  Codex  <tspan fill="#98A2B0">·</tspan>  Gemini CLI  <tspan fill="#98A2B0">·</tspan>  OpenCode</text>
+  </g>
+  <line x1="660" y1="64" x2="660" y2="356" stroke="#222933" stroke-width="1"/>
+  <g font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="15" fill="#98A2B0">
+    <text x="720" y="84">every request re-sends the startup load</text>
+    <text x="720" y="126" fill="#E8ECF1">before <tspan dx="12" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" fill="#98A2B0">~154k tokens of instructions</tspan></text>
+    <text x="720" y="258" fill="#E8ECF1">after slimming <tspan dx="12" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" fill="#98A2B0">~5k, nothing lost</tspan></text>
+  </g>
+  <g>
+    <rect x="720" y="140" width="230" height="10" rx="2" fill="#FF7A3D"/>
+    <rect x="953" y="140" width="70" height="10" rx="2" fill="#353D49"/>
+    <rect x="720" y="158" width="230" height="10" rx="2" fill="#FF7A3D"/>
+    <rect x="953" y="158" width="130" height="10" rx="2" fill="#353D49"/>
+    <rect x="720" y="176" width="230" height="10" rx="2" fill="#FF7A3D"/>
+    <rect x="953" y="176" width="105" height="10" rx="2" fill="#353D49"/>
+    <rect x="720" y="194" width="230" height="10" rx="2" fill="#FF7A3D"/>
+    <rect x="953" y="194" width="190" height="10" rx="2" fill="#353D49"/>
+    <rect x="720" y="212" width="230" height="10" rx="2" fill="#FF7A3D"/>
+    <rect x="953" y="212" width="250" height="10" rx="2" fill="#353D49"/>
+  </g>
+  <g>
+    <rect x="720" y="272" width="9" height="10" rx="2" fill="#FF7A3D"/>
+    <rect x="732" y="272" width="70" height="10" rx="2" fill="#353D49"/>
+    <rect x="720" y="290" width="9" height="10" rx="2" fill="#FF7A3D"/>
+    <rect x="732" y="290" width="130" height="10" rx="2" fill="#353D49"/>
+    <rect x="720" y="308" width="9" height="10" rx="2" fill="#FF7A3D"/>
+    <rect x="732" y="308" width="105" height="10" rx="2" fill="#353D49"/>
+    <rect x="720" y="326" width="9" height="10" rx="2" fill="#FF7A3D"/>
+    <rect x="732" y="326" width="190" height="10" rx="2" fill="#353D49"/>
+    <rect x="720" y="344" width="9" height="10" rx="2" fill="#FF7A3D"/>
+    <rect x="732" y="344" width="250" height="10" rx="2" fill="#353D49"/>
+  </g>
+  <g font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="15">
+    <rect x="720" y="378" width="10" height="10" rx="2" fill="#FF7A3D"/>
+    <text x="738" y="388" fill="#98A2B0">startup instructions</text>
+    <rect x="950" y="378" width="10" height="10" rx="2" fill="#353D49"/>
+    <text x="968" y="388" fill="#98A2B0">the actual work</text>
+  </g>
+</svg>

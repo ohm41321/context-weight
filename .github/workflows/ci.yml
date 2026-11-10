@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: ${{ matrix.os }} / Python ${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-22.04, python: "3.8" }
+          - { os: ubuntu-latest, python: "3.10" }
+          - { os: ubuntu-latest, python: "3.13" }
+          - { os: macos-latest, python: "3.13" }
+          - { os: windows-latest, python: "3.13" }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Unit tests
+        run: python -m unittest discover -s tests -v
+      - name: Script runs end to end on this repo
+        run: |
+          python skills/context-weight/scripts/cw.py report . --days 1
+          python skills/context-weight/scripts/cw.py report . --days 1 --json
+      - name: Instruction budget gate (dogfood)
+        run: python skills/context-weight/scripts/cw.py files . --max-tokens 6000
+      - name: Installer, personal and per-repo
+        shell: bash
+        run: |
+          python install.py
+          test -f "$HOME/.claude/skills/context-weight/SKILL.md"
+          test -f "$HOME/.agents/skills/context-weight/SKILL.md"
+          python install.py --uninstall
+          mkdir -p "$RUNNER_TEMP/demo" && python install.py --project "$RUNNER_TEMP/demo"
+          test -f "$RUNNER_TEMP/demo/.claude/skills/context-weight/scripts/cw.py"
