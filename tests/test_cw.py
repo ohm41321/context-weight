@@ -108,6 +108,23 @@ class CwTest(unittest.TestCase):
         res = self.cw_json("files", str(self.repo), "--harness", "claude,codex")
         self.assertFalse(res.get("cross"))
 
+    def test_cross_harness_one_side_empty(self):
+        # The worst divergence: one harness gets every rule, the other gets none.
+        write(self.repo / "CLAUDE.md", "c" * 30_000)
+        res = self.cw_json("files", str(self.repo), "--harness", "claude,codex")
+        self.assertTrue(res.get("cross"), "Claude rules with no AGENTS.md went unflagged")
+        self.assertIn("Codex ~0", res["cross"][0])
+        # Codex was not measured, so nothing can be compared.
+        res = self.cw_json("files", str(self.repo), "--harness", "claude")
+        self.assertFalse(res.get("cross"))
+        (self.repo / "CLAUDE.md").unlink()
+        write(self.repo / "AGENTS.md", "a" * 30_000)
+        res = self.cw_json("files", str(self.repo), "--harness", "claude,codex")
+        self.assertTrue(res.get("cross"), "AGENTS.md with no CLAUDE.md went unflagged")
+        (self.repo / "AGENTS.md").unlink()
+        res = self.cw_json("files", str(self.repo), "--harness", "claude,codex")
+        self.assertFalse(res.get("cross"))
+
     def test_gemini_context_filenames(self):
         write(self.home / ".gemini" / "settings.json", json.dumps({"context": {"fileName": ["AGENTS.md", "GEMINI.md"]}}))
         write(self.repo / "AGENTS.md", "agents")
