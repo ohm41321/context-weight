@@ -47,7 +47,9 @@ class CwTest(unittest.TestCase):
         self.tmp.cleanup()
 
     def run_cw(self, *args, code=0):
-        p = subprocess.run([sys.executable, str(CW), *args], env=self.env, capture_output=True, text=True)
+        # The child writes UTF-8 (PYTHONIOENCODING); decode it so, not in the locale's code page.
+        p = subprocess.run([sys.executable, str(CW), *args], env=self.env, capture_output=True,
+                           text=True, encoding="utf-8")
         self.assertEqual(p.returncode, code, p.stdout + p.stderr)
         return p.stdout
 
