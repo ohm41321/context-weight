@@ -2,7 +2,7 @@
 
 ## 0.2.0 (2026-11-10)
 
-Fixes from a pre-release review. Each fix has a test that failed before it.
+Fixes from two pre-release reviews. Every review finding has a test that failed before its fix.
 
 - `verify-split` no longer passes when content is lost. It counts repeated lines, keeps short
   lines that contain words, keeps indentation inside code blocks, and never counts the old file
@@ -19,8 +19,13 @@ Fixes from a pre-release review. Each fix has a test that failed before it.
 - Robustness: UTF-8 BOM before frontmatter, unreadable folders (Python 3.13 and older), log lines
   that are valid JSON but not objects, non-numeric usage fields, bad dates, broken pipes, and
   non-UTF-8 consoles on Windows.
+- `verify-split` reads each real file once, so a symlinked `CLAUDE.md -> AGENTS.md` or a file
+  passed together with its folder cannot hide a dropped copy.
+- An instruction file that exists but cannot be read is reported, and `--max-tokens` exits 2
+  instead of passing on a number it could not measure.
 - New `install.py`: links or copies into every agent's skill folders, installs into one repo with
-  `--project`, works on Windows, and never replaces a folder it did not install.
+  `--project`, works on Windows. It only deletes symlinks and copies it marked as its own, never
+  the source checkout, and reports a broken target folder without stopping.
 - CI on Linux, macOS and Windows, Python 3.8 to 3.13.
 
 ## 0.1.0

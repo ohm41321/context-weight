@@ -202,8 +202,20 @@ def frontmatter(text: str) -> dict[str, str]:
     return out
 
 
-def file_entry(path, role: str, via=None) -> dict | None:
+UNREADABLE: list[str] = []  # instruction files that exist but could not be read
+
+
+def read_instruction(path) -> str | None:
+    """read_text for an instruction file; remembers files that exist but cannot be read,
+    so a gate can refuse to pass on numbers it could not measure."""
     text = read_text(path)
+    if text is None and _is_file(path) and str(path) not in UNREADABLE:
+        UNREADABLE.append(str(path))
+    return text
+
+
+def file_entry(path, role: str, via=None) -> dict | None:
+    text = read_instruction(path)
     if text is None:
         return None
     return {
@@ -313,7 +325,7 @@ def claude_files(cwd) -> dict:
     # Auto memory: Claude Code loads the start of MEMORY.md (first 200 lines / 25 KB).
     slug = re.sub(r"[^A-Za-z0-9]", "-", str(project_root(cwd)))
     mem = cd / "projects" / slug / "memory" / "MEMORY.md"
-    text = read_text(mem) if _is_file(mem) else None
+    text = read_instruction(mem) if _is_file(mem) else None
     if text:
         head = "\n".join(text.splitlines()[:200]).encode("utf-8")[:25_000].decode("utf-8", errors="ignore")
         out.append({"path": str(mem), "role": "user memory", "via": None, "bytes": len(head.encode("utf-8")),
@@ -368,7 +380,7 @@ def codex_files(cwd) -> dict:
     for d in dirs:
         for name in ["AGENTS.override.md", "AGENTS.md", *fallbacks]:
             p = d / name
-            text = read_text(p) if _is_file(p) else None
+            text = read_instruction(p) if _is_file(p) else None
             if not (text and text.strip()):
                 continue
             entry = file_entry(p, "project")
@@ -452,17 +464,23 @@ def opencode_files(cwd) -> dict:
 FILE_SCANNERS = {"claude": claude_files, "codex": codex_files, "gemini": gemini_files, "opencode": opencode_files}
 
 
+def _inside(path, root: Path) -> bool:
+    p = Path(path).resolve()
+    return p == root or root in p.parents
+
+
 def scan_files(cwd, harnesses) -> dict:
     root = project_root(cwd)
     result = {}
     for h in harnesses:
         r = FILE_SCANNERS[h](cwd)
-        repo = [e for e in r["files"]
-                if Path(e["path"]).resolve() == root or root in Path(e["path"]).resolve().parents]
+        repo = [e for e in r["files"] if _inside(e["path"], root)]
         r["total_tokens"] = sum(e["tokens"] for e in r["files"])
         r["repo_tokens"] = sum(e["tokens"] for e in repo)                          # what the harness loads
         r["repo_file_tokens"] = sum(e.get("file_tokens", e["tokens"]) for e in repo)  # what the files hold
         result[h] = r
+    if UNREADABLE:
+        result["unreadable"] = list(UNREADABLE)
     # Same repo, different instructions per harness?
     c = [e for e in result.get("claude", {}).get("files", []) if e["role"] in ("project", "local")]
     x = [e for e in result.get("codex", {}).get("files", []) if e["role"] == "project"]
@@ -917,6 +935,8 @@ def findings(files: dict, skills: dict, stats: dict, target: int) -> list[str]:
             out.append(f"[{h}] {w}")
     for w in files.get("cross", []):
         out.append(f"[all] {w}. Keep one canonical AGENTS.md and import it from CLAUDE.md")
+    for u in files.get("unreadable", []):
+        out.append(f"[all] cannot read {short(u)}: it is not counted, and the agent cannot load it either")
     for h, r in skills.items():
         if r["over_budget"]:
             used = r["chars"] if r["budget_unit"] == "chars" else r["tokens"]
@@ -980,6 +1000,7 @@ def verify_split(original: str, new_paths: list[str], allow: str | None) -> dict
         orig_real = None
     have: Counter = Counter()
     read = []
+    seen_real: set = set()
     for p in new_paths:
         if _is_dir(p):
             targets = _md_files(Path(p))
@@ -988,8 +1009,15 @@ def verify_split(original: str, new_paths: list[str], allow: str | None) -> dict
         else:
             raise UsageError(f"cannot read {p}")
         for t in targets:
-            if orig_real is not None and t.resolve() == orig_real:
+            try:
+                t_real = t.resolve()
+            except (OSError, RuntimeError):
+                raise UsageError(f"cannot read {t}")
+            if t_real == orig_real:
                 continue  # the backup itself never counts as the new copy
+            if t_real in seen_real:
+                continue  # one file reached twice (symlink, or a file plus its folder) counts once
+            seen_real.add(t_real)
             body = read_text(t)
             if body is None:
                 raise UsageError(f"cannot read {t}")
@@ -1126,6 +1154,13 @@ def _main(argv=None) -> int:
     if a.cmd == "files":
         res = scan_files(a.path, _harnesses(a.harness))
         _emit(res, a.json, print_files)
+        for u in UNREADABLE:
+            print(f"warning: cannot read {short(u)}; it is not counted", file=sys.stderr)
+        if a.max_tokens is not None:
+            root = project_root(a.path)
+            blind = [u for u in UNREADABLE if _inside(u, root)]
+            if blind:
+                raise UsageError(f"--max-tokens cannot judge {len(blind)} repo file(s) it could not read")
         if a.max_tokens is not None:
             failed = False
             for h in HARNESSES:

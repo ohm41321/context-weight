@@ -207,8 +207,8 @@ Related skills: [`context-budget`](https://skills.sh/affaan-m/everything-claude-
 
 The personal install writes to `~/.agents/skills`, which Codex, Gemini CLI and
 OpenCode read, and to `~/.claude/skills`, which Claude Code and OpenCode read.
-It respects `$CLAUDE_CONFIG_DIR`. The installer never replaces a folder it did
-not create. On Windows, linking falls back to a copy when symlinks are not
+It respects `$CLAUDE_CONFIG_DIR`. The installer never deletes a folder it did
+not create: its copies carry a marker file, and anything else is left alone. On Windows, linking falls back to a copy when symlinks are not
 allowed. `./install.sh` still works and calls `install.py`.
 
 <details>

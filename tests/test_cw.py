@@ -420,6 +420,93 @@ class CwTest(unittest.TestCase):
         self.assertIn("skip", out)
         self.assertEqual((self.home / ".claude" / "skills" / "context-weight" / "SKILL.md").read_text(), "user's own")
 
+    def test_install_keeps_a_user_copy_even_with_the_same_skill_name(self):
+        mine = self.home / ".claude" / "skills" / "context-weight"
+        write(mine / "SKILL.md", "---\nname: context-weight\n---\nmy edited copy")
+        write(mine / "notes.md", "my notes")
+        self.assertIn("skip", self.run_install())
+        self.run_install("--uninstall")
+        self.assertEqual((mine / "notes.md").read_text(), "my notes")
+
+    def test_install_replaces_and_removes_only_its_own_copy(self):
+        self.run_install("--copy")
+        dest = self.home / ".agents" / "skills" / "context-weight"
+        write(dest / "stale.txt", "from an older copy")
+        self.assertIn("copy", self.run_install("--copy"))
+        self.assertFalse((dest / "stale.txt").exists())
+        self.run_install("--uninstall")
+        self.assertFalse(dest.exists())
+
+    @unittest.skipIf(os.name == "nt", "symlinks need extra rights on Windows")
+    def test_install_never_deletes_its_own_source(self):
+        import shutil
+        checkout = Path(self.tmp.name) / "checkout"
+        shutil.copytree(CW.parents[3] / "skills", checkout / "skills")
+        shutil.copy(CW.parents[3] / "install.py", checkout / "install.py")
+        (self.home / ".claude").mkdir(parents=True)
+        os.symlink(checkout / "skills", self.home / ".claude" / "skills", target_is_directory=True)
+        for args in ((), ("--copy",), ("--uninstall",)):
+            subprocess.run([sys.executable, str(checkout / "install.py"), *args], env=self.env, capture_output=True)
+            src = checkout / "skills" / "context-weight"
+            self.assertFalse(src.is_symlink(), args)
+            self.assertTrue((src / "scripts" / "cw.py").is_file(), args)
+
+    @unittest.skipIf(os.name == "nt", "symlinks need extra rights on Windows")
+    def test_install_reports_a_broken_folder_and_still_installs_the_rest(self):
+        (self.home / ".agents").mkdir(parents=True)
+        os.symlink(self.home / "gone", self.home / ".agents" / "skills")  # dangling
+        p = subprocess.run([sys.executable, str(CW.parents[3] / "install.py")], env=self.env,
+                           capture_output=True, text=True)
+        self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+        self.assertTrue((self.home / ".claude" / "skills" / "context-weight" / "SKILL.md").is_file())
+
+    # ------------------------------------------------------------------ more inputs
+    @unittest.skipIf(os.name == "nt", "symlinks need extra rights on Windows")
+    def test_verify_split_reads_each_real_file_once(self):
+        old = write(self.repo / "old.md", "- Run tests: make check\n- Run tests: make check\n")
+        write(self.repo / "AGENTS.md", "- Run tests: make check\n")
+        os.symlink(self.repo / "AGENTS.md", self.repo / "CLAUDE.md")
+        res = self.cw_json("verify-split", str(old), str(self.repo / "AGENTS.md"), str(self.repo / "CLAUDE.md"), code=1)
+        self.assertEqual(res["missing_copies"], {"- Run tests: make check": [1, 2]})
+        self.cw_json("verify-split", str(old), str(self.repo / "AGENTS.md"), str(self.repo), code=1)
+
+    @unittest.skipIf(os.name == "nt" or (hasattr(os, "geteuid") and os.geteuid() == 0), "needs POSIX permissions")
+    def test_unreadable_instruction_file_blocks_the_gate(self):
+        f = write(self.repo / "AGENTS.md", "a" * 100 * 1024)
+        f.chmod(0)
+        try:
+            p = subprocess.run([sys.executable, str(CW), "files", str(self.repo), "--max-tokens", "6000"],
+                               env=self.env, capture_output=True, text=True)
+            self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
+            self.assertIn("cannot read", p.stderr)
+            self.run_cw("files", str(self.repo))                     # without the gate: a warning, exit 0
+            self.assertIn("cannot read", self.run_cw("report", str(self.repo)))
+        finally:
+            f.chmod(0o644)
+
+    def test_bad_arguments_exit_2(self):
+        self.run_cw("sessions", "--since", "2026-13-01", code=2)
+        self.run_cw("sessions", "--compare-at", "yesterday", code=2)
+        self.run_cw("files", str(self.repo), "--harness", ",", code=2)
+        self.run_cw("files", str(self.repo), "--harness", "cursor", code=2)
+        self.run_cw("files", str(self.repo), "--max-tokens", "-1", code=2)
+
+    def test_skill_description_cap_follows_settings(self):
+        write(self.home / ".claude" / "skills" / "big" / "SKILL.md", "---\nname: big\ndescription: " + "d" * 3_000 + "\n---\n")
+        write(self.home / ".claude" / "settings.json", json.dumps({"skillListingMaxDescChars": 2_000}))
+        self.assertEqual(self.cw_json("skills", str(self.repo), "--harness", "claude")["claude"]["desc_chars"], 2_000)
+
+    def test_odd_config_shapes_do_not_crash(self):
+        write(self.home / ".claude" / "settings.json", json.dumps({"enabledPlugins": ["not", "a", "dict"],
+                                                                   "skillListingBudgetFraction": "lots"}))
+        write(self.home / ".claude" / "plugins" / "installed_plugins.json", json.dumps({"plugins": {"x@m": "nope"}}))
+        write(self.home / ".config" / "opencode" / "opencode.json", json.dumps({"instructions": "notes.md"}))
+        write(self.repo / "opencode.json", json.dumps(["a", "list"]))
+        write(self.home / ".gemini" / "settings.json", json.dumps(["a", "list"]))
+        write(self.home / ".codex" / "config.toml", "project_doc_max_bytes = 'big'\n")
+        self.cw_json("report", str(self.repo))
+
 
 if __name__ == "__main__":
     unittest.main()
