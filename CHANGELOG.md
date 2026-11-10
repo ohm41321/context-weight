@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- The check that Claude Code and Codex follow the same rules now also fires when one side has
+  no project instructions at all, such as a large CLAUDE.md with no AGENTS.md. Before, it ran
+  only when both files existed, so the worst case went unflagged.
+
 ## 0.2.0 (2026-11-10)
 
 Fixes from two pre-release reviews. Every review finding has a test that failed before its fix.

@@ -486,10 +486,11 @@ def scan_files(cwd, harnesses) -> dict:
         result[h] = r
     if UNREADABLE:
         result["unreadable"] = list(UNREADABLE)
-    # Same repo, different instructions per harness?
+    # Same repo, different instructions per harness? One side with none at all is the worst case,
+    # so compare whenever both harnesses were measured and either side has project files.
     c = [e for e in result.get("claude", {}).get("files", []) if e["role"] in ("project", "local")]
     x = [e for e in result.get("codex", {}).get("files", []) if e["role"] == "project"]
-    if c and x:
+    if "claude" in result and "codex" in result and (c or x):
         ct = sum(e["tokens"] for e in c)
         xt = sum(e["tokens"] for e in x)
         linked = any("@AGENTS.md" in (read_text(e["path"]) or "") for e in c) or any(

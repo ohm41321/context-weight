@@ -31,3 +31,6 @@
   user plant a symlink and have `--svg` overwrite their target. The default now goes into a fresh
   `tempfile.mkdtemp` folder. SVG text also drops control characters and lone surrogates, which
   XML cannot hold.
+- The Claude/Codex divergence check once ran only when both harnesses had project files
+  (`if c and x`), so a large CLAUDE.md with no AGENTS.md, the worst case, went unflagged.
+  A comparison must decide what an empty side means instead of skipping it.
