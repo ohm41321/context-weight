@@ -1,7 +1,7 @@
 {
   "name": "context-weight",
   "displayName": "context-weight",
-  "version": "0.2.2",
+  "version": "0.3.0",
   "description": "Measure and cut the context an agent loads before any work starts (CLAUDE.md, AGENTS.md, GEMINI.md, rules, @imports, skill listings), then slim instruction files and prove no line was lost.",
   "author": {
     "name": "ohm41321",
