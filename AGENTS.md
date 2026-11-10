@@ -15,6 +15,8 @@
 - A release bumps `VERSION` in `cw.py` and `version` in both `plugin.json` files; a test checks
   they match. Claude Code and Codex cache plugins by version, so an unbumped change never
   reaches people who installed the plugin.
+- `.claude-plugin/icon.png` is `assets/icon.svg` drawn at 1024 px. Anthropic's plugin directory
+  reads the icon only the first time the plugin is saved or submitted; later changes are ignored.
 - Keep this file and SKILL.md small: `python3 skills/context-weight/scripts/cw.py files . --max-tokens 6000`.
 
 ## Lessons
