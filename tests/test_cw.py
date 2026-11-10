@@ -19,6 +19,11 @@ def write(path: Path, text: str) -> Path:
     return path
 
 
+def rules(tag: str, n: int) -> str:
+    """`n` distinct lines of about 100 bytes, so a cut removes real lines, as in a real file."""
+    return "".join(f"{tag} {i:05d} " + "x" * 90 + "\n" for i in range(n))
+
+
 def jsonl(path: Path, records) -> None:
     write(path, "".join(json.dumps(r) + "\n" for r in records))
 
@@ -299,9 +304,313 @@ class CwTest(unittest.TestCase):
         self._git("checkout", "-q", "main")
         self._git("merge", "-q", "--no-ff", "-m", "merge slim", "slim", date="2026-02-01T00:00:00+00:00")
         merge = self._git("rev-parse", "--short=7", "HEAD")
+        slim = self._git("rev-parse", "--short=7", "slim")
         c = self.cw_json("report", str(self.repo), "--days", "40000")["compare"]
-        self.assertEqual((c["found"], c["commit"]), ("commit", merge))
+        # The split is the merge; the name is the branch commit that did the cut.
+        self.assertEqual((c["found"], c["commit"], c["merge"], c["subject"]), ("commit", slim, merge, "slim"))
+        self.assertTrue(c["at"].startswith("2026-02-01T00:00"))
         self.assertEqual(c["files"]["claude"]["before"], 20_000)
+        out = self.run_cw("report", str(self.repo), "--days", "40000")
+        self.assertIn(f'commit {slim} "slim", merged in {merge}', out)
+
+    def _merge_branch(self, steps, harness, main=None):
+        """Commit `steps` [(subject, {file: text})] on a branch, then `main` {file: text} on main,
+        merge the branch, and return the compare."""
+        self._git("checkout", "-q", "-b", "slim")
+        shas = {}
+        for i, (subject, files) in enumerate(steps):
+            for name, text in files.items():
+                write(self.repo / name, text)
+            shas[subject] = self._commit(subject, f"2026-01-{10 + i}T00:00:00+00:00")
+        self._git("checkout", "-q", "main")
+        if main:
+            for name, text in main.items():
+                write(self.repo / name, text)
+            self._commit("main grows", "2026-01-25T00:00:00+00:00")
+        self._git("merge", "-q", "--no-ff", "-m", "merge", "slim", date="2026-02-01T00:00:00+00:00")
+        return self.cw_json("report", str(self.repo), "--days", "40000", "--harness", harness)["compare"], shas
+
+    def test_compare_names_the_branch_commit_whose_cut_landed(self):
+        self._git_repo()
+        write(self.repo / "CLAUDE.md", "a" * 60_000)
+        self._commit("rules", "2026-01-01T00:00:00+00:00")
+        c, shas = self._merge_branch([("B1 slim hard", {"CLAUDE.md": "short\n"}),
+                                      ("B2 put it back", {"CLAUDE.md": "a" * 60_000}),
+                                      ("B3 trim a third", {"CLAUDE.md": "a" * 40_000}),
+                                      ("B4 one more line", {"CLAUDE.md": "a" * 40_030})], "claude")
+        self.assertEqual((c["commit"], c["subject"]), (shas["B3 trim a third"], "B3 trim a third"))
+
+    def test_compare_names_the_branch_commit_for_the_agents_asked(self):
+        self._git_repo()
+        write(self.repo / "CLAUDE.md", "a" * 30_000)
+        write(self.repo / "AGENTS.md", "b" * 90_000)
+        self._commit("rules", "2026-01-01T00:00:00+00:00")
+        c, shas = self._merge_branch([("slim CLAUDE", {"CLAUDE.md": "short\n"}),
+                                      ("trim AGENTS", {"AGENTS.md": "short\n"})], "claude")
+        self.assertEqual(c["subject"], "slim CLAUDE")
+
+    def test_compare_names_the_branch_commit_that_cut_the_asked_load_most(self):
+        # "trim both" cuts more bytes, mostly in AGENTS.md; for Claude Code "slim CLAUDE" cut most.
+        self._git_repo()
+        write(self.repo / "CLAUDE.md", rules("a", 600))
+        write(self.repo / "AGENTS.md", rules("b", 900))
+        self._commit("rules", "2026-01-01T00:00:00+00:00")
+        c, _ = self._merge_branch([("trim both", {"AGENTS.md": "short\n", "CLAUDE.md": rules("a", 500)}),
+                                   ("slim CLAUDE", {"CLAUDE.md": "short\n"})], "claude")
+        self.assertEqual(c["subject"], "slim CLAUDE")
+
+    def test_compare_does_not_name_the_removal_of_text_the_branch_added(self):
+        self._git_repo()
+        write(self.repo / "CLAUDE.md", "a" * 60_000)
+        self._commit("rules", "2026-01-01T00:00:00+00:00")
+        c, shas = self._merge_branch([("B1 paste a log", {"CLAUDE.md": "a" * 120_000}),
+                                      ("B2 remove the pasted log", {"CLAUDE.md": "a" * 60_000}),
+                                      ("B3 real slim", {"CLAUDE.md": "a" * 3_000})], "claude")
+        self.assertEqual((c["commit"], c["subject"]), (shas["B3 real slim"], "B3 real slim"))
+
+    def test_compare_names_the_merge_when_no_branch_commit_cut_enough(self):
+        # Small trims make the slimming together. The one big commit mostly removes text the
+        # branch pasted in itself: none of them is the cut, so the merge is named.
+        self._git_repo()
+        write(self.repo / "CLAUDE.md", rules("a", 300))
+        self._commit("rules", "2026-01-01T00:00:00+00:00")
+        steps = [("paste", {"CLAUDE.md": rules("a", 300) + rules("p", 40)}),
+                 ("cut", {"CLAUDE.md": rules("a", 270)})]
+        steps += [(f"trim {i}", {"CLAUDE.md": rules("a", 270 - 15 * i)}) for i in range(1, 5)]
+        c, _ = self._merge_branch(steps, "claude")
+        self.assertEqual((c["merge"], c["subject"]), (None, "merge"))
+
+    def test_compare_names_the_cut_the_merge_kept_not_one_put_back(self):
+        # B1 drops section B, B2 drops section A, B3 puts B back: the merge removes only A.
+        self._git_repo()
+        write(self.repo / "CLAUDE.md", rules("A", 300) + rules("B", 300))
+        self._commit("rules", "2026-01-01T00:00:00+00:00")
+        c, shas = self._merge_branch([("B1 drop section B", {"CLAUDE.md": rules("A", 300)}),
+                                      ("B2 drop section A", {"CLAUDE.md": "short\n"}),
+                                      ("B3 put section B back", {"CLAUDE.md": rules("B", 300)})], "claude")
+        self.assertEqual((c["commit"], c["subject"]), (shas["B2 drop section A"], "B2 drop section A"))
+
+    def test_compare_names_the_branch_slim_when_main_grew_meanwhile(self):
+        # Main added a rules file while the branch was open, so its load at the merge is higher.
+        self._git_repo()
+        write(self.repo / "CLAUDE.md", rules("a", 600))
+        self._commit("rules", "2026-01-01T00:00:00+00:00")
+        c, shas = self._merge_branch([("B1 paste a log", {"CLAUDE.md": rules("a", 600) + rules("p", 600)}),
+                                      ("B2 remove the pasted log", {"CLAUDE.md": rules("a", 600)}),
+                                      ("B3 real slim", {"CLAUDE.md": rules("a", 30)})],
+                                     "claude", main={".claude/rules/team.md": rules("t", 600)})
+        self.assertEqual((c["commit"], c["subject"]), (shas["B3 real slim"], "B3 real slim"))
+
+    def test_compare_names_a_single_branch_cut_when_main_grew_meanwhile(self):
+        self._git_repo()
+        write(self.repo / "CLAUDE.md", rules("a", 600))
+        self._commit("rules", "2026-01-01T00:00:00+00:00")
+        c, shas = self._merge_branch([("B1 cut half", {"CLAUDE.md": rules("a", 300)})],
+                                     "claude", main={".claude/rules/team.md": rules("t", 300)})
+        self.assertEqual((c["commit"], c["subject"]), (shas["B1 cut half"], "B1 cut half"))
+        self.assertIsNotNone(c["merge"])
+
+    def test_compare_names_the_newer_of_two_equal_branch_cuts(self):
+        self._git_repo()
+        write(self.repo / "CLAUDE.md", rules("a", 900))
+        self._commit("rules", "2026-01-01T00:00:00+00:00")
+        c, shas = self._merge_branch([("B1 cut a third", {"CLAUDE.md": rules("a", 600)}),
+                                      ("B2 cut another third", {"CLAUDE.md": rules("a", 300)})], "claude")
+        self.assertEqual((c["commit"], c["subject"]), (shas["B2 cut another third"], "B2 cut another third"))
+
+    def test_compare_at_a_time_finds_the_cut_past_other_changes(self):
+        # Five AGENTS.md cuts and a small trim come first; Claude Code's cut is the seventh
+        # change, then it grew back.
+        self._git_repo()
+        write(self.repo / "CLAUDE.md", "a" * 60_000)
+        write(self.repo / "AGENTS.md", rules("b", 400))
+        self._commit("notes", "2026-08-01T00:00:00+00:00")
+        for i in range(1, 6):
+            write(self.repo / "AGENTS.md", rules("b", 400 - 70 * i))
+            self._commit(f"codex {i}", f"2026-08-20T0{i}:00:00+00:00")
+        write(self.repo / "CLAUDE.md", "a" * 54_000)  # a tenth: too small to be the slimming
+        self._commit("trim", "2026-08-20T06:00:00+00:00")
+        write(self.repo / "CLAUDE.md", "a" * 6_000)
+        self._commit("slim", "2026-08-20T07:00:00+00:00")
+        write(self.repo / "CLAUDE.md", "a" * 90_000)
+        self._commit("grow", "2026-09-01T00:00:00+00:00")
+        for hs in ("claude", "claude,codex"):
+            args = ("report", str(self.repo), "--days", "40000", "--harness", hs, "--compare-at", "2026-08-20T00:30Z")
+            f = self.cw_json(*args)["compare"]["files"]["claude"]
+            self.assertEqual((f["before"], f["after"], f["now"]), (20_000, 2_000, 30_000), hs)
+            self.assertNotIn("did not shrink", self.run_cw(*args))
+
+    def test_compare_at_a_time_weighs_each_agent_at_its_own_cut(self):
+        # After the split, the first cut is Codex's AGENTS.md, the next one Claude Code's CLAUDE.md.
+        self._git_repo()
+        write(self.repo / "CLAUDE.md", rules("a", 600))
+        write(self.repo / "AGENTS.md", rules("c", 300))
+        self._commit("rules", "2026-08-01T00:00:00+00:00")
+        write(self.repo / "AGENTS.md", "short\n")
+        self._commit("slim AGENTS", "2026-08-20T01:00:00+00:00")
+        write(self.repo / "CLAUDE.md", rules("a", 60))
+        self._commit("slim CLAUDE", "2026-08-20T02:00:00+00:00")
+        write(self.repo / "AGENTS.md", rules("c", 300))
+        self._commit("AGENTS grew back", "2026-09-01T00:00:00+00:00")
+        args = ("report", str(self.repo), "--days", "40000", "--compare-at", "2026-08-20T00:30Z", "--harness")
+        alone = {h: self.cw_json(*args, h)["compare"]["files"][h] for h in ("claude", "codex")}
+        both = self.cw_json(*args, "claude,codex")["compare"]["files"]
+        self.assertLess(alone["claude"]["after"], alone["claude"]["before"])
+        self.assertLess(alone["codex"]["after"], alone["codex"]["now"])
+        self.assertEqual(both, alone)
+        changed = self.cw_json(*args, "claude,codex")["compare"]["changed"]
+        self.assertEqual({x["path"]: x["after"] for x in changed},
+                         {"CLAUDE.md": alone["claude"]["after"], "AGENTS.md": alone["codex"]["after"]})
+
+    def test_compare_names_an_old_slimming_on_a_long_branch(self):
+        # The slim comes before ten small edits, one of which drops a line: the slim is the cut.
+        self._git_repo()
+        line = "r" * 99 + "\n"
+        write(self.repo / "CLAUDE.md", line * 600)
+        self._commit("rules", "2026-01-01T00:00:00+00:00")
+        steps = [("slim", {"CLAUDE.md": line * 20})]
+        for i in range(10):
+            n = 21 + i if i != 5 else 24                                  # T5 drops one line
+            steps.append((f"T{i}", {"CLAUDE.md": line * n}))
+        c, shas = self._merge_branch(steps, "claude")
+        self.assertEqual((c["commit"], c["subject"]), (shas["slim"], "slim"))
+
+    def test_compare_names_the_slimming_when_the_branch_merged_an_older_one(self):
+        # The slim branch merged a side branch cut from main before the slim; the slim still names.
+        self._git_repo()
+        write(self.repo / "CLAUDE.md", "a" * 60_000)
+        self._commit("rules", "2026-01-01T00:00:00+00:00")
+        self._git("checkout", "-q", "-b", "side")
+        write(self.repo / ".claude" / "rules" / "x.md", "rule\n")
+        self._commit("side rule", "2026-01-05T00:00:00+00:00")
+        self._git("checkout", "-q", "main")
+        self._git("checkout", "-q", "-b", "slim")
+        write(self.repo / "CLAUDE.md", "short\n")
+        slim = self._commit("B1 slim", "2026-01-10T00:00:00+00:00")
+        self._git("merge", "-q", "--no-ff", "-m", "take side", "side", date="2026-01-12T00:00:00+00:00")
+        self._git("checkout", "-q", "main")
+        self._git("merge", "-q", "--no-ff", "-m", "merge", "slim", date="2026-02-01T00:00:00+00:00")
+        c = self.cw_json("report", str(self.repo), "--days", "40000", "--harness", "claude")["compare"]
+        self.assertEqual((c["commit"], c["subject"]), (slim, "B1 slim"))
+
+    def test_compare_at_a_time_skips_changes_that_do_not_load(self):
+        # Between the split and the slim: a subfolder CLAUDE.md and an AGENTS.md Claude never reads.
+        self._git_repo()
+        write(self.repo / "CLAUDE.md", "a" * 60_000)
+        self._commit("rules", "2026-08-01T00:00:00+00:00")
+        write(self.repo / "pkg" / "CLAUDE.md", "pkg rules\n")
+        self._commit("pkg", "2026-08-19T00:10:00+00:00")
+        write(self.repo / "AGENTS.md", "codex rules\n")
+        self._commit("codex", "2026-08-19T00:20:00+00:00")
+        write(self.repo / "CLAUDE.md", "short\n")
+        self._commit("slim", "2026-08-20T00:24:00+00:00")
+        args = ("report", str(self.repo), "--days", "40000", "--harness", "claude", "--compare-at", "2026-08-19T00:00Z")
+        f = self.cw_json(*args)["compare"]["files"]["claude"]
+        self.assertEqual((f["before"], f["after"]), (20_000, 2))
+        self.assertNotIn("did not shrink", self.run_cw(*args))
+
+    def test_compare_at_takes_a_sha256_commit_id(self):
+        (self.repo / ".git").rmdir()
+        if subprocess.run(["git", "init", "-q", "--object-format=sha256", str(self.repo)],
+                          capture_output=True).returncode:
+            self.skipTest("this git has no SHA-256 repositories")
+        write(self.repo / "CLAUDE.md", "a" * 60_000)
+        self._commit("rules", "2026-01-01T00:00:00+00:00")
+        write(self.repo / "CLAUDE.md", "short\n")
+        self._commit("slim", "2026-02-01T00:00:00+00:00")
+        full = self._git("rev-parse", "HEAD")
+        self.assertEqual(len(full), 64)
+        c = self.cw_json("report", str(self.repo), "--days", "40000", "--harness", "claude", "--compare-at", full)["compare"]
+        self.assertEqual(c["files"]["claude"]["before"], 20_000)
+
+    def test_compare_finds_a_slimming_that_grew_back(self):
+        # Slimmed once, then grew past the old size: still the slimming, judged against its parent.
+        self._git_repo()
+        write(self.repo / "CLAUDE.md", "a" * 37_758)
+        self._commit("notes", "2026-08-01T00:00:00+00:00")
+        write(self.repo / "CLAUDE.md", "a" * 5_595)
+        slim = self._commit("split project notes into docs/", "2026-08-20T00:24:00+00:00")
+        write(self.repo / "CLAUDE.md", "a" * 114_999)
+        write(self.repo / "AGENTS.md", "b" * 30_000)                    # new for Codex: growth, never cut
+        self._commit("grow", "2026-09-15T00:00:00+00:00")
+        args = ("report", str(self.repo), "--days", "40000", "--harness", "claude,codex")
+        c = self.cw_json(*args)["compare"]
+        self.assertEqual((c["found"], c["commit"]), ("commit", slim))
+        f = c["files"]["claude"]
+        self.assertEqual((f["before"], f["after"], f["now"]), (12_586, 1_865, 38_333))
+        self.assertEqual([(x["before"], x["after"]) for x in c["changed"]], [(12_586, 1_865)])  # what the commit did
+        out = self.run_cw(*args)
+        self.assertIn("12.6k -> 1.9k, now 38.3k", out)
+        grew = next(ln for ln in out.splitlines() if ln.startswith("Grew back"))
+        self.assertEqual(grew, "Grew back since the change: Claude Code ~1.9k -> ~38.3k now, past the ~12.6k "
+                               "before it. Sessions after it include that growth.")
+
+    def test_compare_commit_subject_has_no_control_characters(self):
+        self._git_repo()
+        write(self.repo / "CLAUDE.md", "a" * 60_000)
+        self._commit("rules", "2026-01-01T00:00:00+00:00")
+        write(self.repo / "CLAUDE.md", "short\n")
+        self._commit("slim \x1b[2J\x1b]0;owned\x07 notes\u202e" + " and more" * 10, "2026-02-01T00:00:00+00:00")
+        c = self.cw_json("report", str(self.repo), "--days", "40000", "--harness", "claude")["compare"]
+        self.assertEqual(c["subject"], "slim [2J]0;owned notes" + " and more" * 10)  # whole, in the JSON
+        out = self.run_cw("report", str(self.repo), "--days", "40000", "--harness", "claude")
+        self.assertNotRegex(out, "[\x00-\x08\x0b-\x1f\x7f\u202e]")
+        self.assertIn("notes and more and more", out)
+        self.assertIn('…"', out)                                          # shortened in the label
+
+    def test_compare_at_takes_a_time_or_a_commit(self):
+        self._git_repo()
+        write(self.repo / "AGENTS.md", "rules\n")
+        self._commit("start", "2026-08-01T00:00:00+00:00")
+        write(self.repo / "CLAUDE.md", "a" * 60_000)
+        self._commit("notes", "2026-08-19T23:00:00+00:00")
+        write(self.repo / "CLAUDE.md", "short\n")
+        slim = self._commit("slim", "2026-08-20T00:24:00+00:00")
+        write(self.repo / "CLAUDE.md", "a" * 120_000)
+        self._commit("grow", "2026-09-01T00:00:00+00:00")
+        args = ("report", str(self.repo), "--days", "40000", "--harness", "claude")
+        c = self.cw_json(*args, "--compare-at", "2026-08-20T00:20+00:00")["compare"]  # just before the slim
+        f = c["files"]["claude"]
+        self.assertEqual((c["found"], f["before"], f["after"], f["now"]), ("date", 20_000, 2, 40_000))
+        self.assertTrue(c["at"].startswith("2026-08-20T00:20"))
+        self.assertNotIn("did not shrink", self.run_cw(*args, "--compare-at", "2026-08-20T00:20+00:00"))
+        c = self.cw_json(*args, "--compare-at", "2150-01-01")["compare"]  # git reads no date that late
+        self.assertEqual(c["files"]["claude"]["before"], 40_000)
+        c = self.cw_json(*args, "--compare-at", "2026-08-19 22:00Z")["compare"]
+        self.assertEqual(c["files"]["claude"]["before"], 0)          # no CLAUDE.md yet
+        self.assertEqual(c["files"]["claude"]["after"], 40_000)      # no cut since: today
+        self.assertIn("did not shrink", self.run_cw(*args, "--compare-at", "2026-08-19 22:00Z"))
+        c = self.cw_json(*args, "--compare-at", slim)["compare"]
+        self.assertEqual((c["found"], c["commit"], c["picked"]), ("commit", slim, True))
+        self.assertTrue(c["at"].startswith("2026-08-20T00:24"))
+        f = c["files"]["claude"]
+        self.assertEqual((f["before"], f["after"], f["now"]), (20_000, 2, 40_000))
+        for bad in ("yesterday", "2026-08-20T25:00", "ffffffffff", "--all"):
+            self.run_cw(*args, "--compare-at", bad, code=2)
+
+    def test_compare_says_when_claude_deleted_old_logs(self):
+        self._git_repo()
+        self._slim_history()                                             # slim on 2026-02-01
+        for i, day in enumerate(("10", "12", "14")):
+            self._claude_log(f"a{i}", self.repo, f"2026-02-{day}T12:00:00Z", [30_000])  # local day in any zone
+        c = self.cw_json("report", str(self.repo), "--days", "40000", "--harness", "claude")["compare"]
+        self.assertEqual(c["logs_from"], {"claude": "2026-02-10"})
+        out = self.run_cw("report", str(self.repo), "--days", "40000", "--harness", "claude")
+        self.assertIn("cleanupPeriodDays", out)
+        self.assertIn("30 days", out)
+        self.assertEqual((c["cleanup_days"], c["logs_deleted"]), (30, True))
+        write(self.home / ".claude" / "settings.json", '{"cleanupPeriodDays": 100000}')
+        c = self.cw_json("report", str(self.repo), "--days", "40000", "--harness", "claude")["compare"]
+        self.assertEqual((c["logs_from"], c["cleanup_days"], c["logs_deleted"]), ({"claude": "2026-02-10"}, 100000, False))
+        out = self.run_cw("report", str(self.repo), "--days", "40000", "--harness", "claude")
+        self.assertNotIn("deletes transcripts", out)
+        self.assertIn("logs on this machine start 2026-02-10", out)
+        os.remove(str(self.home / ".claude" / "settings.json"))
+        self._claude_log("b", self.repo, "2026-01-10T00:00:00Z", [90_000])
+        for i, day in enumerate(("11", "12")):
+            self._claude_log(f"b{i}", self.repo, f"2026-01-{day}T00:00:00Z", [90_000])
+        c = self.cw_json("report", str(self.repo), "--days", "40000", "--harness", "claude")["compare"]
+        self.assertNotIn("logs_from", c)                                 # enough sessions before
 
     def test_compare_at_date_and_no_compare_without_a_cut(self):
         self._git_repo()
@@ -313,6 +622,8 @@ class CwTest(unittest.TestCase):
         c = self.cw_json("report", str(self.repo), "--days", "40000", "--compare-at", "2026-01-05")["compare"]
         self.assertEqual(c["found"], "date")
         self.assertEqual((c["files"]["claude"]["before"], c["files"]["claude"]["after"]), (1_000, 1_100))
+        out = self.run_cw("report", str(self.repo), "--days", "40000", "--compare-at", "2026-01-05")
+        self.assertIn("did not shrink at this split", out)
 
     def test_compare_skips_a_move_into_an_imported_file(self):
         # The entry file shrinks, but @import still loads every line: nothing to compare.

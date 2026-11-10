@@ -34,11 +34,13 @@ import statistics
 import subprocess
 import sys
 import tempfile
+import unicodedata
 import webbrowser
+from collections import Counter
 from pathlib import Path
 from xml.sax.saxutils import escape
 
-VERSION = "0.3.0"
+VERSION = "0.3.1"
 HARNESSES = ("claude", "codex", "gemini", "opencode")
 
 CLAUDE_FILE_WARN_CHARS = 40_000   # Claude Code startup warning: "Large CLAUDE.md will impact performance"
@@ -949,6 +951,7 @@ class _Repo:
         # text file holding its target, and that text is what the agents read.
         self.skip = ("160000",) if plain_links else ("120000", "160000")
         self.listed = _opencode_patterns(read_text(root / "opencode.json"))  # files opencode.json lists
+        self.snaps: dict = {}  # (rev, harnesses) -> _snapshot_load
 
     def on_path(self, rel: str) -> bool:
         d = _load_dir(rel)
@@ -1089,17 +1092,20 @@ def _blobs(root, shas) -> dict[str, bytes] | None:
     return blobs if len(blobs) == len(shas) else None
 
 
-def _history(repo: _Repo, head_size: int, since: str | None) -> list[dict]:
-    """Main-line commits since `since` that changed an entry file, newest first, with the size
-    of the entry files that load from `here` before and after each one, and whether it changed a
-    link that can change what loads. A merge counts as one change against its first parent, so
-    a slimming reviewed on a branch lands on the day it reached the main line."""
+def _specs(repo: _Repo) -> list[str]:
+    """Pathspecs for every file that can change what loads at startup."""
     specs = [f":(glob,icase)**/{n}" for n in sorted(repo.names)] + [":(glob,icase)**/.claude/rules/**",
                                                                       ":(glob,icase)**/.claude/rules"]
-    specs += [":(glob)" + pat for pat, _ in repo.listed] + (["opencode.json"] if repo.listed else [])
-    window = [f"--since={since}"] if since else []  # git finds nothing for a date before 1970
-    out = _git(repo.root, "log", "--first-parent", "-m", "--no-renames", "--raw", "-z", "--no-abbrev", *window,
-               "--format=%x01%H %cI", "HEAD", "--", *specs)
+    return specs + [":(glob)" + pat for pat, _ in repo.listed] + (["opencode.json"] if repo.listed else [])
+
+
+def _log_changes(repo: _Repo, *args: str) -> list[dict]:
+    """Commits `git log *args` lists that changed a file that loads from `here` or a link that
+    can change what loads, newest first: sha, date, the size change of the loading files in
+    bytes (`delta`), whether a link changed, and `files`: (path, old blob, new blob, size
+    change) for each loading file, a blob None where none was read (absent, link, submodule)."""
+    out = _git(repo.root, "log", "--no-renames", "--raw", "-z", "--no-abbrev", "--format=%x01%H %cI",
+               *args, "--", *_specs(repo))
     if out is None:
         return []
     commits, cur = [], None
@@ -1110,7 +1116,7 @@ def _history(repo: _Repo, head_size: int, since: str | None) -> list[dict]:
         i += 1
         if rec.startswith("\x01"):
             sha, _, date = rec[1:].partition(" ")
-            cur = {"sha": sha, "date": date.strip(), "blobs": [], "links": False}
+            cur = {"sha": sha, "date": date.strip(), "files": [], "links": False}
             commits.append(cur)
         elif rec.startswith(":") and cur is not None and i < len(fields):
             bits, path = rec.split(), fields[i]
@@ -1119,19 +1125,35 @@ def _history(repo: _Repo, head_size: int, since: str | None) -> list[dict]:
                 continue
             old_mode, new_mode = bits[0][1:], bits[1]
             if repo.loads(path):
-                cur["blobs"].append((old_mode, new_mode, bits[2], bits[3]))
+                cur["files"].append((path, old_mode, new_mode, bits[2], bits[3]))
             if "120000" in (old_mode, new_mode) and not repo.plain_links and repo.link_spot(path):
                 cur["links"] = True
-    sizes = _blob_sizes(repo.root, [x for c in commits for b in c["blobs"] for x in (b[2], b[3])])
+    sizes = _blob_sizes(repo.root, [x for c in commits for f in c["files"] for x in (f[3], f[4])])
+    for c in commits:
+        files = []
+        for path, old_mode, new_mode, old, new in c["files"]:
+            old = old if old_mode not in repo.skip and old in sizes else None
+            new = new if new_mode not in repo.skip and new in sizes else None
+            files.append((path, old, new, sizes.get(new, 0) - sizes.get(old, 0)))
+        c["files"], c["delta"] = files, sum(f[3] for f in files)
+    return [c for c in commits if c["files"] or c["links"]]
+
+
+def _drop(c: dict, keep) -> int:
+    """Bytes a commit from _log_changes removed from the files in `keep`."""
+    return -sum(d for path, _, _, d in c["files"] if path in keep)
+
+
+def _history(repo: _Repo, head_size: int, since: str | None) -> list[dict]:
+    """Main-line commits since `since` that changed an entry file, newest first, with the size
+    of the entry files that load from `here` before and after each one, and whether it changed a
+    link that can change what loads. A merge counts as one change against its first parent, so
+    a slimming reviewed on a branch lands on the day it reached the main line."""
+    window = [f"--since={since}"] if since else []  # git finds nothing for a date before 1970
+    commits = _log_changes(repo, "--first-parent", "-m", *window, "HEAD")
     after = head_size
     for c in commits:
-        delta = 0
-        for old_mode, new_mode, old, new in c.pop("blobs"):
-            if new_mode not in repo.skip:
-                delta += sizes.get(new, 0)
-            if old_mode not in repo.skip:
-                delta -= sizes.get(old, 0)
-        c["after"], c["before"] = after, after - delta
+        c["after"], c["before"] = after, after - c["delta"]
         after = c["before"]
     return commits
 
@@ -1332,7 +1354,15 @@ def _when(ts: str) -> dt.datetime | None:
 
 
 def _snapshot_load(repo: _Repo, rev: str, hs):
-    """Repo tokens each harness would load at `rev`, from its files copied to a temporary folder."""
+    """Repo tokens each harness would load at `rev`, from its files copied to a temporary folder.
+    Each commit is weighed once per repo."""
+    key = (rev, tuple(hs))
+    if key not in repo.snaps:
+        repo.snaps[key] = _weigh_snapshot(repo, rev, hs)
+    return repo.snaps[key]
+
+
+def _weigh_snapshot(repo: _Repo, rev: str, hs):
     seen_unreadable = len(UNREADABLE)
     try:
         with tempfile.TemporaryDirectory(prefix="context-weight-before-") as tmp:
@@ -1356,20 +1386,129 @@ def _loads_less(before: dict, after: dict) -> bool:
     return any(_is_cut(before.get(h, 0), after.get(h, 0), COMPARE_MIN_DROP_BYTES // 3) for h in before)
 
 
-def compare(path, hs, files_now: dict, sessions, days: int, threshold: int, at_date: str | None = None):
+def _clean(text: str, limit: int | None = None) -> str:
+    """Text from the repo, safe to print: no control or format characters, so a commit message
+    cannot send terminal escapes or flip the line with bidi marks."""
+    s = "".join(ch for ch in text if unicodedata.category(ch)[0] != "C" and unicodedata.category(ch) not in ("Zl", "Zp"))
+    s = " ".join(s.split())
+    return s if limit is None or len(s) <= limit else s[:limit - 1] + "…"
+
+
+def _commit_info(root, sha: str) -> tuple[dt.datetime | None, str | None]:
+    """When `sha` was committed, and its subject line made safe to print."""
+    out = _git(root, "log", "-1", "--format=%cI%x00%s", sha)
+    if not out:
+        return None, None
+    when, _, subject = out.decode("utf-8", errors="replace").strip("\n").partition("\0")
+    return _when(when.strip()), _clean(subject)
+
+
+def _gone(blobs: dict, files, keep) -> Counter:
+    """Lines changes remove from the files in `keep`, net of lines they add there, so text
+    moved from one of them to another is not gone."""
+    out: Counter = Counter()
+    for path, old, new, _ in files:
+        if path in keep:
+            out.update((blobs[old] if old else b"").split(b"\n"))
+            out.subtract((blobs[new] if new else b"").split(b"\n"))
+    return +out
+
+
+def _branch_cut(repo: _Repo, merge: str, keep) -> str | None:
+    """The commit a merge brought in that made its cut, so the report can name it. `keep` holds
+    the files the agents asked load before the merge. Each of the 20 branch commits that cut
+    them most by size is credited with the bytes of the lines it removed that the merge itself
+    removed too (its diff against the main line). Removing text the branch added, a cut the
+    branch put back, and whatever the main line changed meanwhile earn nothing. The biggest
+    credit of at least COMPARE_MIN_DROP_BYTES wins, the newer commit on a tie; None names the
+    merge instead."""
+    landed = [c for c in _log_changes(repo, "--first-parent", "-m", f"{merge}^1..{merge}") if c["sha"] == merge]
+    changes = _log_changes(repo, "--no-merges", f"{merge}^1..{merge}")  # newest first
+    cuts = sorted((c for c in changes if _drop(c, keep) >= COMPARE_MIN_DROP_BYTES), key=lambda c: -_drop(c, keep))[:20]
+    if not (landed and cuts):
+        return None
+    blobs = _blobs(repo.root, {x for c in landed + cuts for f in c["files"] for x in f[1:3] if x})
+    if blobs is None:
+        return None
+    goal = _gone(blobs, landed[0]["files"], keep)
+    best, most = None, (COMPARE_MIN_DROP_BYTES - 1, 0)
+    for c in cuts:
+        credit = sum((len(line) + 1) * min(n, goal[line]) for line, n in _gone(blobs, c["files"], keep).items())
+        rank = (credit, -changes.index(c))
+        if rank > most:
+            best, most = c["sha"], rank
+    return best
+
+
+_AT_TIME = re.compile(r"\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2})?(?:Z|[+-]\d{2}:\d{2})?)?\Z")
+_AT_COMMIT = re.compile(r"[0-9a-fA-F]{4,64}\Z")  # 64 in a SHA-256 repository
+
+
+def _compare_at(s: str) -> tuple[str, object, str]:
+    """report --compare-at: a day (local midnight), a time (local unless it has an offset), or a
+    commit id. Only a hex id reaches git, so the value can never be read as an option."""
+    if _AT_TIME.match(s):
+        try:
+            if len(s) == 10:
+                t = dt.datetime.combine(dt.date.fromisoformat(s), dt.time())
+            else:
+                t = dt.datetime.fromisoformat(s[:10] + "T" + s[11:].replace("Z", "+00:00"))
+            return "time", (t if t.tzinfo else t.astimezone()), s
+        except (ValueError, OverflowError, OSError):
+            raise UsageError(f"--compare-at {s}: not a real date or time")
+    if _AT_COMMIT.match(s):
+        return "commit", s.lower(), s
+    raise UsageError(f"--compare-at wants YYYY-MM-DD, YYYY-MM-DDTHH:MM or a commit id, got {s!r}")
+
+
+def _cut_since(repo: _Repo, rev: str, hs, snap, today):
+    """The after side of a split at a day or a time, whose files are `snap`: for each agent, its
+    first main-line cut since then, found as the report finds one by itself, not today's files,
+    which may have grown back. Only commits that cut the files of an agent still without a cut
+    are weighed, at most five; an agent with no cut among them is weighed as today."""
+    need = [h for h in hs if snap[0].get(h, 0) > 0]
+    own = {h: set((_snapshot_load(repo, rev, (h,)) or ({}, {}))[1]) for h in need}
+    picked, stages, looked = {}, [], 0
+    for c in reversed(_log_changes(repo, "--first-parent", "-m", f"{rev}..HEAD")):  # oldest first
+        if looked >= 5 or len(picked) == len(need):
+            break
+        keep = set().union(*(own[h] for h in need if h not in picked))
+        if not (c["links"] or _drop(c, keep) >= COMPARE_MIN_DROP_BYTES):
+            continue
+        looked += 1
+        nxt = _snapshot_load(repo, c["sha"], hs)
+        cut = [h for h in need if h not in picked and nxt and _loads_less({h: snap[0][h]}, {h: nxt[0].get(h, 0)})]
+        if cut:
+            picked.update(dict.fromkeys(cut, nxt))
+            stages.append(nxt)
+    if not picked:
+        return today
+    if len(picked) < len(need):
+        stages.append(today)
+    load = dict(today[0])
+    load.update({h: s[0].get(h, 0) for h, s in picked.items()})
+    files = {}
+    for rel in set(snap[1]).union(*(s[1] for s in stages)):  # each file as it was first changed
+        files[rel] = next((s[1].get(rel, 0) for s in stages if s[1].get(rel, 0) != snap[1].get(rel, 0)),
+                          snap[1].get(rel, 0))
+    return load, files
+
+
+def compare(path, hs, files_now: dict, sessions, days: int, threshold: int, at=None):
     """Before and after the last cut of this repo's instruction files.
 
     The cut is found in git: uncommitted changes that shrink the entry files that load from
     `path`, else the newest main-line commits in the window that shrank them by
     COMPARE_MIN_DROP_BYTES and a fifth or changed a link on the load path, and the first of
-    those whose startup load really dropped. `at_date` (YYYY-MM-DD) sets the split instead.
-    Sizes before come from git; session numbers on each side come from the logs. Returns None
-    when there is nothing to compare."""
+    those whose startup load really dropped against its parent. Files that grew back later do
+    not hide it: today's size is shown next to it. `at` (from _compare_at) sets the split
+    instead. Sizes come from git; session numbers on each side come from the logs. Returns
+    None when there is nothing to compare."""
     root = git_root(path)
     top = _git(root, "rev-parse", "--show-toplevel") if root else None
     if top is None or Path(top.decode(errors="replace").strip()).resolve() != root.resolve() or \
             _git(root, "rev-parse", "--verify", "-q", "HEAD^{commit}") is None:
-        if at_date:
+        if at:
             raise UsageError("--compare-at needs git and a git repository with at least one commit")
         return None
     root = root.resolve()
@@ -1385,18 +1524,24 @@ def compare(path, hs, files_now: dict, sessions, days: int, threshold: int, at_d
     tracked, other, ignored = work
     after, after_files = _repo_load(files_now, root, ignored)
     after_all, after_all_files = _repo_load(files_now, root, None)
+    local = {h: after_all.get(h, 0) - after.get(h, 0) for h in after_all}  # what ignored files load now
     now = dt.datetime.now().astimezone()
-    candidates = []  # (found, rev to weigh as before, split time, commit)
-    if at_date:
-        try:
-            at = dt.datetime.combine(dt.date.fromisoformat(at_date), dt.time()).astimezone()
-        except (ValueError, OverflowError, OSError):
-            raise UsageError(f"--compare-at {at_date}: date out of range")
-        rev = (_git(root, "rev-list", "-1", "--first-parent", f"--before={at.isoformat()}", "HEAD")
+    # (found, rev weighed as before or None for nothing, rev weighed as after or None for the
+    # files today, split time, commit)
+    candidates = []
+    if at and at[0] == "time":
+        rev = (_git(root, "rev-list", "-1", "--first-parent", f"--before={min(at[1], now).isoformat()}", "HEAD")
                or b"").decode().strip()
         if not rev:
-            raise UsageError(f"--compare-at {at_date}: no commit on this branch before that day")
-        candidates.append(("date", rev, at, None))
+            raise UsageError(f"--compare-at {at[2]}: no commit on this branch before then")
+        candidates.append(("date", rev, None, at[1], None))
+    elif at:
+        sha = (_git(root, "rev-parse", "--verify", "-q", at[1] + "^{commit}") or b"").decode().strip()
+        when = _commit_info(root, sha)[0] if sha else None
+        if not when:
+            raise UsageError(f"--compare-at {at[2]}: not a commit in this repository")
+        parent = _git(root, "rev-parse", "--verify", "-q", sha + "^1")
+        candidates.append(("commit", parent.decode().strip() if parent else None, sha, when, sha))
     else:
         head = _tree(root, "HEAD")
         if head is None:
@@ -1404,7 +1549,7 @@ def compare(path, hs, files_now: dict, sessions, days: int, threshold: int, at_d
         head_size = _tree_size(repo, head)
         relinked = _links_at(repo, head) != _links_now(repo, tracked | other)
         if relinked or _is_cut(head_size, _work_size(repo, tracked | other)):
-            candidates.append(("uncommitted", "HEAD", now, None))
+            candidates.append(("uncommitted", "HEAD", None, now, None))
         start = now - dt.timedelta(days=days) if days < 365 * 50 else None  # git finds nothing before 1970
         cuts = links = 0
         for c in _history(repo, head_size, start.isoformat() if start else None):
@@ -1417,37 +1562,58 @@ def compare(path, hs, files_now: dict, sessions, days: int, threshold: int, at_d
             when = _when(c["date"])
             if parent and when:
                 cuts, links = cuts + is_cut, links + (not is_cut)
-                candidates.append(("commit", parent.decode().strip(), when, c["sha"]))
-    for found, rev, at, commit in candidates:
-        snap = _snapshot_load(repo, rev, hs)
-        if snap and (found == "date" or _loads_less(snap[0], after_all)):
-            before, before_files = snap
+                candidates.append(("commit", parent.decode().strip(), c["sha"], when, c["sha"]))
+    for found, rev, cut_rev, at_time, commit in candidates:
+        snap = _snapshot_load(repo, rev, hs) if rev else ({}, {})
+        cut = _snapshot_load(repo, cut_rev, hs) if cut_rev else (after, after_files)
+        if snap and found == "date":
+            cut = _cut_since(repo, rev, hs, snap, cut)
+        if not (snap and cut):
+            continue
+        if at:
+            break
+        # Judge a commit against its own parent, not today: files that grew back since must not
+        # hide it. Ignored local files (CLAUDE.local.md) still load, so text moved there counts.
+        weigh = after_all if cut_rev is None else {h: cut[0].get(h, 0) + local.get(h, 0)
+                                                   for h in set(cut[0]) | set(local)}
+        if _loads_less(snap[0], weigh):
             break
     else:
         return None
-    changed = [{"path": rel, "before": before_files.get(rel, 0), "after": after_files.get(rel, 0)}
-               for rel in set(before_files) | set(after_files)
-               if before_files.get(rel, 0) != after_files.get(rel, 0)]
+    (before, before_files), (cut_load, cut_files) = snap, cut
+    merge = None
+    if commit and len((_git(root, "rev-parse", commit + "^@") or b"").split()) > 1:
+        branch = _branch_cut(repo, commit, set(before_files))
+        if branch:
+            merge, commit = commit, branch
+    subject = _commit_info(root, commit)[1] if commit else None
+    changed = [{"path": rel, "before": before_files.get(rel, 0), "after": cut_files.get(rel, 0)}
+               for rel in set(before_files) | set(cut_files)
+               if before_files.get(rel, 0) != cut_files.get(rel, 0)]
     changed.sort(key=lambda x: (-abs(x["after"] - x["before"]), x["path"]))
     key = str(root)
     mine = [(s, _when(s.start)) for s in sessions if s.reqs and project_key(s.cwd) == key]
     try:
-        lo = at - dt.timedelta(days=days)
+        lo = at_time - dt.timedelta(days=days)
     except OverflowError:
         lo = dt.datetime.min.replace(tzinfo=dt.timezone.utc)
     sess = {}
     for h in hs:
-        b = [s for s, t in mine if s.harness == h and t and lo <= t < at]
-        a = [s for s, t in mine if s.harness == h and t and t >= at]
+        b = [s for s, t in mine if s.harness == h and t and lo <= t < at_time]
+        a = [s for s, t in mine if s.harness == h and t and t >= at_time]
         if b or a:
             sess[h] = {"before": summarize(b, threshold), "after": summarize(a, threshold)}
-    return {
+    files = {h: {"before": before.get(h, 0), "after": cut_load.get(h, 0), "now": after.get(h, 0)} for h in hs
+             if before.get(h, 0) or cut_load.get(h, 0) or after.get(h, 0)}
+    out = {
         "found": found,
-        "at": at.isoformat(timespec="minutes"),  # a commit keeps the offset it was made in
+        "picked": bool(at),
+        "at": at_time.isoformat(timespec="minutes"),  # a commit keeps the offset it was made in
         "commit": commit[:7] if commit else None,
-        "before_ref": "HEAD" if found == "uncommitted" else rev[:7],
-        "files": {h: {"before": before.get(h, 0), "after": after.get(h, 0)} for h in hs
-                  if before.get(h, 0) or after.get(h, 0)},
+        "merge": merge[:7] if merge else None,
+        "subject": subject,
+        "before_ref": "HEAD" if found == "uncommitted" else (rev[:7] if rev else None),
+        "files": files,
         "changed": changed[:5],
         "untracked": sorted(rel for rel in after_files if rel in other) if found != "uncommitted" else [],
         "ignored": [{"path": rel, "tokens": after_all_files[rel]} for rel in sorted(after_all_files)
@@ -1456,15 +1622,78 @@ def compare(path, hs, files_now: dict, sessions, days: int, threshold: int, at_d
         "days": days,
         "min_sessions": COMPARE_MIN_SESSIONS,
     }
+    # Claude Code deletes transcripts after cleanupPeriodDays (30 by default), so an empty
+    # "before" may only mean the logs are gone. Say so, from the oldest log left on this machine.
+    if "claude" in files or "claude" in sess:
+        starts = [s.start for s in sessions if s.harness == "claude" and _when(s.start)]
+        oldest = min(starts, key=_when) if starts else None
+        b = (sess.get("claude") or {}).get("before")
+        if oldest and _when(oldest) > lo and (not b or b["sessions"] < COMPARE_MIN_SESSIONS):
+            keep = _cleanup_days(root)
+            out["logs_from"] = {"claude": local_day(oldest)}
+            out["cleanup_days"] = keep
+            out["logs_deleted"] = (now - _when(oldest)).days >= keep - 1
+    return out
 
 
-def _compare_label(c: dict) -> str:
+def _cleanup_days(root: Path) -> int:
+    """Claude Code's cleanupPeriodDays: user, then project, then local settings; 30 when unset."""
+    days = 30
+    for f in (claude_dir() / "settings.json", root / ".claude" / "settings.json",
+              root / ".claude" / "settings.local.json"):
+        try:
+            v = json.loads(read_text(f) or "{}").get("cleanupPeriodDays")
+        except (ValueError, AttributeError):
+            continue
+        if isinstance(v, int) and not isinstance(v, bool) and v >= 1:
+            days = v
+    return days
+
+
+def _compare_label(c: dict, subject_max: int = 72) -> str:
     when = c["at"][:16].replace("T", " ")
     if c["found"] == "uncommitted":
         return "uncommitted changes against the last commit"
     if c["found"] == "commit":
-        return f"commit {c['commit']}, {when}"
-    return f"split at {c['at'][:10]}, --compare-at"
+        label = f"commit {c['commit']}"
+        if c.get("subject"):
+            subject = c["subject"] if len(c["subject"]) <= subject_max else c["subject"][:subject_max - 1] + "…"
+            label += f' "{subject}"'
+        if c.get("merge"):
+            label += f", merged in {c['merge']}"
+        return label + f", {when}" + (", --compare-at" if c.get("picked") else "")
+    return f"split at {when[:10] if when.endswith(' 00:00') else when}, --compare-at"
+
+
+def _grew_back(f: dict) -> bool:
+    return f.get("now", f["after"]) - f["after"] >= COMPARE_MIN_DROP_BYTES // 3
+
+
+def _compare_notes(c: dict, arrow: str = "->") -> list[str]:
+    """What the numbers alone would hide: growth since the change, a split that cut nothing,
+    and session logs Claude Code already deleted."""
+    notes = []
+    files = c["files"]
+    grew = [h for h in _compare_agents(c)  # only agents the change cut: growth elsewhere is not "back"
+            if h in files and files[h]["after"] < files[h]["before"] and _grew_back(files[h])]
+    if grew:
+        notes.append("Grew back since the change: " + ", ".join(
+            f"{AGENT_NAMES[h]} ~{fmt_k(files[h]['after'])} {arrow} ~{fmt_k(files[h]['now'])} now"
+            + (f", past the ~{fmt_k(files[h]['before'])} before it" if files[h]["now"] >= files[h]["before"] else "")
+            for h in grew) + ". Sessions after it include that growth.")
+    if c.get("picked") and c["files"] and not any(f["after"] < f["before"] for f in c["files"].values()):
+        notes.append("The instruction files did not shrink at this split. Pass the time just before "
+                     "the change (YYYY-MM-DDTHH:MM) or its commit id.")
+    for h, day in sorted((c.get("logs_from") or {}).items()):
+        if not c.get("logs_deleted"):
+            notes.append(f"{AGENT_NAMES[h]} logs on this machine start {day}, so few sessions come before the change.")
+            continue
+        keep = c.get("cleanup_days", 30)
+        notes.append(f"{AGENT_NAMES[h]} logs on this machine start {day}: it deletes transcripts older than "
+                     f"cleanupPeriodDays ({keep} days{' by default' if keep == 30 else ''}).")
+        notes.append(f'Set "cleanupPeriodDays" higher in {short(claude_dir() / "settings.json")} '
+                     "to keep the sessions the next report needs.")
+    return notes
 
 
 def _compare_agents(c: dict) -> list[str]:
@@ -1503,6 +1732,8 @@ def print_compare(c: dict) -> None:
     for h in _compare_agents(c):
         f = c["files"].get(h, {"before": 0, "after": 0})
         line = f"{h:8} files {fmt_k(f['before'])} -> {fmt_k(f['after'])}"
+        if fmt_k(f.get("now", f["after"])) != fmt_k(f["after"]):
+            line += f", now {fmt_k(f['now'])}"
         s = c["sessions"].get(h) or {}
         b, a = s.get("before"), s.get("after")
         if b and a:
@@ -1517,6 +1748,8 @@ def print_compare(c: dict) -> None:
     if c["ignored"]:
         print("left out because git ignores them, so the old commit cannot show them: " +
               ", ".join(f"{x['path']} {fmt_k(x['tokens'])}" for x in c["ignored"]))
+    for note in _compare_notes(c):
+        print(note)
     hint = _compare_hint(c)
     if hint:
         print(hint)
@@ -1795,10 +2028,10 @@ def render_svg(rep: dict, theme: str = "auto") -> str:
     if c:
         y += 38
         g.text(L, y, "Before and after", 17, "b")
-        g.text(R, y, _fit(_compare_label(c), 420, 13), 13, "m r")
+        g.text(R, y, _fit(_compare_label(c, 40), 700, 13, left=False), 13, "m r")
         y += 20
-        g.text(L, y, f"This repo's instruction files before the change and now. Sessions: the {c['days']} days "
-                     "before it against everything since.", 13, "m")
+        g.text(L, y, f"This repo's instruction files before and right after the change. Sessions: the "
+                     f"{c['days']} days before it against everything since.", 13, "m")
         y += 30
         cx_files, cx_start, cx_status = L + 130, L + 340, L + 560
         for x, label in ((L, "Agent"), (cx_files, "Instruction files"), (cx_start, "Startup, measured"),
@@ -1810,6 +2043,8 @@ def render_svg(rep: dict, theme: str = "auto") -> str:
             f = c["files"].get(h, {"before": 0, "after": 0})
             g.text(L, y, AGENT_NAMES[h], 14)
             g.text(cx_files, y, f"~{fmt_k(f['before'])} → ~{fmt_k(f['after'])}", 14, "b n")
+            if fmt_k(f.get("now", f["after"])) != fmt_k(f["after"]):
+                g.text(cx_files, y + 15, f"now ~{fmt_k(f['now'])}", 11, "s" if _grew_back(f) else "m")
             sd = c["sessions"].get(h) or {}
             b, a = sd.get("before"), sd.get("after")
             if b and a:
@@ -1822,6 +2057,12 @@ def render_svg(rep: dict, theme: str = "auto") -> str:
                 g.badge(x + 7, y - 5, kind)
                 x += 22
             g.text(x, y, _fit(words, R - x, 13, left=False), 13, "s" if kind else "m")
+        if any(fmt_k(f.get("now", f["after"])) != fmt_k(f["after"]) for f in c["files"].values()):
+            y += 12
+        lines = [ln for note in _compare_notes(c, "→") for ln in _wrap(note, R - L, 13)]
+        for i, ln in enumerate(lines):
+            y += 30 if i == 0 else 20
+            g.text(L, y, ln, 13, "m")
         hint = _compare_hint(c)
         if hint:
             y += 30
@@ -2055,8 +2296,6 @@ def _norm(line: str) -> str:
 def verify_split(original: str, new_paths: list[str], allow: str | None) -> dict:
     """Every content line of ORIGINAL must appear in the new files at least as many times as
     it did in ORIGINAL, unless the allow list names it."""
-    from collections import Counter
-
     text = read_text(original)
     if text is None:
         raise UsageError(f"cannot read {original}")
@@ -2200,8 +2439,9 @@ def _main(argv=None) -> int:
     p.add_argument("--threshold", type=int, default=150_000)
     p.add_argument("--window", type=int, help=window_help)
     p.add_argument("--target", type=int, default=5_000, help="target tokens for repo instructions (default 5000)")
-    p.add_argument("--compare-at", help="YYYY-MM-DD, compare before and after this day instead of the "
-                   "slimming the report finds in git by itself")
+    p.add_argument("--compare-at", metavar="WHEN",
+                   help="YYYY-MM-DD, YYYY-MM-DDTHH:MM or a commit id: compare before and after this "
+                   "instead of the slimming the report finds in git by itself")
     p.add_argument("--svg", nargs="?", const="", metavar="FILE",
                    help="also draw the report as a picture (SVG); without FILE it goes to the temp folder")
     p.add_argument("--theme", choices=("auto", "light", "dark"), default="auto",
@@ -2218,8 +2458,10 @@ def _main(argv=None) -> int:
     if getattr(a, "path", None) is not None:
         _project_dir(a.path)
     for flag in ("since", "until", "compare_at"):
-        if getattr(a, flag, None):
+        if getattr(a, flag, None) and not (a.cmd == "report" and flag == "compare_at"):
             setattr(a, flag, _date(getattr(a, flag), "--" + flag.replace("_", "-")))
+    if a.cmd == "report" and a.compare_at:
+        a.compare_at = _compare_at(a.compare_at)
     for flag in ("max_tokens", "window", "threshold", "days", "top"):
         v = getattr(a, flag, None)
         if v is not None and v < 0:
