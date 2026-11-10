@@ -1,6 +1,7 @@
 """Tests for cw.py on a synthetic HOME. Run: python3 -m unittest discover -s tests -v"""
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -506,6 +507,36 @@ class CwTest(unittest.TestCase):
         write(self.home / ".gemini" / "settings.json", json.dumps(["a", "list"]))
         write(self.home / ".codex" / "config.toml", "project_doc_max_bytes = 'big'\n")
         self.cw_json("report", str(self.repo))
+
+
+class ManifestTest(unittest.TestCase):
+    """The plugin manifests that `/plugin install` and `codex plugin add` read."""
+
+    ROOT = CW.parents[3]
+    FILES = (".claude-plugin/plugin.json", ".codex-plugin/plugin.json", ".claude-plugin/marketplace.json")
+
+    def load(self, rel):
+        return json.loads((self.ROOT / rel).read_text(encoding="utf-8"))
+
+    def test_manifests_agree_with_the_script(self):
+        out = subprocess.run([sys.executable, str(CW), "--version"], capture_output=True, text=True)
+        version = out.stdout.strip()
+        self.assertTrue(version)
+        for rel in self.FILES[:2]:
+            plugin = self.load(rel)
+            self.assertEqual(plugin["name"], "context-weight", rel)
+            self.assertEqual(plugin["version"], version, rel)
+            self.assertTrue((self.ROOT / plugin["skills"] / "context-weight" / "SKILL.md").is_file(), rel)
+        market = self.load(self.FILES[2])
+        self.assertEqual(market["name"], "context-weight")
+        [entry] = market["plugins"]
+        self.assertEqual(entry["name"], "context-weight")
+        self.assertTrue((self.ROOT / entry["source"] / ".claude-plugin" / "plugin.json").is_file())
+
+    def test_manifests_carry_no_email(self):
+        email = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
+        for rel in self.FILES:
+            self.assertIsNone(email.search((self.ROOT / rel).read_text(encoding="utf-8")), rel)
 
 
 if __name__ == "__main__":

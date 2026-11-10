@@ -9,6 +9,9 @@
   Change both together, with a source and the date you checked it.
 - Use `_is_file` / `_is_dir` / `_exists`, not the `Path` methods: on Python 3.13 and older
   those raise `PermissionError` under an unreadable parent folder.
+- A release bumps `VERSION` in `cw.py` and `version` in both `plugin.json` files; a test checks
+  they match. Claude Code and Codex cache plugins by version, so an unbumped change never
+  reaches people who installed the plugin.
 - Keep this file and SKILL.md small: `python3 skills/context-weight/scripts/cw.py files . --max-tokens 6000`.
 
 ## Lessons

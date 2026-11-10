@@ -43,16 +43,38 @@ It works with **Claude Code, Codex, Gemini CLI and OpenCode**, on any repo.
 
 ## Quick start
 
-```bash
-git clone https://github.com/ohm41321/context-weight.git
-cd context-weight
-python3 install.py          # Windows: py install.py
+Pick the line for your agent. Each one is a single step.
+
+**Claude Code**: type this in a session.
+
+```text
+/plugin install context-weight --marketplace ohm41321/context-weight
 ```
 
-Restart your agent and ask it to **"weigh this repo's context"**. You can also run the script yourself:
+**Codex**
 
 ```bash
-python3 ~/.claude/skills/context-weight/scripts/cw.py report .
+codex plugin marketplace add ohm41321/context-weight && codex plugin add context-weight@context-weight
+```
+
+**Any agent** (Claude Code, Codex, Gemini CLI, OpenCode, Cursor and [more](https://skills.sh)), with Node installed:
+
+```bash
+npx skills add ohm41321/context-weight
+```
+
+**No Node**: Python is enough.
+
+```bash
+git clone https://github.com/ohm41321/context-weight.git && python3 context-weight/install.py
+```
+
+Restart your agent and ask it to **"weigh this repo's context"**.
+
+To try it without installing anything, run the script straight from GitHub. It only reads files:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ohm41321/context-weight/main/skills/context-weight/scripts/cw.py | python3 - report .
 ```
 
 ## What you get
@@ -198,14 +220,23 @@ Related skills: [`context-budget`](https://skills.sh/affaan-m/everything-claude-
 
 ## Install options
 
-| Goal | Command |
-| --- | --- |
-| Every repo, every agent (symlink) | `python3 install.py` |
-| Same, but as a copy | `python3 install.py --copy` |
-| One repo, committed with it | `python3 install.py --project path/to/repo` |
-| Remove | `python3 install.py --uninstall` |
+Use one method per agent. If you install the plugin and also copy the skill into a
+skills folder, the agent lists it twice.
 
-The personal install writes to `~/.agents/skills`, which Codex, Gemini CLI and
+| Method | Install | Update | Remove |
+| --- | --- | --- | --- |
+| Claude Code plugin | `/plugin install context-weight --marketplace ohm41321/context-weight` | `/plugin update context-weight@context-weight` | `/plugin uninstall context-weight@context-weight` |
+| Codex plugin | `codex plugin marketplace add ohm41321/context-weight`<br>`codex plugin add context-weight@context-weight` | `codex plugin marketplace upgrade context-weight` | `codex plugin remove context-weight@context-weight` |
+| [skills CLI](https://github.com/vercel-labs/skills), any agent | `npx skills add ohm41321/context-weight` | `npx skills update` | `npx skills remove context-weight` |
+| Python, every agent (symlink) | `python3 install.py` | `git pull` | `python3 install.py --uninstall` |
+| Python, as a copy | `python3 install.py --copy` | `git pull`, then run it again | `python3 install.py --uninstall` |
+| Python, one repo, committed with it | `python3 install.py --project path/to/repo` | run it again | `python3 install.py --project path/to/repo --uninstall` |
+
+Claude Code older than 2.1.275 takes two steps: `/plugin marketplace add ohm41321/context-weight`,
+then `/plugin install context-weight@context-weight`. As a plugin, the skill is named
+`context-weight:context-weight`.
+
+The Python install writes to `~/.agents/skills`, which Codex, Gemini CLI and
 OpenCode read, and to `~/.claude/skills`, which Claude Code and OpenCode read.
 It respects `$CLAUDE_CONFIG_DIR`. The installer never deletes a folder it did
 not create: its copies carry a marker file, and anything else is left alone. On Windows, linking falls back to a copy when symlinks are not
@@ -216,6 +247,8 @@ allowed. `./install.sh` still works and calls `install.py`.
 
 ```text
 context-weight/
+├── .claude-plugin/                Claude Code plugin and marketplace manifests
+├── .codex-plugin/plugin.json      Codex plugin manifest
 ├── install.py                     installer (install.sh calls it)
 ├── skills/context-weight/
 │   ├── SKILL.md                   what the agent reads

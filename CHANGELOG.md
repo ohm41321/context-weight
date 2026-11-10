@@ -4,6 +4,8 @@
 
 Fixes from two pre-release reviews. Every review finding has a test that failed before its fix.
 
+- Installable in one step: as a Claude Code plugin (`/plugin install context-weight --marketplace
+  ohm41321/context-weight`), as a Codex plugin, or with `npx skills add ohm41321/context-weight`.
 - `verify-split` no longer passes when content is lost. It counts repeated lines, keeps short
   lines that contain words, keeps indentation inside code blocks, and never counts the old file
   as its own copy. Unreadable inputs exit 2.

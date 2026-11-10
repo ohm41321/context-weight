@@ -1,0 +1,25 @@
+{
+  "name": "context-weight",
+  "displayName": "context-weight",
+  "version": "0.2.0",
+  "description": "Measure and cut the context an agent loads before any work starts (CLAUDE.md, AGENTS.md, GEMINI.md, rules, @imports, skill listings), then slim instruction files and prove no line was lost.",
+  "author": {
+    "name": "ohm41321",
+    "url": "https://github.com/ohm41321"
+  },
+  "license": "MIT",
+  "homepage": "https://github.com/ohm41321/context-weight",
+  "repository": "https://github.com/ohm41321/context-weight",
+  "keywords": [
+    "context",
+    "tokens",
+    "claude-md",
+    "agents-md",
+    "skills",
+    "codex",
+    "claude-code",
+    "gemini-cli",
+    "opencode"
+  ],
+  "skills": "./skills"
+}

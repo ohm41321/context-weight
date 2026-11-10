@@ -1,0 +1,17 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "context-weight",
+  "owner": {
+    "name": "ohm41321",
+    "url": "https://github.com/ohm41321"
+  },
+  "description": "Single-plugin marketplace for context-weight.",
+  "plugins": [
+    {
+      "name": "context-weight",
+      "source": "./",
+      "description": "Measure and cut the context an agent loads before any work starts (CLAUDE.md, AGENTS.md, GEMINI.md, rules, @imports, skill listings), then slim instruction files and prove no line was lost.",
+      "category": "productivity"
+    }
+  ]
+}
