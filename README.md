@@ -226,6 +226,10 @@ Related skills: [`context-budget`](https://skills.sh/affaan-m/everything-claude-
 [`claude-md-progressive-disclosurer`](https://skills.sh/daymade/claude-code-skills/claude-md-progressive-disclosurer),
 [`codex-token-usage`](https://skills.sh/huajiexiewenfeng/codex-token-usage-skill/codex-token-usage).
 
+From the same author: [Luciazero](https://github.com/ohm41321/luciazero) makes coding agents
+prove their work, with a verify loop, a `/done` closeout and handoffs between agents. Its
+doctrine is one of the always-loaded files context-weight keeps small.
+
 ## Install options
 
 Use one method per agent. If you install the plugin and also copy the skill into a
