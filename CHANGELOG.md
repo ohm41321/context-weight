@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.2 (2026-11-10)
 
 - The picture's top row now describes one agent. The big number, measured startup, startup
   share and possible saving all belong to the agent with the heaviest startup load. Before,
