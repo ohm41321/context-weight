@@ -1055,7 +1055,7 @@ def _y_resolve(s: str):
     if s in ("false", "False", "FALSE"):
         return False
     if re.match(r"[-+]?[0-9]+\Z", s):
-        return int(s)
+        return int(s) if int(s) or s[0] != "-" else -0.0
     if re.match(r"0o[0-7]+\Z", s):
         return int(s[2:], 8)
     if re.match(r"0x[0-9a-fA-F]+\Z", s):
@@ -1077,9 +1077,12 @@ class _Yaml:
 
     def __init__(self, text: str):
         self.lines = text.replace("\r\n", "\n").split("\n")
+        if len(self.lines) > 1 and self.lines[-1] == "":
+            self.lines.pop()  # the break that ends the last line starts no line
         self.i = 0
         self.anchors: dict = {}
         self.at = [0, 0]  # the cursor in a flow collection: line, column
+        self.flow_parent = -1  # the indentation the flow collection's lines must pass
 
     def parse(self):
         if self._next() is None:
@@ -1166,9 +1169,7 @@ class _Yaml:
             kv = self._key(text)
             if kv is None:
                 raise _YamlError("an entry without a key")
-            if kv[0] in out:
-                raise _YamlError("a key given twice")
-            out[kv[0]] = self._after_colon(i, n, kv[1])
+            out[kv[0]] = self._after_colon(i, n, kv[1])  # a key given twice keeps the last value
         return out
 
     def _after_colon(self, i, n, rest):
@@ -1215,6 +1216,8 @@ class _Yaml:
             while k < len(line) and line[k] not in " \t,[]{}":
                 k += 1
             mark = line[col:k]
+            if c != "!" and len(mark) == 1:
+                raise _YamlError("an anchor or alias without a name")
             if c == "*":
                 if mark[1:] not in self.anchors:
                     raise _YamlError("an alias to no anchor")
@@ -1225,6 +1228,8 @@ class _Yaml:
             if not rest or rest.startswith("#"):
                 self.i = i + 1
                 v = self._node(parent)
+                if v is None and mark == "!!str":
+                    v = ""
             else:
                 v = self._value(i, len(line) - len(rest), parent, resolve and mark != "!!str")
             if c == "&":
@@ -1233,19 +1238,19 @@ class _Yaml:
         if c in "|>":
             return self._block(i, col, parent)
         if c in "\"'":
-            v, j, k = self._quoted(i, col)
+            v, j, k = self._quoted(i, col, parent)
             self._rest_is_empty(j, k)
             self.i = j + 1
             return v
         if c in "[{":
-            self.at = [i, col]
+            self.at, self.flow_parent = [i, col], parent
             v = self._flow(0)
             j, k = self.at
             self._rest_is_empty(j, k)
             self.i = j + 1
             return v
         s = line[col:]
-        if c in "@`%,]}#" or self._is_item(s) or s[:2] in ("? ", ": ", "?\t", ":\t") or s in ("?", ":"):
+        if c in "@`%]}#" or self._is_item(s) or s[:2] in ("? ", ": ", "?\t", ":\t") or s in ("?", ":"):
             raise _YamlError("a value cannot start with " + c)
         return self._plain(i, col, parent, resolve)
 
@@ -1379,9 +1384,9 @@ class _Yaml:
             k += 1
         return "".join(out), None, False, trail
 
-    def _quoted(self, i, col):
-        """A quoted value from column `col` of line i, maybe over several lines, folded as
-        YAML folds them: (value, line, column after the closing quote)."""
+    def _quoted(self, i, col, parent):
+        """A quoted value from column `col` of line i, maybe over several lines, each indented
+        past `parent`, folded as YAML folds them: (value, line, column after the closing quote)."""
         q = self.lines[i][col]
         out, j, k = [], i, col + 1
         while True:
@@ -1390,7 +1395,10 @@ class _Yaml:
                 out.append(text)
                 v = "".join(out)
                 if q == '"' and re.search("[\ud800-\udfff]", v):  # a pair written as two escapes
-                    v = v.encode("utf-16-le", "surrogatepass").decode("utf-16-le", "surrogatepass")
+                    try:
+                        v = v.encode("utf-16-le", "surrogatepass").decode("utf-16-le")
+                    except UnicodeDecodeError:
+                        raise _YamlError("half of a surrogate pair")
                 return v, j, end
             out.append(text[:len(text) - trail])
             blank, j = 0, j + 1
@@ -1398,6 +1406,8 @@ class _Yaml:
                 blank, j = blank + 1, j + 1
             if j >= len(self.lines):
                 raise _YamlError("a quote not closed")
+            if len(self.lines[j]) - len(self.lines[j].lstrip(" ")) <= parent:
+                raise _YamlError("a quoted value's next line is not indented")
             out.append("\n" * blank if blank else "" if escaped else " ")
             k = len(self.lines[j]) - len(self.lines[j].lstrip(" \t"))
 
@@ -1410,15 +1420,26 @@ class _Yaml:
 
     def _skip(self):
         """Past blanks, line breaks and comments inside a flow collection."""
+        moved = False
         while self.at[0] < len(self.lines):
             j, k = self.at
             line = self.lines[j]
             if k < len(line) and line[k] in " \t":
                 self.at[1] += 1
             elif k >= len(line) or line[k] == "#" and (k == 0 or line[k - 1] in " \t"):
-                self.at = [j + 1, 0]
+                self.at, moved = [j + 1, 0], True
             else:
+                if moved:
+                    self._flow_indent(j)
                 return
+
+    def _flow_indent(self, j):
+        """A flow collection's next line must be indented past the block it sits in, unless it
+        only closes the collection."""
+        line = self.lines[j]
+        text = line.lstrip(" ")
+        if len(line) - len(text) <= self.flow_parent and not text.lstrip(" \t").startswith(("]", "}")):
+            raise _YamlError("a flow collection's next line is not indented")
 
     def _flow(self, depth):
         if depth > 200:
@@ -1452,24 +1473,46 @@ class _Yaml:
                 if isinstance(out, list):
                     out.append({_js_str(key) if not isinstance(key, str) else key: value} if pair else key)
                 else:
-                    name = key if isinstance(key, str) else _js_str(key)
-                    if name in out:
-                        raise _YamlError("a key given twice")
-                    out[name] = value
+                    out[key if isinstance(key, str) else _js_str(key)] = value
                 c = self._char()
                 if c == ",":
                     self.at[1] += 1
                 elif c != close:
                     raise _YamlError("a bad flow collection")
         if c in "\"'":
-            v, j, k = self._quoted(*self.at)
+            v, j, k = self._quoted(*self.at, self.flow_parent)
             self.at = [j, k]
             return v
-        if c in "@`%&*!|>#":
+        if c in "&*!":
+            j, k = self.at
+            line = self.lines[j]
+            e = k + 1
+            while e < len(line) and line[e] not in " \t,[]{}":
+                e += 1
+            mark = line[k:e]
+            if c != "!" and len(mark) == 1:
+                raise _YamlError("an anchor or alias without a name")
+            self.at = [j, e]
+            if c == "*":
+                if mark[1:] not in self.anchors:
+                    raise _YamlError("an alias to no anchor")
+                return self.anchors[mark[1:]]
+            self._skip()
+            nxt = self._char()
+            if nxt in ("", ",", "]", "}", ":"):
+                v = "" if mark == "!!str" else None
+            elif mark == "!!str" and nxt not in "[{\"'&*!":
+                v = self._flow_plain(resolve=False)
+            else:
+                v = self._flow(depth + 1)
+            if c == "&":
+                self.anchors[mark[1:]] = v
+            return v
+        if c in "@`%|>#":
             raise _YamlError("a flow value cannot start with " + c)
         return self._flow_plain()
 
-    def _flow_plain(self):
+    def _flow_plain(self, resolve=True):
         parts, blank = [], 0
         while True:
             j, k = self.at
@@ -1485,19 +1528,34 @@ class _Yaml:
             while nj < len(self.lines) and not self.lines[nj].strip(" \t"):
                 nj, blank = nj + 1, blank + 1
             nxt = self.lines[nj].lstrip(" \t") if nj < len(self.lines) else ""
-            if not nxt or nxt[0] in ",[]{}#" or _Y_FLOW_STOP.match(nxt).group(0).startswith(":"):
+            if not nxt or nxt[0] in ",[]{}#" or nxt[0] == ":" and (len(nxt) == 1 or nxt[1] in " \t,[]{}"):
                 self.at = [j, len(line)]
                 break
+            self._flow_indent(nj)
             self.at = [nj, len(self.lines[nj]) - len(nxt)]
-        return _y_resolve("".join(parts))
+        v = "".join(parts)
+        return _y_resolve(v) if resolve else v
 
 
 def _cc_yaml(text: str):
-    """Bun.YAML.parse(text), or _YamlError."""
+    """Bun.YAML.parse(text), or _YamlError. A ... line ends a document; with more documents
+    after it, the result is the list of them."""
+    docs, cur = [], []
+    for line in text.replace("\r\n", "\n").split("\n"):
+        if line == "..." or line.startswith(("... ", "...\t")):
+            if not docs or any(x.strip(" \t") and not x.lstrip(" \t").startswith("#") for x in cur):
+                docs.append(cur)  # a marker right after another ends no document
+            cur = []
+        else:
+            cur.append(line)
+    docs.append(cur)
+    while len(docs) > 1 and not any(x.strip(" \t") and not x.lstrip(" \t").startswith("#") for x in docs[-1]):
+        docs.pop()
     try:
-        return _Yaml(text).parse()
+        parsed = [_Yaml("\n".join(d)).parse() for d in docs]
     except RecursionError:
         raise _YamlError("nested too deep")
+    return parsed[0] if len(parsed) == 1 else parsed
 
 
 _AF_LINE = re.compile("([a-zA-Z_-]+):" + _JS_S + "+(" + _JS_NS + _JS_DOT + r"*)\Z")

@@ -789,6 +789,34 @@ class CwTest(unittest.TestCase):
                            ("❤️", 2), ("1️⃣", 2), ("👨‍👩‍👧", 2), ("​", 0), ("a\tb", 2)):
             self.assertEqual(cw.str_width(text), cols, ascii(text))
 
+    def test_frontmatter_yaml_reads_as_bun_does(self):
+        # Each expected value is what Bun.YAML.parse (Bun 1.4.4, inside Claude Code 2.1.322)
+        # returned for the same text; None stands for an error.
+        cw = load_cw()
+        for text, want in (
+                ("a: 1\na: 2", {"a": 2}),                      # a repeated key keeps the last value
+                ("a: {b: 1, b: 2}", {"a": {"b": 2}}),
+                ("a: |+\n  one\n\n\n", {"a": "one\n\n\n"}),    # the last break ends a line, not adds one
+                ("a: 'one\n  two'", {"a": "one two"}),
+                ("a: 'one\ntwo'", None),                       # a quoted value's next line must be indented
+                ("a: [b\n  c]", {"a": ["b c"]}),
+                ("a: [b,\nc]", None),                          # so must a flow list's
+                ("a: [\n  b\n]", {"a": ["b"]}),                # except its closing bracket
+                ("a: [b, &x c, *x]", {"a": ["b", "c", "c"]}),
+                ("a: ,b", {"a": ",b"}),
+                ("a: !!str", {"a": ""}),
+                ("a: b: c", None),
+                ("...\na: b", [None, {"a": "b"}]),             # ... ends a document
+                ("...\n...\na: b", [None, {"a": "b"}]),
+                ('a: "x\\uD83D\\uDE00y"', {"a": "x\U0001F600y"}),
+                ('a: "x\\uD83Dy"', None),                      # half of a surrogate pair
+        ):
+            try:
+                got = cw._cc_yaml(text)
+            except cw._YamlError:
+                got = None
+            self.assertEqual(got, want, ascii(text))
+
     # ------------------------------------------------------------------ sessions
     def _claude_log(self, name, cwd, ts, ctxs, dup_first=0, creation=0):
         recs = [{"type": "user", "cwd": str(cwd), "timestamp": ts}]
