@@ -147,7 +147,10 @@ flowchart LR
 - **Copies count.** If a line appeared twice, removing one copy shows up as a
   loss.
 - **Code keeps its shape.** Flattening indented YAML or Python inside a code
-  block is a loss. Re-wrapping prose is not.
+  block is a loss, and so is turning a Makefile's tab indentation into spaces,
+  unless GitHub shows both alike (where a list item's indentation takes part
+  of the tab). Spacing inside a line may change. In prose, indentation may
+  change too; moving a line break shows the two changed lines as missing.
 - **The backup cannot vouch for itself.** The old file is never counted as its
   own copy.
 - **Deliberate drops are explicit.** You list them in `dropped.txt`, and the
@@ -165,7 +168,7 @@ jobs:
   instructions-budget:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Agent instructions stay under 6k tokens
         run: |
           curl -fsSL https://raw.githubusercontent.com/ohm41321/context-weight/main/skills/context-weight/scripts/cw.py -o cw.py
@@ -174,7 +177,8 @@ jobs:
 
 The gate fails when any agent's repo instructions pass the limit. It also fails
 when Codex would cut part of `AGENTS.md` off at its 32 KiB cap. Replace `main`
-with a commit SHA if you want reproducible builds.
+with a release tag such as `v0.3.2`, or a commit SHA, if you want reproducible
+builds.
 
 <details>
 <summary>As a pre-commit hook</summary>
@@ -191,8 +195,11 @@ repos:
         entry: python3 .agents/skills/context-weight/scripts/cw.py files . --max-tokens 6000
         language: system
         pass_filenames: false
-        files: (AGENTS|CLAUDE|GEMINI)\.md$
+        always_run: true
 ```
+
+It runs on every commit: rules, `@imports` and notes files count too, not only
+the files named `AGENTS.md`, `CLAUDE.md` or `GEMINI.md`.
 </details>
 
 ## What each agent loads
@@ -271,7 +278,7 @@ context-weight/
 │       └── slimming.md            the slimming procedure
 ├── assets/make_report_demo.py     draws the sample report pictures from made-up data
 ├── tests/test_cw.py               unit tests on a synthetic HOME
-└── .github/workflows/ci.yml       Linux, macOS, Windows; Python 3.8 to 3.13
+└── .github/workflows/ci.yml       Linux, macOS, Windows; Python 3.8 to 3.14
 ```
 </details>
 
@@ -338,7 +345,7 @@ python3 assets/make_report_demo.py      # redraw the sample pictures in this REA
 ```
 
 CI runs the tests and the installer on Linux, macOS and Windows with Python
-3.8 to 3.13. It also checks this repo's own instructions with the gate.
+3.8 to 3.14. It also checks this repo's own instructions with the gate.
 
 ## License
 

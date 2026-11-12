@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
-import fnmatch
+import errno
 import glob
 import json
 import os
@@ -40,7 +40,7 @@ from collections import Counter
 from pathlib import Path
 from xml.sax.saxutils import escape
 
-VERSION = "0.3.1"
+VERSION = "0.3.2"
 HARNESSES = ("claude", "codex", "gemini", "opencode")
 
 CLAUDE_FILE_WARN_CHARS = 40_000   # Claude Code startup warning: "Large CLAUDE.md will impact performance"
@@ -53,6 +53,7 @@ CODEX_DOC_MAX_DEFAULT = 32 * 1024 # Codex: project_doc_max_bytes default
 CODEX_LISTING_FRACTION = 0.02     # Codex: skill listing gets 2% of the context window
 CODEX_LISTING_FALLBACK_CHARS = 8_000  # Codex: listing budget when the window is unknown
 DEFAULT_WINDOW = 200_000          # assumed when neither --window nor a log gives the window
+FINDING_MIN_CUT = 2_000           # a finding needs repo instructions this far above --target
 EXIT_OK, EXIT_FAIL, EXIT_USAGE = 0, 1, 2
 
 
@@ -92,7 +93,7 @@ def _dict(x) -> dict:
 def _int(x) -> int:
     try:
         return int(x or 0)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):  # OverflowError: 1e999 in a log reads as infinity
         return 0
 
 
@@ -359,6 +360,12 @@ def claude_files(cwd) -> dict:
     return {"files": out, "warnings": warnings, "notes": notes}
 
 
+_TOML_KEY = r"""(?:[\w-]+|"[^"\n]*"|'[^'\n]*')"""
+_TOML_TABLE = re.compile(rf"^\s*\[\[?\s*{_TOML_KEY}(?:\s*\.\s*{_TOML_KEY})*\s*\]\]?\s*(?:#.*)?$", re.M)
+_TOML_DOC_MAX = re.compile(r"^\s*project_doc_max_bytes\s*=\s*\+?(0x[0-9A-Fa-f_]+|0o[0-7_]+|0b[01_]+|\d[\d_]*)"
+                           r"\s*(?:#.*)?$", re.M)
+
+
 def _codex_config() -> tuple[int, list[str]]:
     text = read_text(codex_dir() / "config.toml") or ""
     max_bytes, fallbacks = CODEX_DOC_MAX_DEFAULT, []
@@ -368,10 +375,19 @@ def _codex_config() -> tuple[int, list[str]]:
         max_bytes = int(cfg.get("project_doc_max_bytes", max_bytes))
         fallbacks = [str(x) for x in cfg.get("project_doc_fallback_filenames", [])]
     except Exception:
-        m = re.search(r"^project_doc_max_bytes\s*=\s*(\d+)", text, re.M)
+        # No tomllib (Python 3.8 to 3.10), or a value it cannot use: read the two keys by hand,
+        # as TOML does. Top-level keys come before the first [table] header (a key under
+        # [profiles.x] is not the global limit), and an integer may carry underscores and a
+        # 0x, 0o or 0b prefix.
+        header = _TOML_TABLE.search(text)
+        top = text[:header.start()] if header else text
+        m = _TOML_DOC_MAX.search(top)
         if m:
-            max_bytes = int(m.group(1))
-        m = re.search(r"^project_doc_fallback_filenames\s*=\s*\[(.*?)\]", text, re.M | re.S)
+            try:
+                max_bytes = int(m.group(1).replace("_", ""), 0)
+            except ValueError:
+                pass
+        m = re.search(r"^\s*project_doc_fallback_filenames\s*=\s*\[(.*?)\]", top, re.M | re.S)
         if m:
             fallbacks = re.findall(r"['\"]([^'\"]+)['\"]", m.group(1))
     return max_bytes, fallbacks
@@ -416,11 +432,12 @@ def _gemini_names() -> list[str]:
     try:
         settings = json.loads(read_text(home() / ".gemini" / "settings.json") or "{}")
         fn = (settings.get("context") or {}).get("fileName") or settings.get("contextFileName")
-        if fn:
-            return [fn] if isinstance(fn, str) else [str(x) for x in fn]
     except (ValueError, AttributeError):
-        pass
-    return ["GEMINI.md"]
+        fn = None
+    if isinstance(fn, str) and fn:
+        return [fn]
+    names = [x for x in fn if isinstance(x, str) and x] if isinstance(fn, list) else []
+    return names or ["GEMINI.md"]  # a number, true or an object is not a file name
 
 
 def gemini_files(cwd) -> dict:
@@ -500,8 +517,11 @@ def scan_files(cwd, harnesses) -> dict:
     if UNREADABLE:
         result["unreadable"] = list(UNREADABLE)
     # Same repo, different instructions per harness? One side with none at all is the worst case,
-    # so compare whenever both harnesses were measured and either side has project files.
-    c = [e for e in result.get("claude", {}).get("files", []) if e["role"] in ("project", "local")]
+    # so compare whenever both harnesses were measured and either side has project files. Only
+    # files in the repo count: a CLAUDE.md in a parent folder loads for Claude Code alone in every
+    # repo below it, and no change in this repo can share it with Codex.
+    c = [e for e in result.get("claude", {}).get("files", [])
+         if e["role"] in ("project", "local") and _inside(e["path"], root)]
     x = [e for e in result.get("codex", {}).get("files", []) if e["role"] == "project"]
     if "claude" in result and "codex" in result and (c or x):
         ct = sum(e["tokens"] for e in c)
@@ -847,6 +867,43 @@ def project_key(cwd: str) -> str:
     return str(root) if root else cwd
 
 
+_SAME_DIR: dict[tuple[str, str], bool] = {}
+
+
+def _same_dir(a, b) -> bool:
+    """One folder under two spellings? macOS and Windows disks ignore letter case, and
+    Path.resolve keeps the case that was typed, while git and the session logs may record
+    another. Ask the disk, not the string."""
+    a, b = str(a), str(b)
+    if a == b:
+        return True
+    if (a, b) not in _SAME_DIR:
+        try:
+            _SAME_DIR[(a, b)] = os.path.samefile(a, b)
+        except (OSError, ValueError):
+            _SAME_DIR[(a, b)] = False
+    return _SAME_DIR[(a, b)]
+
+
+def _true_case(path) -> Path:
+    """`path` resolved, each part spelled as the disk spells it. A subfolder typed `SUB` for
+    `sub` is the same folder to macOS and Windows but matches none of git's paths. A part in a
+    folder that cannot be listed, or with no single match, keeps its typed spelling."""
+    p = Path(path).resolve()
+    out = Path(p.anchor)
+    for part in p.parts[1:]:
+        try:
+            names = os.listdir(str(out))
+        except OSError:  # can be entered, not listed: keep this part as typed, fix the rest
+            names = [part]
+        if part not in names:
+            same = [n for n in names if n.lower() == part.lower() and _same_dir(out / n, out / part)]
+            if len(same) == 1:  # else (another Unicode form, say) keep the typed spelling
+                part = same[0]
+        out = out / part
+    return out
+
+
 def group_sessions(sessions, since=None, until=None, project=None):
     groups: dict[tuple[str, str], list[Session]] = {}
     for s in sessions:
@@ -868,7 +925,6 @@ COMPARE_MIN_DROP_BYTES = 6_000  # about 2k tokens: a /retro line or a typo fix i
 COMPARE_MIN_DROP_SHARE = 0.20   # and the files must shrink by at least a fifth
 COMPARE_MIN_SESSIONS = 3        # fewer sessions after a change are too few to trust
 _NULL_SHA = "0" * 40
-_SKIP_MODES = ("120000", "160000")  # symlinks and submodules carry no instruction text of their own
 _WIN_DEVICES = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}
 # Read-only and offline whatever the repo's own config says: no fsmonitor program, no signature
 # check program, no fetch of objects a partial clone lacks, no prompts, no pager.
@@ -1506,7 +1562,7 @@ def compare(path, hs, files_now: dict, sessions, days: int, threshold: int, at=N
     None when there is nothing to compare."""
     root = git_root(path)
     top = _git(root, "rev-parse", "--show-toplevel") if root else None
-    if top is None or Path(top.decode(errors="replace").strip()).resolve() != root.resolve() or \
+    if top is None or not _same_dir(Path(top.decode(errors="replace").strip()).resolve(), root.resolve()) or \
             _git(root, "rev-parse", "--verify", "-q", "HEAD^{commit}") is None:
         if at:
             raise UsageError("--compare-at needs git and a git repository with at least one commit")
@@ -1592,7 +1648,7 @@ def compare(path, hs, files_now: dict, sessions, days: int, threshold: int, at=N
                if before_files.get(rel, 0) != cut_files.get(rel, 0)]
     changed.sort(key=lambda x: (-abs(x["after"] - x["before"]), x["path"]))
     key = str(root)
-    mine = [(s, _when(s.start)) for s in sessions if s.reqs and project_key(s.cwd) == key]
+    mine = [(s, _when(s.start)) for s in sessions if s.reqs and _same_dir(project_key(s.cwd), key)]
     try:
         lo = at_time - dt.timedelta(days=days)
     except OverflowError:
@@ -1827,7 +1883,7 @@ def findings(files: dict, skills: dict, stats: dict, target: int) -> list[str]:
         if not (f and s):
             continue
         cut = f["repo_tokens"] - target
-        if cut > 2_000:
+        if cut > FINDING_MIN_CUT:
             saved = cut * s["requests"]
             out.append(f"[{h}] repo instructions ~{fmt_k(f['repo_tokens'])} tokens are re-sent on every request. "
                        f"Slimming to ~{fmt_k(target)} would have saved ~{fmt_k(saved)} of "
@@ -1840,7 +1896,7 @@ def findings(files: dict, skills: dict, stats: dict, target: int) -> list[str]:
         f = files.get(h)
         if not f:
             continue
-        if h not in stats and f["repo_tokens"] - target > 2_000:
+        if h not in stats and f["repo_tokens"] - target > FINDING_MIN_CUT:
             out.append(f"[{h}] repo instructions ~{fmt_k(f['repo_tokens'])} tokens load at startup "
                        "(no session logs in this window to measure the cost)")
         for w in f["warnings"]:
@@ -1856,6 +1912,14 @@ def findings(files: dict, skills: dict, stats: dict, target: int) -> list[str]:
                        f"{fmt_k(r['budget'])} ({r['basis']}): the least-used lose their descriptions and stop "
                        "triggering reliably. Uninstall unused skills or plugins")
     return out
+
+
+def _over_target(files: dict, target: int) -> str | None:
+    """With no findings, the agents whose repo instructions still pass the target: by less
+    than a finding needs, but the report must not call that "within target"."""
+    over = [f"{AGENT_NAMES[h]} is ~{fmt_k(files[h]['repo_tokens'] - target)} over" for h in HARNESSES
+            if h in files and files[h]["repo_tokens"] > target]
+    return f"No large fixes: {', '.join(over)} the ~{fmt_k(target)} target." if over else None
 
 
 # --------------------------------------------------------------------------- picture (SVG)
@@ -2004,7 +2068,7 @@ def render_svg(rep: dict, theme: str = "auto") -> str:
         tiles.append(("Measured startup", f"~{fmt_k(s['baseline_median'])}", f"median, {name}"))
         tiles.append(("Startup share", pct(s["startup_share"]), f"of {name} input"))
         cut = files[heavy]["repo_tokens"] - target
-        if cut > 2_000 and s["input_tokens"]:
+        if cut > FINDING_MIN_CUT and s["input_tokens"]:
             saved = cut * s["requests"]
             tiles.append(("Could save", f"~{fmt_k(saved)}", f"tokens, {pct(saved / s['input_tokens'])} of input"))
         else:
@@ -2210,8 +2274,10 @@ def render_svg(rep: dict, theme: str = "auto") -> str:
     g.text(L, y, "What to do", 17, "b")
     if not found:
         y += 32
-        g.badge(L + 7, y - 5, "good")
-        g.text(L + 24, y, "Nothing to fix: startup context is within target.", 14)
+        near = _over_target(files, target)
+        g.badge(L + 7, y - 5, "warn" if near else "good")
+        note = _fit(near, R - L - 24, 14) if near else "Nothing to fix: startup context is within target."
+        g.text(L + 24, y, note, 14)
     for i, item in enumerate(found[:6], 1):
         y += 32
         g.text(L, y, f"{i}.", 14, "b n")
@@ -2256,36 +2322,238 @@ def write_picture(rep: dict, out: str, theme: str) -> Path:
 
 # --------------------------------------------------------------------------- verify-split
 
-_FENCE_LINE = re.compile(r"^(\s*)(`{3,}|~{3,})")
+_FENCE_OPEN = re.compile(r"(`{3,}|~{3,})(.*)$")
+_FENCE_CLOSE = re.compile(r"(`{3,}|~{3,}) *$")
+_LIST_MARKER = re.compile(r"(?:[-+*]|([0-9]{1,9})[.)])(?= |$)")  # ASCII digits: \d takes any
+_THEMATIC_BREAK = re.compile(r"([-*_])(?: *\1){2,} *$")
+_SETEXT_RULE = re.compile(r"(?:=+|-+) *$")
+_ATX_HEADING = re.compile(r"#{1,6}(?: |$)")
+_TABLE_RULE = re.compile(r"\|?[ \t\v\f]*:?-+:?[ \t\v\f]*(?:\|[ \t\v\f]*:?-+:?[ \t\v\f]*)*\|?[ \t\v\f]*$")
+_TABLE_PIPE = re.compile(r"(?<!\\)\|[ \t\v\f]*")
+# CommonMark's HTML blocks as cmark-gfm scans them: how types 1 to 6 start, how types 1 to 5 end
+# (somewhere in a line, the first one too), and the lone tag that starts type 7. Letter case is
+# ignored in ASCII only (re.A): plain re.I takes a long s for s, a dotless i for i, a Kelvin sign for k.
+_HTML_START = (
+    re.compile(r"<(?:pre|script|style|textarea)(?:[ \t\v\f>]|$)", re.I | re.A),
+    re.compile(r"<!--"),
+    re.compile(r"<\?"),
+    re.compile(r"<![A-Z]"),
+    re.compile(r"<!\[CDATA\[", re.I | re.A),
+    re.compile(r"</?(?:address|article|aside|base|basefont|blockquote|body|caption|center|col|colgroup|dd|details|"
+               r"dialog|dir|div|dl|dt|fieldset|figcaption|figure|footer|form|frame|frameset|h[1-6]|head|header|hr|"
+               r"html|iframe|legend|li|link|main|menu|menuitem|nav|noframes|ol|optgroup|option|p|param|section|"
+               r"source|summary|table|tbody|td|tfoot|th|thead|title|tr|track|ul)(?:[ \t\v\f]|/?>|$)", re.I | re.A),
+)
+_HTML_END = (re.compile(r"</(?:pre|script|style|textarea)>", re.I | re.A), re.compile("-->"), re.compile(r"\?>"),
+             re.compile(">"), re.compile(r"\]\]>"))
+_HTML_ATTR = r"""[ \t\v\f]+[A-Za-z_:][A-Za-z0-9_.:-]*(?:[ \t\v\f]*=[ \t\v\f]*(?:[^ \t\v\f"'=<>`]+|'[^']*'|"[^"]*"))?"""
+_HTML_TAG = re.compile(r"<(?:[A-Za-z][A-Za-z0-9-]*(?:" + _HTML_ATTR + r")*[ \t\v\f]*/?>|/[A-Za-z][A-Za-z0-9-]*[ \t\v\f]*>)[ \t\f]*$")
+
+
+def _nonspace(line: str, pos: int) -> int:
+    """Where the first character that is not a space at or after `pos` is (len(line) if none)."""
+    return len(line) - len(line[pos:].lstrip(" "))
+
+
+def _index(raw: str, col: int) -> int:
+    """The index in `raw` of the character that holds column `col` once tabs are expanded to
+    four columns (len(raw) if none does): inside a tab, the tab."""
+    width = 0
+    for i, ch in enumerate(raw):
+        width += 4 - width % 4 if ch == "\t" else 1
+        if width > col:
+            return i
+    return len(raw)
+
+
+def _cut(raw: str, col: int) -> str:
+    """`raw` from column `col` on, as CommonMark keeps code: tabs stay tabs, and the columns
+    of a tab that `col` splits, from `col` on, become spaces."""
+    i = _index(raw, col)
+    if i < len(raw) and raw[i] == "\t":
+        start = len(raw[:i].expandtabs(4))
+        if start < col:
+            return " " * (start + 4 - start % 4 - col) + raw[i + 1:]
+    return raw[i:]
+
+
+def _cells(row: str) -> int:
+    """How many cells GFM reads in a table row, as cmark-gfm counts them: a pipe ends a cell
+    unless a backslash comes right before it, a pipe that opens the row opens no cell, and
+    what follows the last pipe is a cell if anything does."""
+    if row.startswith("|"):
+        row = row[1:].lstrip(" \t\v\f")
+    parts = _TABLE_PIPE.split(row)
+    return len(parts) - 1 + (parts[-1] != "")
+
+
+def _blocks(text: str):
+    """Yield (is_code, line) for each line of `text` but fence markers: code as its block holds
+    it, without the prefixes of its containers or the block's own indentation and with its tabs
+    (what that indentation leaves of a tab, as spaces), any other line with tabs expanded to four
+    columns, as CommonMark reads structure.
+
+    What makes a line code follows GitHub Flavored Markdown (CommonMark and its tables), as
+    GitHub shows it. Block quotes and list items hold blocks. A fence opens at most three
+    spaces past where the text of its container starts (the margin outside one), and a
+    backtick fence's info string holds no backtick, so a line that opens with inline code is
+    prose. A block closes on a bare run of its own character at least as long as the one that
+    opened it (cmark-gfm counts at most 255), within three spaces, or where its container
+    ends. A line four or more spaces past where its container's text starts, not continuing a
+    paragraph, is indented code. A paragraph's lazy lines, indented less than its container,
+    keep that container open. A list item interrupts a paragraph only if it is not empty and,
+    when numbered, starts at 1; a line of - under a paragraph underlines a heading. A
+    delimiter row (`| --- | :-: |`) right under a paragraph line with as many cells turns that
+    line into a table's header; a table is no paragraph, so a line four spaces in under a row
+    is code and any list item can start there, and it ends at a line with no cell. An HTML
+    block (CommonMark's seven types) holds no code: a comment, `<pre>`, `<script>`, `<style>`,
+    `<textarea>`, `<?`, `<!X` or `<![CDATA[` runs to the line that holds its end, past blank
+    lines; a block tag such as `<div>`, or any other tag alone on its line, runs to a blank
+    line, and the lone tag cannot interrupt a paragraph. Lines end only at \\n, \\r\\n or \\r.
+    Not modelled: footnote definitions (GitHub reads them), and a paragraph made only of link
+    reference definitions, which takes no heading underline (cmark-gfm reads a `---` or `===`
+    under one as text)."""
+    stack: list = []  # open containers, outermost first: [width, empty] for a list item, None for a block quote
+    leaf = None  # the open leaf block: "para", "table", "code" (indented), (char, length, indent) for a fence,
+    # or 1 to 7 for an HTML block of that CommonMark type
+    last, tried = "", False  # the open paragraph's last line as it holds it; whether a delimiter row came
+    for raw in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        line = raw.expandtabs(4)
+        pos = n = 0  # n: how many containers this line continues
+        for c in stack:
+            at = _nonspace(line, pos)
+            if c is None:
+                if at - pos > 3 or not line.startswith(">", at):
+                    break
+                pos = at + 1 + line.startswith(" ", at + 1)
+            elif at - pos >= c[0]:
+                pos += c[0]
+            elif at == len(line) and not c[1]:
+                pos = at  # a blank line continues a list item that holds something
+            else:
+                break
+            n += 1
+        if n < len(stack) and leaf != "para":
+            del stack[n:]  # the containers it misses end, and the code they held
+            leaf = None
+        at = _nonspace(line, pos)
+        if isinstance(leaf, tuple):
+            char, length, indent = leaf
+            m = _FENCE_CLOSE.match(line, at)
+            if at - pos <= 3 and m and m.group(1)[0] == char and len(m.group(1)) >= length:
+                leaf = None
+            else:
+                yield True, _cut(raw, min(pos + indent, at))
+            continue
+        if leaf == "code":
+            if at - pos >= 4 or at == len(line):
+                yield True, _cut(raw, pos + 4)
+                continue
+            leaf = None
+        if isinstance(leaf, int):  # an HTML block
+            if leaf <= 5 or at < len(line):
+                if leaf <= 5 and _HTML_END[leaf - 1].search(line, at):
+                    leaf = None
+                yield False, line
+                continue
+            leaf = None  # types 6 and 7 end before a blank line
+        if leaf == "table" and not _cells(line[at:]):
+            leaf = None  # a line with no cell (blank, or a lone pipe) ends the table
+        lazy = leaf == "para"  # the line may continue a paragraph, lazily if it missed a container
+        in_para = lazy and n == len(stack) and at < len(line)
+        opened = False
+        new_item = None
+        kind = None
+        while True:  # open the containers the line starts, then at most one leaf block
+            indent, rest = at - pos, line[at:]
+            if indent >= 4 or not rest:
+                break
+            if rest[0] == ">":
+                del stack[n:]
+                stack.append(None)
+                pos = at + 1 + line.startswith(" ", at + 1)
+            else:
+                m = _FENCE_OPEN.match(rest)
+                if m and not (m.group(1)[0] == "`" and "`" in m.group(2)):
+                    # cmark-gfm keeps the length in a byte, and strips from the code as many columns
+                    # as the fence's indentation has characters (a tab is one)
+                    kind = (m.group(1)[0], min(len(m.group(1)), 255), _index(raw, at) - _index(raw, pos))
+                    break
+                if rest[0] == "<":
+                    html = next((i for i, start in enumerate(_HTML_START, 1) if start.match(rest)), 0)
+                    if html or (not in_para and _HTML_TAG.match(rest)):
+                        kind = html or 7  # type 7 cannot interrupt a paragraph
+                        break
+                if _ATX_HEADING.match(rest) or (in_para and _SETEXT_RULE.match(rest)) or _THEMATIC_BREAK.match(rest):
+                    kind = "line"
+                    break
+                mk = _LIST_MARKER.match(rest)
+                if not mk:
+                    break
+                after = rest[mk.end():]
+                empty = not after.strip(" ")
+                if in_para and (empty or (mk.group(1) is not None and int(mk.group(1)) != 1)):
+                    break  # no list item can interrupt this paragraph: the line continues it
+                gap = len(after) - len(after.lstrip(" "))
+                wide = empty or gap > 4  # an item's text starts one space past its marker if more is code
+                del stack[n:]
+                new_item = [indent + mk.end() + (1 if wide else gap), empty]
+                stack.append(new_item)
+                pos = at + mk.end() + (min(gap, 1) if wide else gap)
+            n, leaf, lazy, in_para, opened = len(stack), None, False, False, True
+            at = _nonspace(line, pos)
+        if kind is not None:
+            del stack[n:]
+            leaf = None if kind == "line" else kind
+            if not isinstance(kind, tuple):
+                yield False, line  # a heading, a rule or an HTML block's first line
+                if isinstance(kind, int) and kind <= 5 and _HTML_END[kind - 1].search(line, at):
+                    leaf = None  # an HTML block that ends where it starts
+        elif at == len(line):
+            del stack[n:]  # a blank line ends a paragraph, and the containers it misses
+            leaf = None
+            if not opened:
+                continue  # and puts nothing in an item: one opened empty still holds nothing
+        elif at - pos >= 4 and not lazy:
+            del stack[n:]
+            leaf = "code"
+            yield True, _cut(raw, pos + 4)
+        else:
+            if leaf == "table":
+                pass  # a row: under a table any line with a cell is one
+            elif in_para and at - pos < 4 and not tried and _TABLE_RULE.match(line, at):
+                tried = True  # cmark-gfm tries a paragraph once: this row makes a table or text
+                if _cells(line[at:]) == _cells(last):
+                    leaf = "table"
+            elif lazy:  # the line continues a paragraph, lazily if it missed a container
+                last = line[at:] if in_para else line[pos:]
+            else:  # a new paragraph
+                del stack[n:]
+                leaf, last, tried = "para", line[at:], False
+            yield False, line
+        for c in stack:
+            if c is not None and c is not new_item:
+                c[1] = False  # every open item holds something now, but one opened empty here
 
 
 def _split_lines(text: str) -> list[str]:
     """Lines that carry content, normalised for comparison.
 
-    Prose: surrounding whitespace dropped and inner runs collapsed, so re-wrapping or
-    re-indenting a sentence is fine. Inside fenced code: indentation relative to the fence
-    is kept, because it carries meaning there (YAML, Python). Fence markers and lines with
-    no letter or digit (rules, table separators) are structure and are skipped."""
+    Each line is compared on its own. Prose: surrounding whitespace dropped and inner runs
+    collapsed, so re-indenting a line or changing its spacing is fine, but moving a line break
+    changes both lines and both show as missing. Code, fenced or indented, as _blocks finds
+    it: indentation relative to its block is kept, because it carries meaning there (YAML,
+    Python), so code may move into or out of a list item or a block quote. Fence markers and
+    lines with no letter or digit (rules, table separators) are structure and are skipped."""
     out: list[str] = []
-    fence = None  # (marker char, fence indent) while inside a code block
-    for raw in text.splitlines():
-        line = raw.expandtabs(4)
-        m = _FENCE_LINE.match(line)
-        if m:
-            if fence is None:
-                fence = (m.group(2)[0], len(m.group(1)))
-                continue
-            if m.group(2)[0] == fence[0] and not line.strip().strip(fence[0]):
-                fence = None
-                continue
+    for is_code, line in _blocks(text):
         if not any(c.isalnum() for c in line):
             continue
-        if fence is None:
-            out.append(re.sub(r"\s+", " ", line.strip()))
+        if is_code:
+            body = line.rstrip()
+            out.append(body[:len(body) - len(body.lstrip(" \t"))] + _norm(body))  # indentation as it is, tabs too
         else:
-            body = line[min(fence[1], len(line) - len(line.lstrip(" "))):].rstrip()
-            indent = len(body) - len(body.lstrip(" "))
-            out.append(" " * indent + re.sub(r"\s+", " ", body.strip()))
+            out.append(_norm(line))
     return out
 
 
@@ -2293,9 +2561,24 @@ def _norm(line: str) -> str:
     return re.sub(r"\s+", " ", line.strip())
 
 
+def _shown(line: str) -> str:
+    """A line as the text output prints it: a tab as \\t and any other control or format
+    character escaped, so a tab that became spaces shows and no line sends terminal escapes."""
+    def one(ch: str) -> str:
+        if ch == "\t":
+            return "\\t"
+        if unicodedata.category(ch) not in ("Cc", "Cf"):
+            return ch
+        cp = ord(ch)
+        return f"\\x{cp:02x}" if cp < 0x100 else f"\\u{cp:04x}" if cp < 0x10000 else f"\\U{cp:08x}"
+    return "".join(one(ch) for ch in line)
+
+
 def verify_split(original: str, new_paths: list[str], allow: str | None) -> dict:
     """Every content line of ORIGINAL must appear in the new files at least as many times as
     it did in ORIGINAL, unless the allow list names it."""
+    if not original or "" in new_paths:  # an unset variable, not the current folder
+        raise UsageError("an empty path was given")
     text = read_text(original)
     if text is None:
         raise UsageError(f"cannot read {original}")
@@ -2355,14 +2638,25 @@ def _harnesses(arg: str) -> list[str]:
     bad = [h for h in hs if h not in HARNESSES]
     if bad or not hs:
         raise UsageError(f"unknown harness: {', '.join(bad) or arg!r} (use {', '.join(HARNESSES)} or all)")
-    return hs
+    return list(dict.fromkeys(hs))  # claude,claude must not read every log twice
 
 
 def _project_dir(path: str) -> str:
-    """A project path must be an existing directory: a typo must not pass a CI gate."""
+    """A project path must be an existing directory: a typo must not pass a CI gate, and an
+    empty one (an unset variable) must not stand for the current folder."""
+    if not path:
+        raise UsageError("empty project path (pass . for the current folder)")
     if not _is_dir(path):
         raise UsageError(f"not a directory: {path}" if _exists(path) else f"no such directory: {path}")
     return path
+
+
+def _since(days: int) -> str:
+    """First day of a window of `days` days; a window longer than the calendar starts in year 1."""
+    try:
+        return (dt.date.today() - dt.timedelta(days=days)).isoformat()
+    except OverflowError:
+        return dt.date.min.isoformat()
 
 
 def _date(s: str | None, flag: str) -> str | None:
@@ -2382,27 +2676,112 @@ def _emit(obj, as_json: bool, printer) -> None:
         printer(obj)
 
 
+_RESULT = [EXIT_OK]  # the exit code decided so far, kept for a reader that leaves early
+_WRITE_ERRORS: list = []  # every write to stdout or stderr that failed in this run
+
+
+class _WriteFailed(Exception):
+    """A write to stdout or stderr failed. Not an OSError, so no `except OSError` meant for a
+    file that cannot be read takes it for one."""
+
+
+class _Output:
+    """stdout or stderr during a run: a failed write is recorded, then raised as _WriteFailed."""
+
+    def __init__(self, stream):
+        self.stream = stream
+
+    def write(self, text):
+        try:
+            return self.stream.write(text)
+        except OSError as e:
+            _WRITE_ERRORS.append(e)
+            raise _WriteFailed() from e
+
+    def flush(self):
+        try:
+            self.stream.flush()
+        except OSError as e:
+            _WRITE_ERRORS.append(e)
+            raise _WriteFailed() from e
+
+    def __getattr__(self, name):
+        return getattr(self.stream, name)
+
+
+def _reader_left(e: OSError) -> bool:
+    """The reader closed the pipe (`| head`). Windows reports that as EINVAL."""
+    return isinstance(e, BrokenPipeError) or (os.name == "nt" and e.errno == errno.EINVAL)
+
+
+def _settle_streams(streams) -> None:
+    """Flush stdout and stderr. One that cannot take its output (`| head`, a full disk) is
+    pointed at devnull, as Python's docs advise, so the flush at exit cannot fail again and
+    exit 120."""
+    for stream in streams:
+        try:
+            stream.flush()
+        except (OSError, ValueError) as e:
+            if isinstance(e, OSError):
+                _WRITE_ERRORS.append(e)
+            try:
+                os.dup2(os.open(os.devnull, os.O_WRONLY), stream.fileno())
+            except (OSError, ValueError, AttributeError):
+                pass
+
+
+class _Parser(argparse.ArgumentParser):
+    def _print_message(self, message, file=None):
+        # As Python 3.13+ does: before it, a failed write of usage or help escaped and skipped
+        # argparse's own exit code. _Output has recorded the failure.
+        try:
+            super()._print_message(message, file)
+        except (OSError, _WriteFailed):
+            pass
+
+
 def main(argv=None) -> int:
+    # Started with no stdout or stderr at all (`>&-`, pythonw), Python sets them to None, and
+    # print(file=None) would even send errors to stdout. Write to devnull instead.
+    if sys.stdout is None:
+        sys.stdout = open(os.devnull, "w")
+    if sys.stderr is None:
+        sys.stderr = open(os.devnull, "w")
     for stream in (sys.stdout, sys.stderr):
         try:  # a Windows console in cp1252 must not crash on a Thai or CJK path
             stream.reconfigure(errors="replace")
         except (AttributeError, ValueError):
             pass
+    _RESULT[0] = EXIT_OK
+    del _WRITE_ERRORS[:]
+    streams = (sys.stdout, sys.stderr)
+    sys.stdout, sys.stderr = _Output(streams[0]), _Output(streams[1])
     try:
-        return _main(argv)
-    except UsageError as e:
-        print(f"cw.py: error: {e}", file=sys.stderr)
-        return EXIT_USAGE
-    except BrokenPipeError:  # `cw.py sessions | head`
         try:
-            sys.stdout = open(os.devnull, "w")
-        except OSError:
+            _RESULT[0] = _main(argv)
+        except UsageError as e:
+            _RESULT[0] = EXIT_USAGE
+            print(f"cw.py: error: {e}", file=sys.stderr)
+        except SystemExit as e:  # argparse, after --help, --version or a bad argument
+            _RESULT[0] = EXIT_OK if e.code is None else e.code if isinstance(e.code, int) else EXIT_USAGE
+    except _WriteFailed:  # `cw.py files . --max-tokens 6000 | head`: a failed gate still exits 1
+        pass
+    finally:
+        sys.stdout, sys.stderr = streams
+    _settle_streams(streams)  # a failed write shows up here at the latest, not at interpreter exit
+    lost = next((e for e in _WRITE_ERRORS if not _reader_left(e)), None)
+    if lost is not None:  # not a reader that left: output is lost (a full disk), so the run fails
+        _RESULT[0] = EXIT_USAGE
+        try:
+            print(f"cw.py: error: cannot write output: {lost.strerror or lost}", file=sys.stderr)
+        except (OSError, ValueError):
             pass
-        return EXIT_OK
+        _settle_streams((sys.stderr,))  # stderr may fail too (`2>&1` into the same full disk)
+    return _RESULT[0]
 
 
 def _main(argv=None) -> int:
-    ap = argparse.ArgumentParser(prog="cw.py", description=__doc__.split("\n\n")[0])
+    ap = _Parser(prog="cw.py", description=__doc__.split("\n\n")[0])
     ap.add_argument("--version", action="version", version=VERSION)
     sub = ap.add_subparsers(dest="cmd", required=True)
 
@@ -2438,7 +2817,8 @@ def _main(argv=None) -> int:
     p.add_argument("--days", type=int, default=30, help="session window in days (default 30)")
     p.add_argument("--threshold", type=int, default=150_000)
     p.add_argument("--window", type=int, help=window_help)
-    p.add_argument("--target", type=int, default=5_000, help="target tokens for repo instructions (default 5000)")
+    p.add_argument("--target", type=int, default=5_000, help="target tokens for repo instructions (default 5000); "
+                   f"findings start {FINDING_MIN_CUT:,} tokens above it")
     p.add_argument("--compare-at", metavar="WHEN",
                    help="YYYY-MM-DD, YYYY-MM-DDTHH:MM or a commit id: compare before and after this "
                    "instead of the slimming the report finds in git by itself")
@@ -2462,38 +2842,38 @@ def _main(argv=None) -> int:
             setattr(a, flag, _date(getattr(a, flag), "--" + flag.replace("_", "-")))
     if a.cmd == "report" and a.compare_at:
         a.compare_at = _compare_at(a.compare_at)
-    for flag in ("max_tokens", "window", "threshold", "days", "top"):
+    for flag in ("max_tokens", "window", "threshold", "days", "top", "target"):
         v = getattr(a, flag, None)
         if v is not None and v < 0:
             raise UsageError(f"--{flag.replace('_', '-')} must not be negative")
 
     if a.cmd == "files":
         res = scan_files(a.path, _harnesses(a.harness))
-        _emit(res, a.json, print_files)
-        for u in UNREADABLE:
-            print(f"warning: cannot read {short(u)}; it is not counted", file=sys.stderr)
+        # Judge the gate before printing: a reader that leaves early must not turn a fail into 0.
+        blind, fails = [], []
         if a.max_tokens is not None:
             root = project_root(a.path)
             blind = [u for u in UNREADABLE if _inside(u, root)]
-            if blind:
-                raise UsageError(f"--max-tokens cannot judge {len(blind)} repo file(s) it could not read")
-        if a.max_tokens is not None:
-            failed = False
             for h in HARNESSES:
                 r = res.get(h)
                 if not r:
                     continue
                 if r["repo_file_tokens"] > a.max_tokens:
-                    failed = True
-                    print(f"FAIL {h}: repo instructions ~{fmt_k(r['repo_file_tokens'])} tokens > "
-                          f"{fmt_k(a.max_tokens)}", file=sys.stderr)
+                    fails.append(f"FAIL {h}: repo instructions ~{fmt_k(r['repo_file_tokens'])} tokens > "
+                                 f"{fmt_k(a.max_tokens)}")
                 for e in r["files"]:
                     if e.get("truncated_bytes"):
-                        failed = True
-                        print(f"FAIL {h}: {short(e['path'])} has {e['truncated_bytes']:,} bytes past "
-                              "project_doc_max_bytes - Codex never sees them", file=sys.stderr)
-            return EXIT_FAIL if failed else EXIT_OK
-        return EXIT_OK
+                        fails.append(f"FAIL {h}: {short(e['path'])} has {e['truncated_bytes']:,} bytes past "
+                                     "project_doc_max_bytes - Codex never sees them")
+        _RESULT[0] = EXIT_USAGE if blind else EXIT_FAIL if fails else EXIT_OK
+        _emit(res, a.json, print_files)
+        for u in UNREADABLE:
+            print(f"warning: cannot read {short(u)}; it is not counted", file=sys.stderr)
+        if blind:
+            raise UsageError(f"--max-tokens cannot judge {len(blind)} repo file(s) it could not read")
+        for line in fails:
+            print(line, file=sys.stderr)
+        return _RESULT[0]
 
     if a.cmd == "skills":
         _emit(scan_skills(a.path, _harnesses(a.harness), a.window), a.json, print_skills)
@@ -2512,25 +2892,30 @@ def _main(argv=None) -> int:
                 print_sessions(before, a.threshold, a.top)
                 print(f"\n== from {a.compare_at}")
                 print_sessions(after, a.threshold, a.top)
-            return 0
+            return EXIT_OK
         groups = group_sessions(sessions, a.since, a.until, a.project)
         if a.json:
             _emit({f"{h} {k}": summarize(v, a.threshold) for (h, k), v in groups.items()}, True, None)
         else:
             print_sessions(groups, a.threshold, a.top)
-        return 0
+        return EXIT_OK
 
     if a.cmd == "report":
         hs = _harnesses(a.harness)
-        root = str(project_root(a.path))
-        since = (dt.date.today() - dt.timedelta(days=a.days)).isoformat()
-        files = scan_files(a.path, hs)
-        skills = scan_skills(a.path, hs, a.window)
+        path = str(_true_case(a.path))  # git and the logs spell folders as the disk does
+        root = str(project_root(path))
+        since = _since(a.days)
+        files = scan_files(path, hs)
+        skills = scan_skills(path, hs, a.window)
         all_sessions = load_sessions(hs)
-        groups = {k: v for k, v in group_sessions(all_sessions, since=since).items() if k[1] == root}
+        # Sessions logged under another spelling of this folder (letter case) are this project too.
+        groups: dict[tuple[str, str], list[Session]] = {}
+        for (h, key), v in group_sessions(all_sessions, since=since).items():
+            if _same_dir(key, root):
+                groups.setdefault((h, root), []).extend(v)
         stats = {h: summarize(v, a.threshold) for (h, _), v in groups.items()}
         found = findings(files, skills, stats, a.target)
-        cmp = compare(a.path, hs, files, all_sessions, a.days, a.threshold, a.compare_at)
+        cmp = compare(path, hs, files, all_sessions, a.days, a.threshold, a.compare_at)
         rep = {"project": root, "since": since, "files": files, "skills": skills,
                "sessions": stats, "findings": found}
         if cmp:
@@ -2553,7 +2938,7 @@ def _main(argv=None) -> int:
             if picture:
                 rep["picture"] = str(picture)
             _emit(rep, True, None)
-            return 0
+            return EXIT_OK
         print(f"project {short(root)}   sessions since {since}\n")
         if cmp:
             print_compare(cmp)
@@ -2568,14 +2953,15 @@ def _main(argv=None) -> int:
         for i, f in enumerate(found, 1):
             print(f"{i}. {f}")
         if not found:
-            print("none")
+            print(_over_target(files, a.target) or "none")
         if picture:
             print(f"\nPicture: {picture}")
-        return 0
+        return EXIT_OK
 
     if a.cmd == "verify-split":
         res = verify_split(a.old, a.new, a.allow)
         missing = res["missing"]
+        _RESULT[0] = EXIT_FAIL if missing else EXIT_OK  # kept if the reader leaves before the end
         if a.json:
             _emit(res, True, None)
         else:
@@ -2586,10 +2972,10 @@ def _main(argv=None) -> int:
                 if m in res["missing_copies"]:
                     short_by, n = res["missing_copies"][m]
                     extra = f"  ({short_by} of {n} copies)"
-                print(f"  - {m[:160]}{extra}")
+                print(f"  - {_shown(m[:160])}{extra}")
             if len(missing) > 40:
                 print(f"  … {len(missing) - 40} more")
-        return EXIT_FAIL if missing else EXIT_OK
+        return _RESULT[0]
     return EXIT_USAGE
 
 

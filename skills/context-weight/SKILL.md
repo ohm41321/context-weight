@@ -77,7 +77,8 @@ Start with the largest number. Leave alone anything the numbers do not point at.
 The full procedure is in `references/slimming.md`. Read it before you edit.
 Short form:
 
-1. Back up the file, then record `cw.py files <repo>`.
+1. Back up every instruction file you will edit (CLAUDE.md and AGENTS.md
+   both, when both exist), then record `cw.py files <repo>`.
 2. Sort every section into one of five kinds: **rule** (keep it, make it
    terse), **pointer**, **reference**, **log**, or **duplicate**.
 3. Move references and logs to `docs/agent-notes/`. Leave a one-line pointer
@@ -87,8 +88,9 @@ Short form:
    chain limit.
 5. Make AGENTS.md the one canonical file. CLAUDE.md holds `@AGENTS.md` plus
    any Claude-only lines.
-6. Prove it: `verify-split` exits 0, `files` shows the drop, and the
-   `--max-tokens` gate passes.
+6. Prove it: `verify-split` exits 0 for each backup, `files` shows the drop,
+   and the `--max-tokens` gate passes. Then remove the backups before the
+   commit (`references/slimming.md` step 6).
 
 Moving text is safe. Deleting knowledge is the user's call: ask before you drop
 any line that is not a proven duplicate.
@@ -110,10 +112,13 @@ re-sends everything before it.
 
 - **Right away:** compare `cw.py files <repo>` before and after, and check that
   `verify-split` exits 0.
-- **Stop regrowth:** add `python3 <skill-dir>/scripts/cw.py files . --max-tokens 6000`
-  to CI or pre-commit. It exits 1 when the repo's instructions grow past the
-  limit or when Codex would cut any of them off, and 2 when the path is wrong,
-  so a typo never passes.
+- **Stop regrowth:** add `cw.py files . --max-tokens 6000` to CI or
+  pre-commit. It exits 1 when the repo's instructions grow past the limit or
+  when Codex would cut any of them off, and 2 when the path is wrong, so a typo
+  never passes. Never write `<skill-dir>` into a committed file: it is a path
+  on this machine, and for a plugin install one version's. CI downloads
+  `cw.py` pinned to a release tag or commit (the README has the recipe);
+  pre-commit runs a copy kept in the repo (`install.py --project .`).
 - **After a few days of real use:** run `cw.py report <repo>` again. It finds
   the slimming in git by itself and prints **Before and after**. When you finish
   slimming, tell the user: commit the change, work as usual for a few days, then

@@ -167,4 +167,5 @@ Source: https://opencode.ai/docs/rules/ and https://opencode.ai/docs/skills/
 - Keep the whole AGENTS.md chain under 32 KiB, or Codex silently loses the tail.
 - A large CLAUDE.md with a small or missing AGENTS.md (or the reverse) means
   Claude and Codex follow different rules in the same repo. `cw.py files`
-  flags this when it measures both harnesses.
+  flags this when it measures both harnesses. It weighs only the repo's own
+  files: a CLAUDE.md in a parent folder is listed, not compared.

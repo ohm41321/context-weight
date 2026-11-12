@@ -1,4 +1,5 @@
 """Tests for cw.py on a synthetic HOME. Run: python3 -m unittest discover -s tests -v"""
+import datetime as dt
 import importlib.util
 import json
 import os
@@ -9,13 +10,19 @@ import tempfile
 import unittest
 import xml.etree.ElementTree as ET
 from pathlib import Path
+from unittest import mock
 
 CW = Path(__file__).resolve().parents[1] / "skills" / "context-weight" / "scripts" / "cw.py"
 
 
-def write(path: Path, text: str) -> Path:
+def write(path: Path, text: str, exact=False) -> Path:
+    """Write `text` as a text file: on Windows each \\n becomes \\r\\n, unless `exact` asks for
+    these bytes, as a test that counts bytes or tokens needs."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text, encoding="utf-8")
+    if exact:
+        path.write_bytes(text.encode("utf-8"))
+    else:
+        path.write_text(text, encoding="utf-8")
     return path
 
 
@@ -28,6 +35,14 @@ def jsonl(path: Path, records) -> None:
     write(path, "".join(json.dumps(r) + "\n" for r in records))
 
 
+def load_cw():
+    """cw.py as a module, for the few checks that need one function rather than the command line."""
+    spec = importlib.util.spec_from_file_location("cw_under_test", str(CW))
+    cw = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(cw)
+    return cw
+
+
 class CwTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -36,15 +51,26 @@ class CwTest(unittest.TestCase):
         self.home = t / "home"
         self.repo = t / "work" / "repo"
         (self.repo / ".git").mkdir(parents=True)
-        self.env = {k: v for k, v in os.environ.items()
-                    if k not in ("CLAUDE_CONFIG_DIR", "CODEX_HOME", "OPENCODE_DISABLE_CLAUDE_CODE",
-                                 "SLASH_COMMAND_TOOL_CHAR_BUDGET", "BROWSER")}
+        # Nothing of the caller's setup may leak in. A git hook exports GIT_DIR and GIT_INDEX_FILE,
+        # which would point the fixtures' git commands at the caller's own repository, and a global
+        # git ignore file under XDG_CONFIG_HOME can hide the fixtures' files.
+        drop = ("CLAUDE_CONFIG_DIR", "CODEX_HOME", "OPENCODE_DISABLE_CLAUDE_CODE", "SLASH_COMMAND_TOOL_CHAR_BUDGET",
+                "BROWSER", "XDG_CONFIG_HOME")
+        self.env = {k: v for k, v in os.environ.items() if k not in drop and not k.startswith("GIT_")}
         self.env["HOME"] = str(self.home)
         self.env["USERPROFILE"] = str(self.home)  # Windows: expanduser reads USERPROFILE, not HOME
+        self.env["XDG_CONFIG_HOME"] = str(self.home / ".config")
+        self.env["GIT_CONFIG_NOSYSTEM"] = "1"
         self.env["PYTHONIOENCODING"] = "utf-8"
 
     def tearDown(self):
         self.tmp.cleanup()
+
+    def mine(self, entries):
+        """Entries inside this test's folder. Claude Code also loads CLAUDE.md files above the
+        working folder, so the developer's own files above the temp folder must not count."""
+        top = str(self.tmp_path.resolve()) + os.sep
+        return [e for e in entries if str(Path(e["path"]).resolve()).startswith(top)]
 
     def run_cw(self, *args, code=0):
         # The child writes UTF-8 (PYTHONIOENCODING); decode it so, not in the locale's code page.
@@ -68,19 +94,20 @@ class CwTest(unittest.TestCase):
         write(self.repo / "sub" / "CLAUDE.md", "z" * 9_000)  # loads on demand, not at launch
 
         r = self.cw_json("files", str(self.repo), "--harness", "claude")["claude"]
-        names = [Path(f["path"]).name for f in r["files"]]
+        files = self.mine(r["files"])
+        names = [Path(f["path"]).name for f in files]
         self.assertEqual(names, ["CLAUDE.md", "extra.md", "CLAUDE.md", "big.md", "eager.md"])
         self.assertNotIn("not.md", names)
-        self.assertEqual(r["files"][3]["role"], "project import")
-        self.assertEqual(r["files"][3]["tokens"], 10_000)          # 30k ASCII chars / 3
+        self.assertEqual(files[3]["role"], "project import")
+        self.assertEqual(files[3]["tokens"], 10_000)          # 30k ASCII chars / 3
         self.assertTrue(any("imports load at launch" in w for w in r["warnings"]))
         self.assertTrue(any("1 path-scoped" in n for n in r["notes"]))
-        self.assertEqual(r["repo_tokens"], sum(f["tokens"] for f in r["files"][2:]))
+        self.assertEqual(r["repo_tokens"], sum(f["tokens"] for f in files[2:]))
 
     def test_thai_estimate_counts_one_token_per_char(self):
         write(self.repo / "CLAUDE.md", "ก" * 900 + "a" * 300)
         r = self.cw_json("files", str(self.repo), "--harness", "claude")["claude"]
-        self.assertEqual(r["files"][0]["tokens"], 1_000)
+        self.assertEqual(self.mine(r["files"])[0]["tokens"], 1_000)
 
     def test_large_claude_md_warning(self):
         write(self.repo / "CLAUDE.md", "rule\n" * 9_000)  # 45,000 chars
@@ -105,6 +132,39 @@ class CwTest(unittest.TestCase):
         write(self.repo / "AGENTS.md", "a" * 40 * 1024)
         r = self.cw_json("files", str(self.repo), "--harness", "codex")["codex"]
         self.assertNotIn("truncated_bytes", r["files"][0])
+
+    def test_codex_config_reads_the_same_without_tomllib(self):
+        # Python 3.8 to 3.10 have no tomllib. The fallback once read `65_536` as 65 and took a key
+        # from a [profiles.x] table as the global one, so the gate's verdict hung on the Python.
+        cw = load_cw()
+        config = self.home / ".codex" / "config.toml"
+        cases = [("project_doc_max_bytes = 65_536\n", 65_536, []),
+                 ("project_doc_max_bytes = 0x1_0000  # 64 KiB\n", 65_536, []),
+                 ("project_doc_max_bytes = 'big'\n", 32_768, []),
+                 ("project_doc_fallback_filenames = [\"TEAM.md\", 'NOTES.md']\n", 32_768, ["TEAM.md", "NOTES.md"]),
+                 ('model = "o3"\n\n[profiles.big]\nproject_doc_max_bytes = 1_048_576\n'
+                  'project_doc_fallback_filenames = ["TEAM.md"]\n', 32_768, [])]
+        for text, max_bytes, names in cases:
+            write(config, text)
+            for modules in ({"tomllib": None}, {}):  # None makes `import tomllib` fail, as on 3.8
+                with mock.patch.dict(os.environ, {"CODEX_HOME": str(config.parent)}), \
+                        mock.patch.dict(sys.modules, modules):
+                    self.assertEqual(cw._codex_config(), (max_bytes, names), (text, modules))
+
+    def test_codex_fallback_filenames(self):
+        write(self.home / ".codex" / "config.toml", 'project_doc_fallback_filenames = ["TEAM.md"]\n')
+        write(self.repo / "TEAM.md", "team rules")
+        pkg = self.repo / "pkg"
+        write(pkg / "AGENTS.md", "pkg rules")
+        write(pkg / "TEAM.md", "not read: AGENTS.md comes first")
+        r = self.cw_json("files", str(pkg), "--harness", "codex")["codex"]
+        self.assertEqual([Path(f["path"]).relative_to(self.repo.resolve()).as_posix() for f in r["files"]],
+                         ["TEAM.md", "pkg/AGENTS.md"])
+
+    def test_codex_counts_only_the_part_it_keeps(self):
+        write(self.repo / "AGENTS.md", "a" * 40 * 1024)
+        f = self.cw_json("files", str(self.repo), "--harness", "codex")["codex"]["files"][0]
+        self.assertEqual((f["tokens"], f["file_tokens"]), (round(32 * 1024 / 3), round(40 * 1024 / 3)))
 
     def test_cross_harness_divergence(self):
         write(self.repo / "CLAUDE.md", "c" * 30_000)
@@ -132,12 +192,47 @@ class CwTest(unittest.TestCase):
         res = self.cw_json("files", str(self.repo), "--harness", "claude,codex")
         self.assertFalse(res.get("cross"))
 
+    def test_cross_check_leaves_out_claude_files_above_the_repo(self):
+        # A CLAUDE.md in a parent folder loads for Claude Code alone, in every repo below it. It is
+        # listed, but this repo holds no rules, so its harnesses do not follow different rules here.
+        parent = self.repo.parent / "CLAUDE.md"
+        write(parent, "Use the shared lint config.\n" * 400)
+        res = self.cw_json("files", str(self.repo), "--harness", "claude,codex")
+        self.assertIn(parent.resolve(), [Path(e["path"]).resolve() for e in res["claude"]["files"]])
+        self.assertFalse(res.get("cross"))
+        write(self.repo / "CLAUDE.md", "c" * 30_000)  # rules in the repo itself still count
+        self.assertTrue(self.cw_json("files", str(self.repo), "--harness", "claude,codex").get("cross"))
+
     def test_gemini_context_filenames(self):
         write(self.home / ".gemini" / "settings.json", json.dumps({"context": {"fileName": ["AGENTS.md", "GEMINI.md"]}}))
         write(self.repo / "AGENTS.md", "agents")
         write(self.repo / "GEMINI.md", "gemini")
         r = self.cw_json("files", str(self.repo), "--harness", "gemini")["gemini"]
         self.assertEqual(sorted(Path(f["path"]).name for f in r["files"]), ["AGENTS.md", "GEMINI.md"])
+
+    def test_gemini_file_names_of_the_wrong_type_do_not_crash(self):
+        write(self.repo / "AGENTS.md", "agents")
+        write(self.repo / "GEMINI.md", "gemini")
+        for value, names in ((123, ["GEMINI.md"]), (True, ["GEMINI.md"]), ({"a": 1}, ["GEMINI.md"]),
+                             ([None], ["GEMINI.md"]), ([1, "AGENTS.md"], ["AGENTS.md"])):
+            write(self.home / ".gemini" / "settings.json", json.dumps({"context": {"fileName": value}}))
+            r = self.cw_json("files", str(self.repo), "--harness", "gemini")["gemini"]
+            self.assertEqual([Path(f["path"]).name for f in r["files"]], names, value)
+
+    def test_claude_imports_stop_after_four_hops(self):
+        write(self.repo / "CLAUDE.md", "@a.md\n")
+        for name, nxt in (("a", "b"), ("b", "c"), ("c", "d"), ("d", "e"), ("e", "f")):
+            write(self.repo / f"{name}.md", f"@{nxt}.md\n")
+        write(self.repo / "f.md", "end")
+        r = self.cw_json("files", str(self.repo), "--harness", "claude")["claude"]
+        self.assertEqual([Path(f["path"]).name for f in self.mine(r["files"])],
+                         ["CLAUDE.md", "a.md", "b.md", "c.md", "d.md"])
+
+    def test_claude_reads_claude_md_inside_dot_claude(self):
+        write(self.repo / ".claude" / "CLAUDE.md", "rules kept under .claude\n")
+        r = self.cw_json("files", str(self.repo), "--harness", "claude")["claude"]
+        self.assertEqual([Path(f["path"]).relative_to(self.repo.resolve()).as_posix() for f in self.mine(r["files"])],
+                         [".claude/CLAUDE.md"])
 
     def test_opencode_fallbacks(self):
         write(self.home / ".claude" / "CLAUDE.md", "claude global")
@@ -166,19 +261,31 @@ class CwTest(unittest.TestCase):
         self.assertEqual(res["codex"]["count"], 1)
         self.assertTrue(res["codex"]["over_budget"])              # budget 200 tokens
 
+    def test_project_and_plugin_skills_are_listed(self):
+        write(self.repo / ".claude" / "skills" / "local" / "SKILL.md", "---\nname: local\ndescription: hi\n---\n")
+        cache = self.home / ".claude" / "plugins" / "cache" / "market" / "tool" / "1.0"
+        write(cache / "skills" / "helper" / "SKILL.md", "---\nname: helper\ndescription: hi\n---\n")
+        write(self.home / ".claude" / "plugins" / "installed_plugins.json",
+              json.dumps({"plugins": {"tool@market": [{"version": "1.0"}]}}))
+        for enabled, names in ((True, ["local", "tool:helper"]), (False, ["local"])):
+            write(self.home / ".claude" / "settings.json", json.dumps({"enabledPlugins": {"tool@market": enabled}}))
+            s = self.cw_json("skills", str(self.repo), "--harness", "claude")["claude"]
+            self.assertEqual(sorted(h["name"] for h in s["heaviest"]), names, enabled)
+
     # ------------------------------------------------------------------ sessions
-    def _claude_log(self, name, cwd, ts, ctxs, dup_first=0):
+    def _claude_log(self, name, cwd, ts, ctxs, dup_first=0, creation=0):
         recs = [{"type": "user", "cwd": str(cwd), "timestamp": ts}]
         for i, c in enumerate(ctxs):
             rec = {"type": "assistant", "cwd": str(cwd), "timestamp": ts, "isSidechain": False,
-                   "message": {"id": f"{name}-m{i}", "usage": {"input_tokens": 1, "cache_read_input_tokens": c - 1,
-                                                               "cache_creation_input_tokens": 0}}}
+                   "message": {"id": f"{name}-m{i}", "usage": {
+                       "input_tokens": 1, "cache_read_input_tokens": c - 1 - creation,
+                       "cache_creation_input_tokens": creation}}}
             recs += [rec] * (1 + (dup_first if i == 0 else 0))
         recs.append({"type": "assistant", "isSidechain": True, "timestamp": ts,
                      "message": {"id": "side", "usage": {"input_tokens": 999_999}}})
         jsonl(self.home / ".claude" / "projects" / "-repo" / f"{name}.jsonl", recs)
 
-    def _codex_log(self, name, cwd, ts, ctxs, subagent=False):
+    def _codex_log(self, name, cwd, ts, ctxs, subagent=False, archived=False):
         recs = [{"type": "session_meta", "timestamp": ts,
                  "payload": {"cwd": str(cwd), "thread_source": "subagent" if subagent else "user"}}]
         total = 0
@@ -189,7 +296,8 @@ class CwTest(unittest.TestCase):
                 "last_token_usage": {"input_tokens": c, "cached_input_tokens": c // 2},
                 "model_context_window": 258_400}}}
             recs += [ev, ev]  # repeated rate-limit update carries the same totals
-        jsonl(self.home / ".codex" / "sessions" / "2026" / "11" / "01" / f"rollout-{name}.jsonl", recs)
+        folder = self.home / ".codex" / ("archived_sessions" if archived else "sessions/2026/11/01")
+        jsonl(folder / f"rollout-{name}.jsonl", recs)
 
     def test_sessions_dedupe_and_stats(self):
         self._claude_log("s1", self.repo / "web", "2026-10-01T00:00:00Z", [50_000, 200_000], dup_first=3)
@@ -204,6 +312,31 @@ class CwTest(unittest.TestCase):
         self.assertAlmostEqual(cl["over_threshold_tokens"], 200_000 / 320_000)
         cx = res[f"codex {self.repo.resolve()}"]
         self.assertEqual((cx["sessions"], cx["requests"], cx["ctx_max"]), (1, 2, 30_000))  # subagent skipped
+
+    def test_session_numbers(self):
+        # Context per request is input + cache read + cache creation. Eleven requests, so the
+        # 90th percentile is neither the median nor the largest.
+        ctxs = [10_000 * i for i in range(1, 11)] + [200_000]
+        self._claude_log("s", self.repo, "2026-10-01T00:00:00Z", ctxs, creation=500)
+        s = self.cw_json("sessions", "--harness", "claude", "--threshold", "150000")[f"claude {self.repo.resolve()}"]
+        total = 750_000
+        self.assertEqual(s, {"sessions": 1, "continued_sessions": 0, "requests": 11, "baseline_median": 10_000,
+                             "ctx_median": 60_000, "ctx_p90": 100_000, "ctx_max": 200_000,
+                             "over_threshold_requests": 1 / 11, "over_threshold_tokens": 200_000 / total,
+                             "input_tokens": total, "startup_share": min(1.0, 10_000 * 11 / total)})
+
+    def test_sessions_table_and_project_filter(self):
+        self._claude_log("s", self.repo, "2026-10-01T00:00:00Z", [10_000, 200_000])
+        self._codex_log("old", self.repo, "2026-10-02T00:00:00Z", [20_000, 30_000], archived=True)
+        out = self.run_cw("sessions", "--threshold", "150000")
+        # The ten number columns are the last ten: the project path may hold spaces.
+        rows = {ln.split()[0]: ln.split()[-10:] for ln in out.splitlines() if ln.startswith(("claude ", "codex "))}
+        self.assertEqual(rows["claude"], ["1", "2", "10.0k", "105.0k", "200.0k", "200.0k", "50%", "95%", "10%", "210.0k"])
+        self.assertEqual(rows["codex"][:2], ["1", "2"])  # an archived rollout still counts
+        hits = self.run_cw("sessions", "--project", "work" + os.sep + "repo")
+        self.assertEqual(sorted(ln.split()[0] for ln in hits.splitlines() if ln.startswith(("claude ", "codex "))),
+                         ["claude", "codex"])
+        self.assertEqual(self.run_cw("sessions", "--project", "no-such-project").strip(), "no sessions found")
 
     def test_compare_at(self):
         self._claude_log("old", self.repo, "2026-10-01T00:00:00Z", [100_000])
@@ -227,7 +360,7 @@ class CwTest(unittest.TestCase):
             env.update(GIT_AUTHOR_DATE=date, GIT_COMMITTER_DATE=date)
         p = subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@example.com",
                             "-c", "init.defaultBranch=main", "-c", "commit.gpgsign=false", *args],
-                           cwd=str(self.repo), env=env, capture_output=True, text=True)
+                           cwd=str(self.repo), env=env, capture_output=True, text=True, encoding="utf-8")
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         return p.stdout.strip()
 
@@ -594,19 +727,21 @@ class CwTest(unittest.TestCase):
         self._git_repo()
         self._slim_history()                                             # slim on 2026-02-01
         for i, day in enumerate(("10", "12", "14")):
-            self._claude_log(f"a{i}", self.repo, f"2026-02-{day}T12:00:00Z", [30_000])  # local day in any zone
+            self._claude_log(f"a{i}", self.repo, f"2026-02-{day}T12:00:00Z", [30_000])
+        # The report names the local day: 11 February east of UTC+12, so work it out as the child will.
+        first = dt.datetime(2026, 2, 10, 12, tzinfo=dt.timezone.utc).astimezone().date().isoformat()
         c = self.cw_json("report", str(self.repo), "--days", "40000", "--harness", "claude")["compare"]
-        self.assertEqual(c["logs_from"], {"claude": "2026-02-10"})
+        self.assertEqual(c["logs_from"], {"claude": first})
         out = self.run_cw("report", str(self.repo), "--days", "40000", "--harness", "claude")
         self.assertIn("cleanupPeriodDays", out)
         self.assertIn("30 days", out)
         self.assertEqual((c["cleanup_days"], c["logs_deleted"]), (30, True))
         write(self.home / ".claude" / "settings.json", '{"cleanupPeriodDays": 100000}')
         c = self.cw_json("report", str(self.repo), "--days", "40000", "--harness", "claude")["compare"]
-        self.assertEqual((c["logs_from"], c["cleanup_days"], c["logs_deleted"]), ({"claude": "2026-02-10"}, 100000, False))
+        self.assertEqual((c["logs_from"], c["cleanup_days"], c["logs_deleted"]), ({"claude": first}, 100000, False))
         out = self.run_cw("report", str(self.repo), "--days", "40000", "--harness", "claude")
         self.assertNotIn("deletes transcripts", out)
-        self.assertIn("logs on this machine start 2026-02-10", out)
+        self.assertIn(f"logs on this machine start {first}", out)
         os.remove(str(self.home / ".claude" / "settings.json"))
         self._claude_log("b", self.repo, "2026-01-10T00:00:00Z", [90_000])
         for i, day in enumerate(("11", "12")):
@@ -675,9 +810,7 @@ class CwTest(unittest.TestCase):
                          (3_000, 0))  # weighed at the old commit, no longer imported now
 
     def test_compare_copy_never_leaves_its_folder(self):
-        spec = importlib.util.spec_from_file_location("cw_under_test", str(CW))
-        cw = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(cw)
+        cw = load_cw()
         for bad in ("..\\..\\.claude\\CLAUDE.md", "\\Users\\me\\.claude\\CLAUDE.md", "C:/x/CLAUDE.md",
                     "a/../../CLAUDE.md", "/etc/CLAUDE.md", "a//CLAUDE.md", "./CLAUDE.md"):
             self.assertFalse(cw._rel_ok(bad), bad)
@@ -706,7 +839,7 @@ class CwTest(unittest.TestCase):
         head, _, msg = raw.partition("\n\n")
         signed = head + "\ngpgsig -----BEGIN PGP SIGNATURE-----\n \n -----END PGP SIGNATURE-----\n\n" + msg + "\n"
         p = subprocess.run(["git", "hash-object", "-t", "commit", "-w", "--stdin"], cwd=str(self.repo),
-                           input=signed, capture_output=True, text=True, env=self.env)
+                           input=signed, capture_output=True, text=True, encoding="utf-8", env=self.env)
         self._git("update-ref", "refs/heads/main", p.stdout.strip())
         script, ran = self._marker_script("gpg")
         self._git("config", "log.showSignature", "true")
@@ -742,7 +875,7 @@ class CwTest(unittest.TestCase):
         fake.chmod(0o755)
         env = dict(self.env, PATH="." + os.pathsep + self.env.get("PATH", ""))
         p = subprocess.run([sys.executable, str(CW), "report", str(self.repo), "--days", "40000", "--json"],
-                           cwd=str(here), env=env, capture_output=True, text=True)
+                           cwd=str(here), env=env, capture_output=True, text=True, encoding="utf-8")
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertFalse((here / "fake-git-ran").exists())
         self.assertEqual(json.loads(p.stdout)["compare"]["found"], "commit")
@@ -886,6 +1019,46 @@ class CwTest(unittest.TestCase):
         self.assertNotIn("median, Codex", texts)
         self.assertNotIn("of Codex input", texts)
 
+    def test_report_says_when_startup_is_over_target_with_nothing_large_to_fix(self):
+        # ~6.9k tokens: past the 5.0k target, but under the 2,000 slack before a finding is raised.
+        write(self.repo / "AGENTS.md", "Run the tests before every commit.\n" * 590, exact=True)
+        out = self.tmp_path / "pic.svg"
+        res = self.cw_json("report", str(self.repo), "--harness", "codex", "--svg", str(out))
+        self.assertEqual(res["findings"], [])
+        _, texts = self._svg_texts(out)
+        self.assertIn("Codex is ~1.9k over the ~5.0k target", texts)
+        self.assertNotIn("within target", texts)
+        self.assertIn("Codex is ~1.9k over the ~5.0k target", self.run_cw("report", str(self.repo), "--harness", "codex"))
+        write(self.repo / "AGENTS.md", "Run the tests before every commit.\n" * 100, exact=True)
+        self.run_cw("report", str(self.repo), "--harness", "codex", "--svg", str(out))
+        self.assertIn("Nothing to fix: startup context is within target.", self._svg_texts(out)[1])
+
+    def test_report_svg_bars_match_the_numbers_and_hide_the_home_folder(self):
+        write(self.home / ".claude" / "CLAUDE.md", "g" * 9_000)   # 3,000 tokens outside the repo
+        write(self.repo / "CLAUDE.md", "a" * 60_000)              # 20,000 tokens in it
+        out = self.tmp_path / "pic.svg"
+        res = self.cw_json("report", str(self.repo), "--harness", "claude", "--svg", str(out))
+        f = res["files"]["claude"]
+        repo_t, other_t = f["repo_tokens"], f["total_tokens"] - f["repo_tokens"]
+        theirs = f["total_tokens"] - sum(e["tokens"] for e in self.mine(f["files"]))  # above the temp folder
+        self.assertEqual((repo_t, other_t - theirs), (20_000, 3_000))
+        root, texts = self._svg_texts(out)
+        ns = "{http://www.w3.org/2000/svg}"
+        widths = {}
+        for p in root.iter(ns + "path"):
+            tip = p.find(ns + "title")
+            if tip is None or ("; this repo ~" not in tip.text and "; outside ~" not in tip.text):
+                continue  # the heaviest-file bars use the same classes
+            h, r = re.match(r"M[\d.]+,[\d.]+h([\d.]+)a([\d.]+),", p.get("d")).groups()
+            widths[p.get("class")] = float(h) + float(r)
+        # The outside bar starts after a 2px gap and is drawn that much narrower.
+        self.assertAlmostEqual(widths["repo"] / (widths["other"] + 2), repo_t / other_t, delta=0.02)
+        tilde = os.path.join("~", ".claude", "CLAUDE.md")  # ~\.claude\CLAUDE.md on Windows
+        self.assertIn(tilde, texts)
+        for shown in (out.read_text(encoding="utf-8"), self.run_cw("report", str(self.repo), "--harness", "claude")):
+            self.assertIn(tilde, shown)
+            self.assertNotIn(str(self.home), shown)
+
     def test_report_svg_escapes_paths_and_works_without_sessions(self):
         repo = self.tmp_path / "work" / "R&D <x>" if os.name != "nt" else self.tmp_path / "work" / "R&D"
         (repo / ".git").mkdir(parents=True)
@@ -922,9 +1095,7 @@ class CwTest(unittest.TestCase):
         self._svg_texts(res["picture"])
 
     def test_svg_drops_characters_xml_cannot_hold(self):
-        spec = importlib.util.spec_from_file_location("cw_under_test", str(CW))
-        cw = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(cw)
+        cw = load_cw()
         bad = "/x/caf\udce9 a\x01b\ufffe"
         rep = {"project": bad, "since": "2026-01-01", "days": 30, "target": 5000, "sessions": {},
                "files": {"claude": {"files": [{"path": bad + "/CLAUDE.md", "role": "project", "tokens": 9000}],
@@ -940,7 +1111,7 @@ class CwTest(unittest.TestCase):
     def test_report_svg_unwritable_exits_2(self):
         bad = self.tmp_path / "no" / "such" / "dir" / "a.svg"
         p = subprocess.run([sys.executable, str(CW), "report", str(self.repo), "--svg", str(bad)],
-                           env=self.env, capture_output=True, text=True)
+                           env=self.env, capture_output=True, text=True, encoding="utf-8")
         self.assertEqual(p.returncode, 2, p.stderr)
         self.assertIn("cannot write", p.stderr)
 
@@ -985,16 +1156,23 @@ class CwTest(unittest.TestCase):
         write(self.repo / "My Notes.md", "spaced")
         write(self.repo / "notes(v2).md", "parens")
         r = self.cw_json("files", str(self.repo), "--harness", "claude")["claude"]
-        self.assertEqual(sorted(Path(f["path"]).name for f in r["files"]),
+        self.assertEqual(sorted(Path(f["path"]).name for f in self.mine(r["files"])),
                          ["CLAUDE.md", "My Notes.md", "notes(v2).md"])
 
-    def test_auto_memory_counted_first_200_lines(self):
+    def _memory(self, text):
         slug = "".join(c if c.isascii() and c.isalnum() else "-" for c in str(self.repo.resolve()))
-        write(self.home / ".claude" / "projects" / slug / "memory" / "MEMORY.md", "abc\n" * 500)
+        write(self.home / ".claude" / "projects" / slug / "memory" / "MEMORY.md", text)
         r = self.cw_json("files", str(self.repo), "--harness", "claude")["claude"]
         mem = [f for f in r["files"] if f["role"] == "user memory"]
         self.assertEqual(len(mem), 1)
-        self.assertEqual(mem[0]["lines"], 200)
+        return mem[0]
+
+    def test_auto_memory_counted_first_200_lines(self):
+        self.assertEqual(self._memory("abc\n" * 500)["lines"], 200)
+
+    def test_auto_memory_counted_first_25_kb(self):
+        mem = self._memory(("m" * 199 + "\n") * 150)  # 150 lines of 200 bytes: the 25 KB cap comes first
+        self.assertEqual((mem["bytes"], mem["lines"]), (25_000, 125))
 
     # ------------------------------------------------------------------ verify-split
     def test_verify_split(self):
@@ -1027,6 +1205,244 @@ class CwTest(unittest.TestCase):
         write(self.repo / "AGENTS.md", "~~~yaml\nenv:\n  prod:   blue\n  dev: green\n~~~\n")  # inner spacing may change
         self.run_cw("verify-split", str(old), str(new))
 
+    def test_verify_split_counts_a_line_that_opens_with_inline_code(self):
+        # CommonMark: a backtick fence's info string has no backtick, so this line is prose, not a fence.
+        span = "```make deploy``` ships to production, never on Fridays"
+        old = write(self.repo / "old.md", f"Rules:\n{span}\nTag the release first\n")
+        new = write(self.repo / "AGENTS.md", "Rules:\nTag the release first\n")
+        res = self.cw_json("verify-split", str(old), str(new), code=1)
+        self.assertEqual((res["missing"], res["checked"]), ([span], 3))
+
+    def test_verify_split_fence_closes_only_on_its_own_marker(self):
+        # Inside a ``` block a ~~~ line is code, and so is a shorter run of the same character.
+        for fence, inner in (("```", "~~~"), ("````", "```")):
+            old = write(self.repo / "old.md", f"{fence}yaml\n{inner}\n  prod: blue\n{fence}\n")
+            new = write(self.repo / "AGENTS.md", f"{fence}yaml\n{inner}\nprod: blue\n{fence}\n")
+            res = self.cw_json("verify-split", str(old), str(new), code=1)
+            self.assertEqual(res["missing"], ["  prod: blue"], fence)
+        # cmark-gfm counts at most 255 of a fence's characters, so 256 close one of 300 and the
+        # next 300 open a block.
+        long_fence = "`" * 300
+        old_text = f"{long_fence}\nx\n{'`' * 256}\n{long_fence}\nenv:\n  prod: blue\n{long_fence}\n"
+        old = write(self.repo / "old.md", old_text)
+        new = write(self.repo / "AGENTS.md", old_text.replace("  prod", "prod"))
+        self.assertEqual(self.cw_json("verify-split", str(old), str(new), code=1)["missing"], ["  prod: blue"])
+
+    def test_verify_split_fence_indented_four_more_is_code(self):
+        # CommonMark: a closing fence has at most three spaces of indentation. Four or more is a code line.
+        old = write(self.repo / "old.md", "```yaml\nsteps:\n    ```\n  prod: blue\n```\n")
+        new = write(self.repo / "AGENTS.md", "```yaml\nsteps:\n    ```\nprod: blue\n```\n")
+        self.assertEqual(self.cw_json("verify-split", str(old), str(new), code=1)["missing"], ["  prod: blue"])
+        # In a list item the three spaces count from where the item's text starts, column 2 for
+        # `- deploy:`: a block opened at column 4 closes at column 5, not at 7. After a fence at 7
+        # the block goes on, so the indented line is code and must keep its indentation.
+        for close, missing in (("       ```", ["  after the block"]), ("     ```", [])):
+            old = write(self.repo / "old.md", f"- deploy:\n\n    ```sh\n    make  ship\n{close}\n      after the block\n")
+            new = write(self.repo / "AGENTS.md", f"- deploy:\n\n    ```sh\n    make ship\n{close}\nafter the block\n")
+            res = self.cw_json("verify-split", str(old), str(new), code=1 if missing else 0)
+            self.assertEqual(res["missing"], missing, close)
+
+    def test_verify_split_finds_fences_where_list_items_put_them(self):
+        cases = {
+            # An item can open with a fence; its code starts where the item's text does, column 3.
+            "item opens with a fence": ("1. ```sh\n   make\n     ship\n   ```\n",
+                                        "1. ```sh\n   make\n   ship\n   ```\n", ["  ship"]),
+            # A block left open ends with its item, so the next fence opens a block, not closes one.
+            "block ends with its item": ("- build:\n  ```sh\n  make\n- config:\n```yaml\nenv:\n  prod: blue\n```\n",
+                                         "- build:\n  ```sh\n  make\n- config:\n```yaml\nenv:\nprod: blue\n```\n",
+                                         ["  prod: blue"]),
+            # Four spaces in at the margin is no fence, so the bare fence after it opens the block.
+            "four spaces in is no fence": ("Text\n    ```\n```\nenv:\n  prod: blue\n```\n",
+                                           "Text\n    ```\n```\nenv:\nprod: blue\n```\n", ["  prod: blue"]),
+        }
+        for name, (old_text, new_text, missing) in cases.items():
+            old = write(self.repo / "old.md", old_text)
+            new = write(self.repo / "AGENTS.md", new_text)
+            self.assertEqual(self.cw_json("verify-split", str(old), str(new), code=1)["missing"], missing, name)
+
+    def _split_cases(self, cases):
+        old, new = self.repo / "old.md", self.repo / "AGENTS.md"
+        for name, (old_text, new_text, missing) in cases.items():
+            with self.subTest(name):
+                old.write_bytes(old_text.encode("utf-8"))  # these exact line endings, on Windows too
+                new.write_bytes(new_text.encode("utf-8"))
+                res = self.cw_json("verify-split", str(old), str(new), code=1 if missing else 0)
+                self.assertEqual(res["missing"], missing)
+
+    def test_verify_split_lazy_lines_keep_their_list_item(self):
+        # CommonMark: a paragraph line indented less than its item's text ("lazy") stays in the
+        # item, so a fence after it still sits in the item and its code keeps its indentation.
+        yaml, flat = "    ```yaml\n    env:\n      prod: blue\n    ```\n", "    ```yaml\n    env:\n    prod: blue\n    ```\n"
+        py = "    ```python\n    def ship():\n        return deploy()\n    ```\n"
+        cases = {
+            "10.": ("10. Configure the service; this sentence wraps\nonto the next line.\n\n" + py,
+                    "10. Configure the service; this sentence wraps\nonto the next line.\n\n"
+                    + py.replace("        return", "    return"), ["    return deploy()"]),
+            "two spaces after 1.": ("1.  Deploy with the steps below; it wraps\nonto a second line.\n\n" + yaml,
+                                    "1.  Deploy with the steps below; it wraps\nonto a second line.\n\n" + flat,
+                                    ["  prod: blue"]),
+            "nested": ("- Deploy:\n  - Run the steps below; it wraps\nonto a lazy line.\n\n" + yaml,
+                       "- Deploy:\n  - Run the steps below; it wraps\nonto a lazy line.\n\n" + flat, ["  prod: blue"]),
+            "under-indented, no blank": ("1.  Configure the service; it wraps\n  onto a short line.\n" + yaml,
+                                         "1.  Configure the service; it wraps\n  onto a short line.\n" + flat,
+                                         ["  prod: blue"]),
+        }
+        self._split_cases(cases)
+
+    def test_verify_split_compares_indented_code_as_code(self):
+        # Four spaces past where the text of its container starts, after a blank line, is an
+        # indented code block (a fence there is a line of that code), so indentation counts.
+        cases = {
+            "margin": ("Run this:\n\n    ```yaml\n    env:\n      prod: blue\n    ```\n",
+                       "Run this:\n\n    ```yaml\n    env:\n    prod: blue\n    ```\n", ["  prod: blue"]),
+            "in an item": ("- Deploy:\n\n      ```yaml\n      env:\n        prod: blue\n      ```\n",
+                           "- Deploy:\n\n      ```yaml\n      env:\n      prod: blue\n      ```\n", ["  prod: blue"]),
+            "plain code": ("Ship it:\n\n    def ship():\n        return deploy()\n\nDone.\n",
+                           "Ship it:\n\n    def ship():\n    return deploy()\n\nDone.\n", ["    return deploy()"]),
+            # The same line right under a paragraph continues it: prose, compared without spacing.
+            "under a paragraph": ("Ship it:\n    def ship():\n        return deploy()\n",
+                                  "Ship it:\n    def ship():\n    return deploy()\n", []),
+            # An item opened empty ends at a blank line even after a line of spaces as deep as
+            # its text, so the code below sits at the margin, two spaces in.
+            "after an empty item": ("-\n   \n\n      x: 1\n", "-\n   \n\n    x: 1\n", ["  x: 1"]),
+            # A list number is ASCII digits: a full-width one is text, so the code below is code.
+            "a full-width number": ("１. Steps\n\n    def f():\n        return 1\n",
+                                    "１. Steps\n\n    def f():\n    return 1\n", ["    return 1"]),
+        }
+        self._split_cases(cases)
+
+    def test_verify_split_keeps_tabs_in_code(self):
+        # A tab in code stays a tab (a Makefile recipe needs one); a tab that only indents an
+        # indented code block, or that a container's prefix splits, counts as its columns.
+        make = "```make\nbuild:\n\tgo build\n```\n"
+        cases = {
+            "tab to spaces": (make, make.replace("\t", "    "), ["\tgo build"]),
+            "tab dropped": (make, make.replace("\t", ""), ["\tgo build"]),
+            "into a list item": (make, "- Build:\n\n" + "".join("  " + ln + "\n" for ln in make.splitlines()), []),
+            "indented code": ("Run:\n\n\tmake build\n", "Run:\n\n    make build\n", []),
+            # The item takes two columns of the first tab and the code four more: two are left.
+            "the rest of a split tab": ("- Run:\n\n\t\tmake build\n", "- Run:\n\n```\n  make build\n```\n", []),
+            # cmark-gfm strips one column per character of a fence's indentation. The item's text
+            # starts two columns into the tab, which leaves two: one is stripped, so GitHub shows
+            # " build:" and " \tgo build".
+            "a fence indented with a tab": (make, "- Build:\n" + "".join("\t" + ln + "\n" for ln in make.splitlines()),
+                                            ["build:", "\tgo build"]),
+            # Under `1. ` the tab has one column left, and it is stripped: no change.
+            "under 1.": (make, "1. Build:\n" + "".join("\t" + ln + "\n" for ln in make.splitlines()), []),
+            # Under `100. ` the second tab has three left: two show, "  build:".
+            "under 100.": (make, "100. Build:\n" + "".join("\t\t" + ln + "\n" for ln in make.splitlines()),
+                           ["build:", "\tgo build"]),
+        }
+        self._split_cases(cases)
+
+    def test_verify_split_shows_tabs_and_control_characters(self):
+        # The text output must show a tab that became spaces, and must not pass a file's escape
+        # sequences to the terminal. --json keeps the lines as they are.
+        old = write(self.repo / "old.md", "```make\nbuild:\n\tgo build\n```\nRun \x1b[31mnow\x1b[0m‮\n")
+        new = write(self.repo / "AGENTS.md", "```make\nbuild:\n    go build\n```\n")
+        out = self.run_cw("verify-split", str(old), str(new), code=1)
+        self.assertIn("\n  - \\tgo build\n", out)
+        self.assertIn("\n  - Run \\x1b[31mnow\\x1b[0m\\u202e\n", out)
+        self.assertNotIn("\x1b", out)
+        res = self.cw_json("verify-split", str(old), str(new), code=1)
+        self.assertEqual(res["missing"], ["\tgo build", "Run \x1b[31mnow\x1b[0m‮"])
+
+    def test_verify_split_a_dash_under_text_is_a_heading_rule(self):
+        # `Some text` over `-` is a setext heading, not an empty list item, so the fence after it
+        # sits at the margin and the next bare fence opens a block instead of closing one.
+        self._split_cases({"setext": ("Some text\n-\n  ```\ncode at margin\n  ```\n\n```\nenv:\n  prod: blue\n```\n",
+                                      "Some text\n-\n  ```\ncode at margin\n  ```\n\n```\nenv:\nprod: blue\n```\n",
+                                      ["  prod: blue"])})
+
+    def test_verify_split_finds_fences_in_block_quotes(self):
+        quoted = "> [!IMPORTANT]\n> ```yaml\n> env:\n>   prod: blue\n> ```\n"
+        cases = {
+            "alert": (quoted, quoted.replace(">   prod", "> prod"), ["  prod: blue"]),
+            "moved out of the quote": (quoted, "> [!IMPORTANT]\n```yaml\nenv:\n  prod: blue\n```\n", []),
+            "in a quoted item": ("> - Deploy:\n>   ```yaml\n>   env:\n>     prod: blue\n>   ```\n",
+                                 "> - Deploy:\n>   ```yaml\n>   env:\n>   prod: blue\n>   ```\n", ["  prod: blue"]),
+        }
+        self._split_cases(cases)
+
+    def test_verify_split_a_table_is_not_a_paragraph(self):
+        # GFM: a table ends the paragraph its header row was in, so a line four spaces past the
+        # text under a row is indented code, and a list numbered 2 can start there.
+        table = "| Env | Color |\n| --- | :---: |\n| prod | blue |\n"
+        code, flat = "    env:\n      prod: blue\n", "    env:\n    prod: blue\n"
+        cases = {
+            "code under a table": (table + code, table + flat, ["  prod: blue"]),
+            "in a list item": ("- Colors:\n" + table.replace("|", "  |", 1).replace("\n|", "\n  |") + "  " + code.replace("\n ", "\n   "),
+                               "- Colors:\n" + table.replace("|", "  |", 1).replace("\n|", "\n  |") + "  " + flat.replace("\n ", "\n   "),
+                               ["  prod: blue"]),
+            "an item numbered 2": (table + "2. Then:\n\n       env:\n         prod: blue\n",
+                                   table + "2. Then:\n\n       env:\n       prod: blue\n", ["  prod: blue"]),
+            # No table: the delimiter row has one cell, the header two (`\|` is no separator),
+            # so the lines stay one paragraph and its indented lines are prose.
+            "cells differ": ("| Env | Color |\n| --- |\n" + code, "| Env | Color |\n| --- |\n" + flat, []),
+            "escaped pipe": ("Env \\| Color\n--- | ---\n" + code, "Env \\| Color\n--- | ---\n" + flat, []),
+        }
+        self._split_cases(cases)
+
+    def test_verify_split_lines_end_only_at_line_endings(self):
+        # A form feed or a Unicode line separator inside a line does not end it (str.splitlines
+        # would split there and open a fence that is not one); \r\n and a lone \r do.
+        yaml = "```\nenv:\n  prod: blue\n```\n"
+        cases = {
+            "line separator": ("Note: see below ```\n" + yaml, "Note: see below ```\n" + yaml.replace("  prod", "prod"),
+                               ["  prod: blue"]),
+            "form feed": ("Note: see below\x0c```\n" + yaml, "Note: see below\x0c```\n" + yaml.replace("  prod", "prod"),
+                          ["  prod: blue"]),
+            "CRLF": (yaml.replace("\n", "\r\n"), yaml.replace("  prod", "prod"), ["  prod: blue"]),
+            "CR": (yaml.replace("\n", "\r"), yaml.replace("  prod", "prod"), ["  prod: blue"]),
+        }
+        self._split_cases(cases)
+
+    def test_verify_split_html_blocks(self):
+        # CommonMark HTML blocks: a fence inside one opens nothing, and a line after one that has
+        # ended is not paragraph text. Types 1 to 5 run past blank lines to their end marker;
+        # types 6 (a block tag such as div) and 7 (any other tag alone on its line) end before a
+        # blank line, and type 7 cannot interrupt a paragraph.
+        code, flat = "```\nenv:\n  prod: blue\n```\n", "```\nenv:\nprod: blue\n```\n"
+        cases = {
+            "comment, then indented code": ("<!-- generated: do not edit -->\n    def f():\n        return 1\n",
+                                            "<!-- generated: do not edit -->\n    def f():\n    return 1\n",
+                                            ["    return 1"]),
+        }
+        for start, end in (("<pre>", "</pre>"), ("<!-- TODO", "-->"), ("<?php", "?>"), ("<!DOCTYPE", ">"),
+                           ("<![CDATA[", "]]>")):
+            html = f"{start}\n\n```\n{end}\n\n"
+            cases[start] = (html + code, html + flat, ["  prod: blue"])
+        for start in ("Text\n<div>", "<example>"):  # a div interrupts a paragraph
+            html = f"{start}\n```\n\n"
+            cases[start] = (html + code, html + flat, ["  prod: blue"])
+        item = "- Deploy:\n  <!-- example\n  ```\n  -->\n\n  ```\n  env:\n    prod: blue\n  ```\n"
+        cases["in a list item"] = (item, item.replace("    prod", "  prod"), ["  prod: blue"])
+        details = "<details>\n<summary>Deploy</summary>\n\n"
+        cases["a div ends at a blank line"] = (details + code + "\n</details>\n", details + flat + "\n</details>\n",
+                                               ["  prod: blue"])
+        cases["a tag alone does not interrupt a paragraph"] = ("Text\n<example>\n" + code, "Text\n<example>\n" + flat,
+                                                               ["  prod: blue"])
+        link = '<a href="https://example.com">Docs</a> for the API\n'
+        cases["a tag with text after it"] = (link + code, link + flat, ["  prod: blue"])
+        # Tag names are ASCII: Python's re.I would let a long s, a dotless i or the Kelvin sign
+        # stand for s, i and k, and cmark-gfm reads these lines as text.
+        for tag in ("<ſcript>\n\n", "<dıv>\n", "<blocKquote>\n"):
+            cases[tag.strip()] = (tag + code, tag + flat, ["  prod: blue"])
+        # So is an end tag: `</ſcript>` leaves the script block open until `</script>`.
+        script = "<script>\n</ſcript>\n```\n</script>\n\n"
+        cases["an end tag in look-alike letters"] = (script + code, script + flat, ["  prod: blue"])
+        # A CDATA start is read in any letter case, as cmark-gfm reads it.
+        cases["a lower-case CDATA start"] = ("<![cdata[\n```\n]]>\n\n" + code, "<![cdata[\n```\n]]>\n\n" + flat,
+                                             ["  prod: blue"])
+        cases["a quote that ends ends its comment"] = ("> <!-- note\n" + code, "> <!-- note\n" + flat, ["  prod: blue"])
+        self._split_cases(cases)
+
+    def test_verify_split_allow_list_ignores_spacing(self):
+        old = write(self.repo / "old.md", "keep me\ndropped   on purpose\n")
+        new = write(self.repo / "AGENTS.md", "keep me\n")
+        allow = write(self.repo / "dropped.txt", "  dropped on   purpose  \n")
+        self.run_cw("verify-split", str(old), str(new), "--allow", str(allow))
+
     def test_verify_split_ignores_the_old_file_inside_a_new_directory(self):
         old = write(self.repo / "notes" / "CLAUDE.md.bak", "only in the backup\n")
         write(self.repo / "notes" / "CLAUDE.md.bak.md", "only in the backup\n")  # a copy that does count
@@ -1052,7 +1468,7 @@ class CwTest(unittest.TestCase):
     def test_max_tokens_gate_counts_text_codex_cuts_off(self):
         write(self.repo / "AGENTS.md", "a" * 100 * 1024)  # ~34k tokens, Codex keeps 32 KiB of it
         p = subprocess.run([sys.executable, str(CW), "files", str(self.repo), "--harness", "codex", "--max-tokens", "15000"],
-                           env=self.env, capture_output=True, text=True)
+                           env=self.env, capture_output=True, text=True, encoding="utf-8")
         self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
         self.assertIn("never sees", p.stderr)
 
@@ -1061,7 +1477,7 @@ class CwTest(unittest.TestCase):
         write(self.repo / ".claude" / "rules" / "scoped.md", "﻿---\npaths:\n  - src/**\n---\nonly src")
         write(self.home / ".claude" / "skills" / "dir-name" / "SKILL.md", "﻿---\nname: real-name\ndescription: hi\n---\n")
         r = self.cw_json("files", str(self.repo), "--harness", "claude")["claude"]
-        self.assertEqual(r["files"], [])
+        self.assertEqual(self.mine(r["files"]), [])
         s = self.cw_json("skills", str(self.repo), "--harness", "claude")["claude"]
         self.assertEqual([h["name"] for h in s["heaviest"]], ["real-name"])
 
@@ -1086,6 +1502,7 @@ class CwTest(unittest.TestCase):
                json.dumps({"type": "assistant", "message": []}),
                json.dumps({"type": "assistant", "message": {"id": "s", "usage": {"input_tokens": "lots"}}}),
                json.dumps({"type": "assistant", "message": {"id": "u", "usage": []}}),
+               '{"type": "assistant", "message": {"id": "inf", "usage": {"input_tokens": 1e999}}}',
                '{"type": "assistant", "cut off']
         write(self.home / ".claude" / "projects" / "-repo" / "x.jsonl", "\n".join(bad + [json.dumps(good)]) + "\n")
         meta = {"type": "session_meta", "payload": {"cwd": str(self.repo)}}
@@ -1094,7 +1511,9 @@ class CwTest(unittest.TestCase):
         cbad = ['["token_count"]', '{"type": "session_meta", "payload": []}',
                 json.dumps({"type": "event_msg", "payload": {"type": "token_count", "info": []}}),
                 json.dumps({"type": "event_msg", "payload": {"type": "token_count",
-                                                              "info": {"last_token_usage": {"input_tokens": None}}}})]
+                                                              "info": {"last_token_usage": {"input_tokens": None}}}}),
+                '{"type": "event_msg", "payload": {"type": "token_count", "info": {'
+                '"last_token_usage": {"input_tokens": 1e999}, "model_context_window": 1e999}}}']
         write(self.home / ".codex" / "sessions" / "2026" / "10" / "01" / "rollout-x.jsonl",
               "\n".join([json.dumps(meta)] + cbad + [json.dumps(tok)]) + "\n")
         res = self.cw_json("sessions")
@@ -1127,7 +1546,7 @@ class CwTest(unittest.TestCase):
         os.symlink(shared.parent, self.repo / ".claude" / "rules" / "shared", target_is_directory=True)
         os.symlink(self.repo / ".claude" / "rules", self.repo / ".claude" / "rules" / "loop", target_is_directory=True)
         r = self.cw_json("files", str(self.repo), "--harness", "claude")["claude"]
-        self.assertEqual([Path(f["path"]).name for f in r["files"]], ["style.md"])
+        self.assertEqual([Path(f["path"]).name for f in self.mine(r["files"])], ["style.md"])
 
     def test_gemini_stops_at_the_git_root(self):
         write(self.repo.parent / "GEMINI.md", "outside the repo")
@@ -1164,7 +1583,7 @@ class CwTest(unittest.TestCase):
     # ------------------------------------------------------------------ installer
     def run_install(self, *args, code=0):
         p = subprocess.run([sys.executable, str(CW.parents[3] / "install.py"), *args],
-                           env=self.env, capture_output=True, text=True)
+                           env=self.env, capture_output=True, text=True, encoding="utf-8")
         self.assertEqual(p.returncode, code, p.stdout + p.stderr)
         return p.stdout
 
@@ -1225,7 +1644,7 @@ class CwTest(unittest.TestCase):
         (self.home / ".agents").mkdir(parents=True)
         os.symlink(self.home / "gone", self.home / ".agents" / "skills")  # dangling
         p = subprocess.run([sys.executable, str(CW.parents[3] / "install.py")], env=self.env,
-                           capture_output=True, text=True)
+                           capture_output=True, text=True, encoding="utf-8")
         self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
         self.assertNotIn("Traceback", p.stderr)
         self.assertTrue((self.home / ".claude" / "skills" / "context-weight" / "SKILL.md").is_file())
@@ -1246,7 +1665,7 @@ class CwTest(unittest.TestCase):
         f.chmod(0)
         try:
             p = subprocess.run([sys.executable, str(CW), "files", str(self.repo), "--max-tokens", "6000"],
-                               env=self.env, capture_output=True, text=True)
+                               env=self.env, capture_output=True, text=True, encoding="utf-8")
             self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
             self.assertIn("cannot read", p.stderr)
             self.run_cw("files", str(self.repo))                     # without the gate: a warning, exit 0
@@ -1260,6 +1679,181 @@ class CwTest(unittest.TestCase):
         self.run_cw("files", str(self.repo), "--harness", ",", code=2)
         self.run_cw("files", str(self.repo), "--harness", "cursor", code=2)
         self.run_cw("files", str(self.repo), "--max-tokens", "-1", code=2)
+        self.run_cw("report", str(self.repo), "--target", "-5000", code=2)
+        # An empty path is an unset variable in a CI line, not the current folder.
+        for cmd in ("files", "skills", "report"):
+            self.run_cw(cmd, "", code=2)
+        old = write(self.repo / "old.md", "a rule found nowhere else\n")
+        self.run_cw("verify-split", str(old), "", code=2)
+
+    def test_a_harness_named_twice_counts_once(self):
+        self._claude_log("s", self.repo, "2026-10-01T00:00:00Z", [10_000, 20_000])
+        once = self.cw_json("sessions", "--harness", "claude")
+        self.assertEqual(self.cw_json("sessions", "--harness", "claude,claude"), once)
+        res = self.cw_json("report", str(self.repo), "--harness", "claude, claude", "--days", "40000")
+        self.assertEqual(res["sessions"]["claude"]["requests"], 2)
+
+    def test_huge_days_window_reaches_back_to_year_one(self):
+        self._git_repo()
+        self._slim_history()
+        self._claude_log("s", self.repo, "2026-02-10T12:00:00Z", [30_000])
+        for days in ("740000", "99999999999999999999"):
+            res = self.cw_json("report", str(self.repo), "--days", days)
+            self.assertEqual(res["since"], "0001-01-01", days)
+            self.assertEqual(res["compare"]["sessions"]["claude"]["after"]["sessions"], 1, days)
+            self.assertIn("sessions since 0001-01-01", self.run_cw("report", str(self.repo), "--days", days))
+
+    @unittest.skipIf(os.name == "nt", "closing a pipe early is a POSIX shell habit (`| head`)")
+    def test_a_closed_pipe_keeps_the_exit_code(self):
+        old = write(self.repo / "old.md", "".join(f"rule {i:05d}: keep the tests green\n" for i in range(3000)))
+        write(self.repo / "AGENTS.md", "nothing here\n")
+        cases = ((["verify-split", str(old), str(self.repo / "AGENTS.md"), "--json"], 1),
+                 (["verify-split", str(old), str(self.repo / "AGENTS.md")], 1),
+                 (["files", str(self.repo), "--max-tokens", "1"], 1),
+                 (["files", str(self.repo)], 0),
+                 (["files", str(self.repo / "missing")], 2),
+                 (["files", str(self.repo), "--max-tokens", "lots"], 2),  # argparse's own error
+                 (["--help"], 0),
+                 (["--version"], 0))
+        for args, code in cases:
+            # `| head -0`, and `2>&1 | head -0`, where errors go into the same closed pipe
+            for together in (False, True):
+                p = subprocess.Popen([sys.executable, str(CW), *args], env=self.env, stdout=subprocess.PIPE,
+                                     stderr=subprocess.STDOUT if together else subprocess.PIPE)
+                p.stdout.close()  # the reader is gone before cw.py writes a byte
+                err = "" if together else p.stderr.read().decode("utf-8", errors="replace")
+                if not together:
+                    p.stderr.close()
+                self.assertEqual(p.wait(), code, (args, together, err))
+                self.assertNotIn("Exception ignored", err, args)
+                self.assertNotIn("Traceback", err, args)
+
+    @unittest.skipIf(os.name == "nt", "no fd to close before exec on Windows")
+    def test_a_closed_stdout_keeps_the_exit_code(self):
+        # `cw.py ... >&-` (or pythonw) starts Python with no stdout at all: sys.stdout is None.
+        write(self.repo / "AGENTS.md", "a" * 3_000)  # ~1,000 tokens
+        cases = ((["files", str(self.repo), "--max-tokens", "2000"], 0),
+                 (["files", str(self.repo), "--max-tokens", "500"], 1),
+                 (["files", str(self.repo), "--max-tokens", "2000", "--json"], 0),
+                 (["files", str(self.repo / "missing")], 2))
+        for args, code in cases:
+            p = subprocess.run([sys.executable, str(CW), *args], env=self.env, stderr=subprocess.PIPE,
+                               preexec_fn=lambda: os.close(1))
+            err = p.stderr.decode("utf-8", errors="replace")
+            self.assertEqual(p.returncode, code, (args, err))
+            self.assertNotIn("Traceback", err, args)
+
+    @unittest.skipIf(os.name == "nt", "no RLIMIT_FSIZE on Windows")
+    def test_a_failed_write_exits_2(self):
+        # A full disk or a file size limit is not a reader that left: the output is lost, so the
+        # run fails whatever the check decided. `ulimit -f 0` makes every write to a file fail.
+        import resource
+        old = write(self.repo / "old.md", "".join(f"rule {i:05d}: keep the tests green\n" for i in range(3000)))
+        write(self.repo / "AGENTS.md", "nothing here\n")
+        cases = (["verify-split", str(old), str(self.repo / "AGENTS.md"), "--json"],  # fails while printing
+                 ["files", str(self.repo)],  # fails on the last flush
+                 ["files", str(self.repo), "--max-tokens", "1"],
+                 ["--help"], ["--version"])
+        limit = lambda: resource.setrlimit(resource.RLIMIT_FSIZE, (0, 0))  # noqa: E731
+        # -B: Apple's Python 3.9 writes bytecode under ~/Library/Caches as it starts, before Python
+        # ignores SIGXFSZ, and the fake home has none yet, so the limit would kill it first.
+        command = [sys.executable, "-B", str(CW)]
+        for args in cases:
+            with open(self.tmp_path / "out.txt", "wb") as out:
+                p = subprocess.run(command + args, env=self.env, stdout=out, stderr=subprocess.PIPE, preexec_fn=limit)
+                both = subprocess.run(command + args, env=self.env, stdout=out,
+                                      stderr=subprocess.STDOUT, preexec_fn=limit)  # `> out 2>&1`: no error can show
+            err = p.stderr.decode("utf-8", errors="replace")
+            self.assertEqual(p.returncode, 2, (args, err))
+            self.assertIn("cw.py: error: cannot write output", err, args)
+            self.assertNotIn("Traceback", err, args)
+            self.assertNotIn("Exception ignored", err, args)
+            self.assertEqual(both.returncode, 2, args)
+
+    def test_git_variables_from_a_hook_do_not_redirect_compare(self):
+        self._git_repo()
+        self._slim_history()
+        self._claude_log("s", self.repo, "2026-02-10T12:00:00Z", [30_000])
+        expected = self.cw_json("report", str(self.repo), "--days", "40000")["compare"]
+        decoy = self.tmp_path / "decoy"
+        decoy.mkdir()
+        self._git("-C", str(decoy), "init", "-q")
+        # A pre-commit hook runs with these set to the repository being committed.
+        self.env.update(GIT_DIR=str(decoy / ".git"), GIT_WORK_TREE=str(decoy),
+                        GIT_INDEX_FILE=str(decoy / ".git" / "index"))
+        self.assertEqual(self.cw_json("report", str(self.repo), "--days", "40000")["compare"], expected)
+
+    def test_project_typed_in_other_letter_case_is_one_project(self):
+        other = self.repo.parent / "REPO"
+        if not os.path.isdir(str(other)):
+            self.skipTest("this disk tells letter cases apart")
+        self._git_repo()
+        self._slim_history()
+        for i, day in enumerate(("10", "12", "14")):
+            self._claude_log(f"a{i}", other, f"2026-02-{day}T12:00:00Z", [30_000])
+        self._codex_log("x", self.repo, "2026-02-20T12:00:00Z", [20_000])
+        for typed in (self.repo, other):
+            res = self.cw_json("report", str(typed), "--days", "40000")
+            self.assertEqual(sorted(res["sessions"]), ["claude", "codex"], typed)
+            self.assertEqual(res["sessions"]["claude"]["sessions"], 3, typed)
+            self.assertEqual(res["compare"]["sessions"]["claude"]["after"]["sessions"], 3, typed)
+
+    def test_subfolder_typed_in_other_letter_case_keeps_its_before_and_after(self):
+        # git's paths carry the true case; a report on `SUB` must still find the cut of sub/CLAUDE.md.
+        if not os.path.isdir(str(self.repo.parent / "REPO")):
+            self.skipTest("this disk tells letter cases apart")
+        self._git_repo()
+        write(self.repo / "sub" / "CLAUDE.md", rules("rule", 600), exact=True)
+        self._commit("rules", "2026-01-01T00:00:00+00:00")
+        write(self.repo / "sub" / "CLAUDE.md", "short\n", exact=True)
+        slim = self._commit("slim", "2026-02-01T00:00:00+00:00")
+        cut = (slim, [{"path": "sub/CLAUDE.md", "before": 20_400, "after": 2}])
+        for typed in ("sub", "SUB"):
+            c = self.cw_json("report", str(self.repo / typed), "--days", "40000", "--harness", "claude")["compare"]
+            self.assertEqual((c["commit"], c["changed"]), cut, typed)
+        # A parent folder that can be entered but not listed keeps its typed spelling; the folders
+        # below it are still spelled as the disk spells them.
+        if os.name != "nt" and os.geteuid() != 0:
+            os.chmod(str(self.repo.parent), 0o311)
+            try:
+                c = self.cw_json("report", str(self.repo / "SUB"), "--days", "40000", "--harness", "claude")["compare"]
+            finally:
+                os.chmod(str(self.repo.parent), 0o755)
+            self.assertEqual((c["commit"], c["changed"]), cut, "parent not listable")
+        # So does a parent typed in another Unicode form than the disk keeps (U+00E9 for e and
+        # U+0301): macOS takes both for one folder.
+        disk, typed = self.tmp_path / "cafe\u0301", self.tmp_path / "caf\u00e9"
+        disk.mkdir()
+        if os.path.isdir(str(typed)) and "caf\u00e9" not in os.listdir(str(self.tmp_path)):
+            self._git("clone", "-q", str(self.repo), str(disk / "repo"))
+            c = self.cw_json("report", str(typed / "repo" / "SUB"), "--days", "40000", "--harness", "claude")["compare"]
+            self.assertEqual((c["commit"], c["changed"]), cut, "parent in another Unicode form")
+
+    def test_default_window_is_the_last_30_days(self):
+        # Every other test passes --days 40000; this one runs on dates relative to today.
+        now = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
+
+        def ago(days):
+            return now - dt.timedelta(days=days)
+
+        self._git_repo()
+        write(self.repo / "CLAUDE.md", rules("rule", 600))
+        self._commit("rules", ago(20).isoformat())
+        write(self.repo / "CLAUDE.md", rules("rule", 60))
+        self._commit("slim", ago(10).isoformat())
+        elsewhere = self.tmp_path / "work" / "other"
+        (elsewhere / ".git").mkdir(parents=True)
+        for d in (14, 13, 12, 45):
+            self._claude_log(f"b{d}", self.repo, ago(d).strftime("%Y-%m-%dT%H:%M:%SZ"), [80_000])
+        for d in (8, 7, 6):
+            self._claude_log(f"a{d}", self.repo, ago(d).strftime("%Y-%m-%dT%H:%M:%SZ"), [30_000])
+            self._claude_log(f"o{d}", elsewhere, ago(d).strftime("%Y-%m-%dT%H:%M:%SZ"), [99_000])
+        res = self.cw_json("report", str(self.repo), "--harness", "claude")
+        self.assertEqual(res["sessions"]["claude"]["sessions"], 6)  # not the 45-day-old one, not the other repo
+        b, a = res["compare"]["sessions"]["claude"]["before"], res["compare"]["sessions"]["claude"]["after"]
+        self.assertEqual((b["sessions"], a["sessions"]), (3, 3))
+        self.assertEqual((b["baseline_median"], a["baseline_median"]), (80_000, 30_000))
+        self.assertNotIn("compare", self.cw_json("report", str(self.repo), "--harness", "claude", "--days", "5"))
 
     def test_skill_description_cap_follows_settings(self):
         write(self.home / ".claude" / "skills" / "big" / "SKILL.md", "---\nname: big\ndescription: " + "d" * 3_000 + "\n---\n")
@@ -1287,7 +1881,7 @@ class ManifestTest(unittest.TestCase):
         return json.loads((self.ROOT / rel).read_text(encoding="utf-8"))
 
     def test_manifests_agree_with_the_script(self):
-        out = subprocess.run([sys.executable, str(CW), "--version"], capture_output=True, text=True)
+        out = subprocess.run([sys.executable, str(CW), "--version"], capture_output=True, text=True, encoding="utf-8")
         version = out.stdout.strip()
         self.assertTrue(version)
         for rel in self.FILES[:2]:
@@ -1305,6 +1899,21 @@ class ManifestTest(unittest.TestCase):
         email = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
         for rel in self.FILES:
             self.assertIsNone(email.search((self.ROOT / rel).read_text(encoding="utf-8")), rel)
+
+    def test_claude_plugin_icon_exists(self):
+        # Anthropic's directory reads the icon from plugin.json, once, when the plugin is first saved.
+        icon = self.load(self.FILES[0]).get("icon")
+        self.assertTrue(icon)
+        self.assertTrue((self.ROOT / icon).is_file(), icon)
+
+    def test_skill_stays_small(self):
+        # SKILL.md loads whole each time the skill triggers: it must not regrow unnoticed.
+        text = (self.ROOT / "skills" / "context-weight" / "SKILL.md").read_text(encoding="utf-8")
+        cw = load_cw()
+        desc = cw.frontmatter(text).get("description", "")
+        self.assertTrue(desc)
+        self.assertLessEqual(len(desc), 1_024)  # Agent Skills spec limit; Claude Code's listing cuts at 1,536
+        self.assertLessEqual(cw.est_tokens(text), 3_000)
 
 
 if __name__ == "__main__":

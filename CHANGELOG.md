@@ -1,5 +1,78 @@
 # Changelog
 
+## 0.3.2 (2026-11-12)
+
+Fixes from a review of 0.3.1. Output and exit codes change only where 0.3.1 was wrong.
+
+- `verify-split` finds code as GitHub does (GitHub Flavored Markdown, checked against
+  cmark-gfm), in list items and block quotes too, and keeps its indentation, tabs included:
+  0.3.1 expanded tabs first, so a Makefile recipe whose tab became spaces passed. A line that opens
+  with inline code in triple backticks is prose, not a fence; a block opened with four
+  backticks closes only on four or more; a fence counts only within three spaces of the
+  margin, or of where the text of its list item or block quote starts, so a line further in is
+  code; a list item can open with a fence (`` 1. ```sh ``); a block left open ends with its
+  list item or block quote; an indented code block (four spaces past where the text starts,
+  not continuing a paragraph) is compared as code, not as prose; code in a block quote, such
+  as a GitHub alert, is compared as code; a table is not a paragraph, so a line four spaces in
+  under one of its rows is code and a list numbered 2 can start there; an HTML block holds no
+  code, so a fence inside an HTML comment opens nothing, and indented code right under a
+  one-line comment (`<!-- generated -->`) is code, not paragraph text; a fence counts at most
+  255 of its characters, as cmark-gfm does; and a line ends only at `\n`, `\r\n` or `\r`, not
+  at a form feed or a Unicode line separator. In each case 0.3.1 could pass a split that lost
+  lines. Code may now move into or out of a list item or block quote without showing as
+  missing. Not modelled: footnote definitions, which GitHub reads, and a paragraph made only of
+  link reference definitions, under which cmark-gfm reads `---` or `===` as text.
+- `verify-split`'s list of missing lines prints a tab as `\t` and any other control or format
+  character as an escape (`\x1b`), so a tab that became spaces shows, and a line cannot send
+  terminal escapes. `--json` keeps the lines as they are.
+- `verify-split` compares each line on its own, so moving a line break shows both lines as
+  missing. The README and `references/slimming.md` used to say re-wrapping prose was fine;
+  they now say to keep the old line breaks.
+- On macOS and Windows, a project typed in other letter case than git or the session logs
+  record (`~/code/repo` for `~/Code/repo`) is one project. `report` used to miss its sessions
+  and its Before and after, and on a subfolder typed so (`repo/SUB` for `repo/sub`) the
+  Before and after as well.
+- Without `tomllib` (Python 3.8 to 3.10), `project_doc_max_bytes = 65_536` in Codex's
+  config.toml was read as 65 bytes, and a key under a `[profiles.x]` table was taken as the
+  global limit. The fallback now reads only top-level keys, and integers with underscores or a
+  `0x`, `0o` or `0b` prefix.
+- The warning that Claude Code and Codex follow different rules weighs only files in the repo.
+  A CLAUDE.md in a parent folder, which Claude Code loads in every repo below it, used to set it
+  off in repos that hold no rules at all.
+- `--days` longer than the calendar starts the window on 0001-01-01; it used to crash.
+- When no finding is large enough but the repo instructions still pass `--target`, `report` and
+  the picture say by how much (`No large fixes: Codex is ~1.9k over the ~5.0k target.`) instead
+  of "none" and "within target". `--help` says findings start 2,000 tokens above the target.
+- Bad input exits 2: an empty project path (an unset variable), an empty `verify-split` path,
+  a negative `--target`. `--harness claude,claude` counts each session once, not twice. A
+  Gemini `context.fileName` that is a number, `true` or an object falls back to `GEMINI.md`
+  instead of crashing, and a `1e999` in a session log counts as 0 instead of crashing.
+- A reader that closes the pipe early (`cw.py files . --max-tokens 6000 | head -1`, with or
+  without `2>&1`) no longer changes the exit code: a failed gate still exits 1, a passing one
+  0, bad input 2, and `--help` and `--version` 0. 0.3.1 exited 0 or 120, depending on when the
+  pipe closed. Started with no stdout at all (`>&-`), `--json` exited 1 with a traceback; it
+  now keeps its exit code too. Output that cannot be written for any other reason (a full
+  disk, a file size limit) exits 2 with `cw.py: error: cannot write output: ...`, where 0.3.1
+  exited 120.
+- The slimming procedure backs up every instruction file it will edit (CLAUDE.md and AGENTS.md
+  both), runs `verify-split` once per backup, adds `--allow dropped.txt` only when that file
+  exists (a missing allow list exits 2), and removes the backups and `dropped.txt` before the
+  commit. It no longer suggests writing `<skill-dir>`, a path on one machine, into a committed
+  CI or pre-commit file.
+- The README's pre-commit hook runs on every commit (`always_run: true`): rules, `@imports` and
+  notes files count too. Its CI recipe uses `actions/checkout@v7` and suggests pinning `cw.py`
+  to a release tag.
+- CI runs on `actions/checkout@v7` and `actions/setup-python@v7`, and tests Python 3.14 on
+  Linux, macOS and Windows; 3.8, 3.10 and 3.13 stay on Linux.
+- The Claude Code plugin manifest names its icon, `.claude-plugin/icon.png`.
+- The tests no longer depend on the machine they run on: they drop `GIT_*` and
+  `XDG_CONFIG_HOME`, ignore CLAUDE.md files above the temp folder, read output as UTF-8,
+  build expected dates in the local time zone and write exact bytes where they count them. New tests cover the Codex config fallback, Codex
+  fallback file names and its 32 KiB cut, Claude Code's import depth limit and
+  `.claude/CLAUDE.md`, project and plugin skills, exact session numbers, auto memory's 25 KB
+  cap, the default 30-day window and the size of SKILL.md.
+- Removed unused code (`fnmatch`, `_SKIP_MODES`).
+
 ## 0.3.1 (2026-11-10)
 
 Fixes from running 0.3.0 on four real repos.
