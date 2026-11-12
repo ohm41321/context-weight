@@ -15,9 +15,14 @@ from unittest import mock
 CW = Path(__file__).resolve().parents[1] / "skills" / "context-weight" / "scripts" / "cw.py"
 
 
-def write(path: Path, text: str) -> Path:
+def write(path: Path, text: str, exact=False) -> Path:
+    """Write `text` as a text file: on Windows each \\n becomes \\r\\n, unless `exact` asks for
+    these bytes, as a test that counts bytes or tokens needs."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text, encoding="utf-8")
+    if exact:
+        path.write_bytes(text.encode("utf-8"))
+    else:
+        path.write_text(text, encoding="utf-8")
     return path
 
 
@@ -1016,7 +1021,7 @@ class CwTest(unittest.TestCase):
 
     def test_report_says_when_startup_is_over_target_with_nothing_large_to_fix(self):
         # ~6.9k tokens: past the 5.0k target, but under the 2,000 slack before a finding is raised.
-        write(self.repo / "AGENTS.md", "Run the tests before every commit.\n" * 590)
+        write(self.repo / "AGENTS.md", "Run the tests before every commit.\n" * 590, exact=True)
         out = self.tmp_path / "pic.svg"
         res = self.cw_json("report", str(self.repo), "--harness", "codex", "--svg", str(out))
         self.assertEqual(res["findings"], [])
@@ -1024,7 +1029,7 @@ class CwTest(unittest.TestCase):
         self.assertIn("Codex is ~1.9k over the ~5.0k target", texts)
         self.assertNotIn("within target", texts)
         self.assertIn("Codex is ~1.9k over the ~5.0k target", self.run_cw("report", str(self.repo), "--harness", "codex"))
-        write(self.repo / "AGENTS.md", "Run the tests before every commit.\n" * 100)
+        write(self.repo / "AGENTS.md", "Run the tests before every commit.\n" * 100, exact=True)
         self.run_cw("report", str(self.repo), "--harness", "codex", "--svg", str(out))
         self.assertIn("Nothing to fix: startup context is within target.", self._svg_texts(out)[1])
 
@@ -1798,9 +1803,9 @@ class CwTest(unittest.TestCase):
         if not os.path.isdir(str(self.repo.parent / "REPO")):
             self.skipTest("this disk tells letter cases apart")
         self._git_repo()
-        write(self.repo / "sub" / "CLAUDE.md", rules("rule", 600))
+        write(self.repo / "sub" / "CLAUDE.md", rules("rule", 600), exact=True)
         self._commit("rules", "2026-01-01T00:00:00+00:00")
-        write(self.repo / "sub" / "CLAUDE.md", "short\n")
+        write(self.repo / "sub" / "CLAUDE.md", "short\n", exact=True)
         slim = self._commit("slim", "2026-02-01T00:00:00+00:00")
         cut = (slim, [{"path": "sub/CLAUDE.md", "before": 20_400, "after": 2}])
         for typed in ("sub", "SUB"):

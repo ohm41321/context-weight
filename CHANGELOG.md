@@ -66,8 +66,8 @@ Fixes from a review of 0.3.1. Output and exit codes change only where 0.3.1 was 
   Linux, macOS and Windows; 3.8, 3.10 and 3.13 stay on Linux.
 - The Claude Code plugin manifest names its icon, `.claude-plugin/icon.png`.
 - The tests no longer depend on the machine they run on: they drop `GIT_*` and
-  `XDG_CONFIG_HOME`, ignore CLAUDE.md files above the temp folder, read output as UTF-8 and
-  build expected dates in the local time zone. New tests cover the Codex config fallback, Codex
+  `XDG_CONFIG_HOME`, ignore CLAUDE.md files above the temp folder, read output as UTF-8,
+  build expected dates in the local time zone and write exact bytes where they count them. New tests cover the Codex config fallback, Codex
   fallback file names and its 32 KiB cut, Claude Code's import depth limit and
   `.claude/CLAUDE.md`, project and plugin skills, exact session numbers, auto memory's 25 KB
   cap, the default 30-day window and the size of SKILL.md.

@@ -119,4 +119,6 @@
 - Tests run cw.py in a fake home. setUp drops every `GIT_*` variable (a hook's `GIT_DIR` points
   git at another repo) and `XDG_CONFIG_HOME`; `mine()` drops the CLAUDE.md files a machine keeps
   above the temp folder. A log time's local day depends on `TZ`: build expected dates with
-  `astimezone()`.
+  `astimezone()`. `write()` writes text, so on Windows each `\n` becomes `\r\n`: a test that
+  counts bytes or tokens passes `exact=True`. To try that on macOS, give `write_text`
+  `newline="\r\n"`.
