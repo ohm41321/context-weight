@@ -55,7 +55,9 @@ class CwTest(unittest.TestCase):
         # which would point the fixtures' git commands at the caller's own repository, and a global
         # git ignore file under XDG_CONFIG_HOME can hide the fixtures' files.
         drop = ("CLAUDE_CONFIG_DIR", "CODEX_HOME", "OPENCODE_DISABLE_CLAUDE_CODE", "SLASH_COMMAND_TOOL_CHAR_BUDGET",
-                "BROWSER", "XDG_CONFIG_HOME")
+                "BROWSER", "XDG_CONFIG_HOME", "ANTHROPIC_MODEL", "CLAUDE_CODE_DISABLE_1M_CONTEXT", "DISABLE_COMPACT",
+                "CLAUDE_CODE_MAX_CONTEXT_TOKENS", "CLAUDE_CODE_ORGANIZATION_UUID", "CLAUDE_CODE_ACCOUNT_UUID",
+                "CLAUDE_CODE_DISABLE_POLICY_SKILLS", "CLAUDE_CODE_DISABLE_AUTO_MEMORY", "CLAUDE_CODE_PROJECT_DIR_NAME")
         self.env = {k: v for k, v in os.environ.items() if k not in drop and not k.startswith("GIT_")}
         self.env["HOME"] = str(self.home)
         self.env["USERPROFILE"] = str(self.home)  # Windows: expanduser reads USERPROFILE, not HOME
@@ -561,9 +563,10 @@ class CwTest(unittest.TestCase):
         write(self.home / ".claude" / "skills" / ".trash" / "SKILL.md", "---\nname: trash\n---\n")
         write(self.home / ".agents" / "skills" / "one" / "SKILL.md", "---\nname: one\ndescription: " + "e" * 600 + "\n---\n")
         res = self.cw_json("skills", str(self.repo), "--harness", "claude,codex", "--window", "10000")
-        self.assertEqual(res["claude"]["count"], 1)
-        self.assertEqual(res["claude"]["desc_chars"], 1_536)      # truncated in the listing
-        self.assertTrue(res["claude"]["over_budget"])             # budget 100 tokens
+        # Claude Code lists hidden folders too, .trash as "- .trash (trash): Skill"; Codex does not
+        self.assertEqual(res["claude"]["count"], 2)
+        self.assertEqual(res["claude"]["desc_chars"], 1_536 + 5)  # truncated in the listing
+        self.assertTrue(res["claude"]["over_budget"])             # budget 300 columns
         self.assertEqual(res["codex"]["count"], 1)
         self.assertTrue(res["codex"]["over_budget"])              # budget 200 tokens
 
@@ -577,6 +580,214 @@ class CwTest(unittest.TestCase):
             write(self.home / ".claude" / "settings.json", json.dumps({"enabledPlugins": {"tool@market": enabled}}))
             s = self.cw_json("skills", str(self.repo), "--harness", "claude")["claude"]
             self.assertEqual(sorted(h["name"] for h in s["heaviest"]), names, enabled)
+
+    def claude_listing(self, cwd=None, policy=None):
+        """Claude Code's listing, from cw.py in this process with this test's HOME and an empty
+        managed folder, or `policy`."""
+        cw = load_cw()
+        managed = Path(policy or self.tmp_path / "no-policy")
+        with mock.patch.dict(os.environ, self.env, clear=True), mock.patch.object(cw, "_policy_dir", lambda: managed):
+            return cw.claude_listing(str(cwd or self.repo))
+
+    def claude_lines(self, cwd=None, policy=None):
+        """The lines Claude Code would list, sorted."""
+        return sorted(e["line"] for e in self.claude_listing(cwd, policy)["entries"])
+
+    def plugin(self, name, version="1.0"):
+        """A plugin folder in Claude Code's cache, recorded as installed (enable it in settings)."""
+        root = self.home / ".claude" / "plugins" / "cache" / "market" / name / version
+        index = self.home / ".claude" / "plugins" / "installed_plugins.json"
+        known = json.loads(index.read_text()) if index.exists() else {"plugins": {}}
+        known["plugins"][f"{name}@market"] = [{"version": version}]
+        write(index, json.dumps(known))
+        return root
+
+    def test_claude_listing_lines_follow_claude_code(self):
+        sk = self.home / ".claude" / "skills"
+        write(sk / "alpha" / "SKILL.md", "---\nname: alpha\ndescription: Does <b>x</b>\nwhen_to_use: Use it\n---\nbody")
+        write(sk / "dir-name" / "SKILL.md", "---\nname: real-name\ndescription: hi\n---\n")
+        write(sk / "spaced" / "SKILL.md", "---\nname: Spaced Name\ndescription: hi\n---\n")
+        write(sk / "titled" / "SKILL.md", "---\nname: titled\n---\n\n# Big Title\ntext\n")
+        write(sk / "wordy" / "SKILL.md", "---\nname: wordy\n---\n" + "v" * 150 + "\n")
+        write(sk / "empty" / "SKILL.md", "---\nname: empty\n---\n")
+        write(sk / "long" / "SKILL.md", '---\ndescription: "' + "w" * 2_000 + '"\n---\n')
+        write(sk / "block" / "SKILL.md", "---\ndescription: |\n  one\n  two\n---\n")
+        write(sk / "quoted" / "SKILL.md", "---\ndescription: 'it''s fine' # a comment\n---\n")
+        write(sk / "plain" / "SKILL.md", "---\ndescription: plain text # not part\n---\n")
+        write(sk / "escaped" / "SKILL.md", '---\ndescription: "tab\\there, \\e[31mred\\e[0m"\n---\n')
+        write(sk / "thai" / "SKILL.md", "---\ndescription: \"ภาษา\\u200bไทย\"\n---\n")
+        write(sk / "dashes" / "SKILL.md", "---\ndescription: cut---here\nname: never read\n---\n")
+        write(sk / "synced" / "x" / "SKILL.md", "---\ndescription: a folder Claude Code keeps for synced skills\n---\n")
+        self.assertEqual(self.claude_lines(), sorted([
+            "- alpha: Does &lt;b&gt;x&lt;/b&gt; - Use it",        # when_to_use joins with " - "; < and > escaped
+            "- dir-name (real-name): hi",                       # listed by folder, the name in brackets
+            "- spaced: hi",                                     # a name with a space is not shown
+            "- titled: Big Title",                              # no description: the first line, # dropped
+            "- wordy: " + "v" * 97 + "...",                     # ... cut at 100 characters
+            "- empty: Skill",                                   # or nothing at all
+            "- long: " + "w" * 1_535 + "…",                # descriptions stop at 1,536 characters
+            "- block: one two",                                 # line breaks become spaces
+            "- quoted: it's fine",
+            "- plain: plain text",
+            "- escaped: tab here, red",                         # tabs become spaces, terminal codes go
+            "- thai: ภาษา ไทย",                                 # so does a zero-width space
+            "- dashes: cut",                                    # frontmatter ends at the first ---
+        ]))
+
+    def test_claude_listing_leaves_out_what_claude_code_hides(self):
+        sk = self.home / ".claude" / "skills"
+        for name, extra in (("manual", "disable-model-invocation: true"), ("manual2", 'disable-model-invocation: "yes"'),
+                            ("auto", "disable-model-invocation: false"), ("off", ""), ("menu", ""), ("terse", ""),
+                            ("scoped", "paths: src/**"), ("anywhere", 'paths: "**"'), ("on", "")):
+            write(sk / name / "SKILL.md", f"---\ndescription: hi\n{extra}\n---\n")
+        tool = self.plugin("tool")
+        write(tool / "skills" / "helper" / "SKILL.md", "---\ndescription: hi\n---\n")
+        write(tool / "skills" / "bare" / "SKILL.md", "---\nname: bare\n---\nbody line\n")
+        write(tool / "skills" / "when" / "SKILL.md", "---\nwhen_to_use: on Mondays\n---\nbody line\n")
+        write(self.home / ".claude" / "settings.json", json.dumps({
+            "enabledPlugins": {"tool@market": True},
+            "skillOverrides": {"off": "off", "menu": "user-invocable-only", "terse": "name-only", "on": "on",
+                               "tool:helper": "off"}}))
+        self.assertEqual(self.claude_lines(), sorted([
+            "- anywhere: hi", "- auto: hi", "- on: hi", "- terse",
+            "- tool:helper: hi",                # plugin skills ignore skillOverrides
+            "- tool:when: body line - on Mondays"]))  # a plugin skill needs a description or when_to_use
+        s = self.cw_json("skills", str(self.repo), "--harness", "claude")["claude"]
+        self.assertEqual(s["hidden"], {"disable-model-invocation": 2, "skillOverrides": 2, "paths": 1,
+                                       "no description": 1})
+
+    def test_claude_listing_reads_every_place_claude_code_does(self):
+        sub = self.repo / "pkg" / "app"
+        sub.mkdir(parents=True)
+        write(self.repo / ".claude" / "skills" / "root-skill" / "SKILL.md", "---\ndescription: r\n---\n")
+        write(self.repo / "pkg" / ".claude" / "skills" / "pkg-skill" / "SKILL.md", "---\ndescription: p\n---\n")
+        write(self.repo.parent / ".claude" / "skills" / "above" / "SKILL.md", "---\ndescription: a\n---\n")
+        cmds = self.home / ".claude" / "commands"
+        write(cmds / "review.md", "---\ndescription: Review it\n---\nbody\n")
+        write(cmds / "git" / "commit.md", "Commit the staged work\n")
+        write(cmds / "blank.md", "")
+        write(self.repo / ".claude" / "commands" / "deploy" / "SKILL.md", "---\ndescription: d\n---\n")
+        tool = self.plugin("tool")
+        write(tool / "commands" / "go.md", "---\ndescription: Go\n---\n")
+        write(tool / "commands" / "quiet.md", "no frontmatter\n")
+        solo = self.plugin("solo", "2.0")
+        write(solo / "SKILL.md", "---\nname: solo\ndescription: s\n---\n")
+        extra = self.plugin("extra")
+        write(extra / ".claude-plugin" / "plugin.json", json.dumps({"name": "extra", "skills": ["./more"]}))
+        write(extra / "more" / "deep" / "SKILL.md", "---\ndescription: e\n---\n")
+        write(self.home / ".claude" / "settings.json", json.dumps(
+            {"enabledPlugins": {"tool@market": True, "solo@market": True, "extra@market": True}}))
+        expected = ["- root-skill: r", "- pkg-skill: p", "- review: Review it", "- git:commit: Commit the staged work",
+                    "- blank: Custom command", "- deploy: d", "- tool:go: Go", "- solo:solo: s"]
+        self.assertEqual(self.claude_lines(sub), sorted(expected + ["- extra:deep: e"]))
+        # enabledPlugins merge per plugin: the project's false beats the user's true
+        write(self.repo / ".claude" / "settings.json", json.dumps({"enabledPlugins": {"extra@market": False}}))
+        self.assertEqual(self.claude_lines(sub), sorted(expected))
+
+    def test_claude_listing_keeps_plugin_order_and_one_skill_per_name(self):
+        zeta, alpha = self.plugin("zeta"), self.plugin("alpha")
+        write(zeta / "commands" / "go.md", "---\ndescription: the command\n---\n")
+        write(zeta / "skills" / "go" / "SKILL.md", "---\ndescription: the skill\n---\n")
+        write(zeta / "skills" / "two" / "SKILL.md", "---\ndescription: z\n---\n")
+        write(alpha / "skills" / "one" / "SKILL.md", "---\ndescription: a\n---\n")
+        write(self.home / ".claude" / "settings.json",
+              json.dumps({"enabledPlugins": {"zeta@market": True, "alpha@market": True}}))
+        got = self.claude_listing()
+        # Plugins in the order settings name them, every plugin's commands before the skills;
+        # a second entry with a name already listed is not listed
+        self.assertEqual([e["line"] for e in got["entries"]], ["- zeta:go: the command", "- zeta:two: z", "- alpha:one: a"])
+        self.assertEqual(got["hidden"], {"same name": 1})
+
+    def test_claude_listing_reads_the_managed_folder(self):
+        policy = self.tmp_path / "policy"
+        write(policy / ".claude" / "skills" / "corp" / "SKILL.md", "---\ndescription: c\n---\n")
+        write(policy / ".claude" / "commands" / "audit.md", "---\ndescription: a\n---\n")
+        self.assertEqual(self.claude_lines(policy=policy), ["- audit: a", "- corp: c"])
+        self.env["CLAUDE_CODE_DISABLE_POLICY_SKILLS"] = "0"  # read as a yes or no, like Claude Code
+        self.assertEqual(self.claude_lines(policy=policy), ["- audit: a", "- corp: c"])
+        self.env["CLAUDE_CODE_DISABLE_POLICY_SKILLS"] = "1"  # managed skills off; managed commands stay
+        self.assertEqual(self.claude_lines(policy=policy), ["- audit: a"])
+
+    def test_claude_listing_in_a_worktree_reads_the_main_checkout(self):
+        write(self.repo / ".claude" / "skills" / "kept" / "SKILL.md", "---\ndescription: k\n---\n")
+        gitdir = self.repo / ".git" / "worktrees" / "wt"
+        write(gitdir / "commondir", "../..\n")
+        wt = self.tmp_path / "work" / "wt"
+        write(wt / ".git", f"gitdir: {gitdir}\n")
+        self.assertEqual(self.claude_lines(wt), ["- kept: k"])
+        write(wt / ".claude" / "skills" / "own" / "SKILL.md", "---\ndescription: o\n---\n")
+        self.assertEqual(self.claude_lines(wt), ["- own: o"])  # it has its own skills folder
+
+    def test_claude_listing_counts_the_account_synced_skills(self):
+        base = self.home / ".claude" / "skills" / "synced"
+        write(base / "org-1_acct-1" / "pdf" / "SKILL.md", "---\ndescription: p\n---\n")
+        write(base / "org-1_unbound" / "docx" / "SKILL.md", "---\ndescription: d\n---\n")
+        write(base / "org-2_acct-9" / "xlsx" / "SKILL.md", "---\ndescription: x\n---\n")
+        self.assertEqual(self.claude_lines(), [])  # no account: none of them
+        write(self.home / ".claude.json", json.dumps({"oauthAccount": {"organizationUuid": "ORG-1", "accountUuid": "ACCT-1"}}))
+        self.assertEqual(self.claude_lines(), ["- anthropic-skills:pdf: p"])
+        write(self.home / ".claude.json", json.dumps({"oauthAccount": {"organizationUuid": "org-1"}}))
+        self.assertEqual(self.claude_lines(), ["- anthropic-skills:docx: d"])
+
+    def test_claude_budget_follows_the_model(self):
+        write(self.home / ".claude" / "skills" / "one" / "SKILL.md", "---\ndescription: hi\n---\n")
+
+        def budget(*args):
+            s = self.cw_json("skills", str(self.repo), "--harness", "claude", *args)["claude"]
+            return s["budget"], s["window"], s["chars_per_token"], s["model"], s["window_source"]
+
+        # Nothing says which model: today's default, a 1M window at 3 characters per token.
+        self.assertEqual(budget(), (30_000, 1_000_000, 3, None, "assumed"))
+        settings = self.home / ".claude" / "settings.json"
+        write(settings, json.dumps({"model": "claude-haiku-4-5-20251001"}))
+        self.assertEqual(budget(), (8_000, 200_000, 4, "claude-haiku-4-5-20251001", "model"))
+        write(settings, json.dumps({"model": "claude-sonnet-4-6[1m]"}))
+        self.assertEqual(budget(), (40_000, 1_000_000, 4, "claude-sonnet-4-6[1m]", "model"))
+        self.env["ANTHROPIC_MODEL"] = "claude-new-9"   # beats settings; unknown: 200k at 3
+        self.assertEqual(budget(), (6_000, 200_000, 3, "claude-new-9", "model"))
+        del self.env["ANTHROPIC_MODEL"]
+        write(settings, json.dumps({"model": "opus"}))  # an alias names no model
+        self.assertEqual(budget(), (30_000, 1_000_000, 3, None, "assumed"))
+        write(self.home / ".claude" / "projects" / "-elsewhere" / "a.jsonl", json.dumps(
+            {"type": "assistant", "cwd": str(self.tmp_path), "requestedModel": "claude-opus-4-1",
+             "message": {"id": "a", "model": "claude-opus-4-1"}}) + "\n")
+        self.assertEqual(budget()[:4], (8_000, 200_000, 4, "claude-opus-4-1"))  # another project's last session
+        log = self.home / ".claude" / "projects" / "-repo" / "b.jsonl"
+        write(log, json.dumps({"type": "assistant", "cwd": str(self.repo), "requestedModel": "claude-opus-5-5",
+                               "message": {"id": "b", "model": "claude-opus-5-5"}}) + "\n")
+        os.utime(log, (1, 1))  # older, but from this project
+        self.assertEqual(budget(), (30_000, 1_000_000, 3, "claude-opus-5-5", "model"))
+        self.assertEqual(budget("--window", "400000")[:2], (12_000, 400_000))
+        write(settings, json.dumps({"env": {"CLAUDE_CODE_DISABLE_1M_CONTEXT": "1"}}))
+        self.assertEqual(budget()[:2], (6_000, 200_000))
+        write(settings, json.dumps({"env": {"DISABLE_COMPACT": "1", "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "50000"}}))
+        self.assertEqual(budget()[:2], (1_500, 50_000))
+        write(settings, json.dumps({"env": {"SLASH_COMMAND_TOOL_CHAR_BUDGET": "12k"}}))  # read as Claude Code does: 12
+        self.assertEqual(budget()[0], 12)
+
+    def test_claude_listing_over_budget_says_how_many_lose_descriptions(self):
+        sk = self.home / ".claude" / "skills"
+        for name, size in (("aa", 100), ("bb", 200), ("cc", 300)):
+            write(sk / name / "SKILL.md", f"---\ndescription: {'d' * size}\n---\n")
+        # Lines of 106, 206 and 306 columns and two line breaks: 620. A line that loses its
+        # description is "- aa", 4 columns.
+        for budget, losing in (("1000", []), ("400", ["cc"]), ("300", ["bb", "cc"]), ("10", ["aa", "bb", "cc"])):
+            self.env["SLASH_COMMAND_TOOL_CHAR_BUDGET"] = budget
+            s = self.cw_json("skills", str(self.repo), "--harness", "claude")["claude"]
+            self.assertEqual((s["used"], s["over_budget"], s["lose_descriptions"], s["losing_descriptions"]),
+                             (620, bool(losing), len(losing), losing), budget)
+        # Descriptions go back to the most used first, by Claude Code's record: cc ran today
+        now = dt.datetime.now(dt.timezone.utc).timestamp() * 1000
+        write(self.home / ".claude.json", json.dumps({"skillUsage": {"cc": {"usageCount": 3, "lastUsedAt": now}}}))
+        self.env["SLASH_COMMAND_TOOL_CHAR_BUDGET"] = "400"
+        s = self.cw_json("skills", str(self.repo), "--harness", "claude")["claude"]
+        self.assertEqual(s["losing_descriptions"], ["aa", "bb"])
+
+    def test_listing_width_counts_columns_as_claude_code(self):
+        cw = load_cw()
+        for text, cols in (("abc", 3), ("กิน", 2), ("漢字", 4), ("👍🏽", 2), ("🇹🇭", 2), ("é", 1),
+                           ("❤️", 2), ("1️⃣", 2), ("👨‍👩‍👧", 2), ("​", 0), ("a\tb", 2)):
+            self.assertEqual(cw.str_width(text), cols, ascii(text))
 
     # ------------------------------------------------------------------ sessions
     def _claude_log(self, name, cwd, ts, ctxs, dup_first=0, creation=0):
@@ -1407,8 +1618,8 @@ class CwTest(unittest.TestCase):
         rep = {"project": bad, "since": "2026-01-01", "days": 30, "target": 5000, "sessions": {},
                "files": {"claude": {"files": [{"path": bad + "/CLAUDE.md", "role": "project", "tokens": 9000}],
                                     "total_tokens": 9000, "repo_tokens": 9000, "warnings": [], "notes": []}},
-               "skills": {"claude": {"budget": 8000, "budget_unit": "chars", "chars": 8320, "tokens": 2000,
-                                     "window_source": "window"}},
+               "skills": {"claude": {"budget": 8000, "budget_unit": "chars", "chars": 8320, "used": 8320,
+                                     "tokens": 2000, "window_source": "--window"}},
                "findings": ["[claude] odd \x03 character"]}
         out = cw.write_picture(rep, str(self.tmp_path / "odd.svg"), "auto")
         _, texts = self._svg_texts(out)
@@ -1786,7 +1997,7 @@ class CwTest(unittest.TestCase):
         r = self.cw_json("files", str(self.repo), "--harness", "claude")["claude"]
         self.assertEqual(self.mine(r["files"]), [])
         s = self.cw_json("skills", str(self.repo), "--harness", "claude")["claude"]
-        self.assertEqual([h["name"] for h in s["heaviest"]], ["real-name"])
+        self.assertEqual([h["name"] for h in s["heaviest"]], ["dir-name (real-name)"])
 
     @unittest.skipIf(os.name == "nt" or (hasattr(os, "geteuid") and os.geteuid() == 0), "needs POSIX permissions")
     def test_unreadable_folder_does_not_crash(self):
@@ -1874,15 +2085,15 @@ class CwTest(unittest.TestCase):
                 "model_context_window": 400_000}}}])
         s = self.cw_json("skills", str(self.repo), "--harness", "claude,codex")
         self.assertEqual(s["codex"]["budget"], 8_000)              # 2% of the window Codex reported
-        self.assertEqual(s["claude"]["window_source"], "default")  # no window in Claude logs: assumed
+        self.assertEqual(s["claude"]["window_source"], "assumed")  # no model in Claude logs or settings
         s = self.cw_json("skills", str(self.repo), "--harness", "claude,codex", "--window", "1000000")
-        # Claude Code budgets the listing in characters: 1% of the window at ~4 chars per token
-        self.assertEqual((s["claude"]["budget"], s["claude"]["budget_unit"]), (40_000, "chars"))
+        # Claude Code budgets the listing in columns: 1% of the window at 3 characters per token
+        self.assertEqual((s["claude"]["budget"], s["claude"]["budget_unit"]), (30_000, "chars"))
         # Codex records its own window; --window must not override it (it once did: 20,000)
         self.assertEqual((s["codex"]["budget"], s["codex"]["budget_unit"]), (8_000, "tokens"))
         self.assertEqual(s["codex"]["window_source"], "codex logs")
         write(self.home / ".claude" / "settings.json", json.dumps({"skillListingBudgetFraction": 0.02}))
-        self.assertEqual(self.cw_json("skills", str(self.repo), "--harness", "claude")["claude"]["budget"], 16_000)
+        self.assertEqual(self.cw_json("skills", str(self.repo), "--harness", "claude")["claude"]["budget"], 60_000)
         self.env["SLASH_COMMAND_TOOL_CHAR_BUDGET"] = "123456"
         s = self.cw_json("skills", str(self.repo), "--harness", "claude")["claude"]
         self.assertEqual((s["budget"], s["basis"]), (123_456, "SLASH_COMMAND_TOOL_CHAR_BUDGET"))

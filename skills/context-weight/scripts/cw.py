@@ -27,6 +27,7 @@ import datetime as dt
 import errno
 import glob
 import json
+import math
 import os
 import posixpath
 import re
@@ -47,12 +48,11 @@ CLAUDE_FILE_WARN_CHARS = 40_000   # Claude Code startup warning: "Large CLAUDE.m
 CLAUDE_FILE_LINES = 200           # Claude Code docs: target under 200 lines per CLAUDE.md
 CLAUDE_IMPORT_DEPTH = 4           # Claude Code docs: imports recurse at most four hops
 CLAUDE_DESC_CAP = 1_536           # Claude Code: description + when_to_use truncated in the listing
-CLAUDE_LISTING_FRACTION = 0.01    # Claude Code: skill listing gets 1% of the context window, in characters
-CHARS_PER_WINDOW_TOKEN = 4        # 1% of a 200k window = the 8,000-character fallback older docs gave
+CLAUDE_LISTING_FRACTION = 0.01    # Claude Code: skill listing gets 1% of the window, in columns
+CLAUDE_WINDOW, CLAUDE_1M = 200_000, 1_000_000  # Claude Code: a model's window, and the 1M one
 CODEX_DOC_MAX_DEFAULT = 32 * 1024 # Codex: project_doc_max_bytes default
 CODEX_LISTING_FRACTION = 0.02     # Codex: skill listing gets 2% of the context window
 CODEX_LISTING_FALLBACK_CHARS = 8_000  # Codex: listing budget when the window is unknown
-DEFAULT_WINDOW = 200_000          # assumed when neither --window nor a log gives the window
 FINDING_MIN_CUT = 2_000           # a finding needs repo instructions this far above --target
 EXIT_OK, EXIT_FAIL, EXIT_USAGE = 0, 1, 2
 
@@ -701,6 +701,1336 @@ def scan_files(cwd, harnesses, copy_root=None, claude_md_outside=False, mode=Non
 
 
 # --------------------------------------------------------------------------- skills
+#
+# Claude Code's skill listing follows its 2.1.322 build, read on 2026-11-12: which skills it
+# lists, the line it writes for each, and the budget those lines must fit
+# (references/harnesses.md). It is JavaScript, so the helpers below parse, clean, cut and
+# measure text as its JavaScript does.
+
+_JS_WS = ("\t\n\v\f\r \u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a"
+          "\u2028\u2029\u202f\u205f\u3000\ufeff")  # what String.prototype.trim and \s take
+_JS_S = r"[\t\n\v\f\r \u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff]"
+_JS_NS = r"[^\t\n\v\f\r \u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff]"
+_JS_DOT = r"[^\n\r\u2028\u2029]"
+
+
+def _len16(s: str) -> int:
+    """Length as JavaScript counts it, in UTF-16 units."""
+    return len(s) + sum(1 for c in s if c > "\uffff")
+
+
+def _cut16(s: str, n: int, split: str = "") -> str:
+    """s.slice(0, n) in UTF-16 units. An astral character cut in half leaves `split`."""
+    if n <= 0:
+        return ""
+    if _len16(s) == len(s):
+        return s[:n]
+    out, used = [], 0
+    for c in s:
+        used += 2 if c > "\uffff" else 1
+        if used > n:
+            if used - n == 1 and c > "\uffff":
+                out.append(split)
+            break
+        out.append(c)
+    return "".join(out)
+
+
+def _cap16(text: str, cap: int) -> str:
+    """Claude Code's cut of a long description: cap - 1 units and an ellipsis."""
+    return _cut16(text, cap - 1) + "\u2026" if _len16(text) > cap else text
+
+
+def _js_num(x) -> str:
+    """String(x) for a JavaScript number."""
+    try:
+        f = float(x)
+    except OverflowError:
+        f = math.inf if x > 0 else -math.inf
+    if f != f:
+        return "NaN"
+    if math.isinf(f):
+        return "Infinity" if f > 0 else "-Infinity"
+    if f == 0:
+        return "0"
+    mant, _, exp = repr(abs(f)).partition("e")
+    whole, _, frac = mant.partition(".")
+    digits = (whole + frac).lstrip("0")
+    n = len(whole) - (len(whole + frac) - len(digits)) + int(exp or 0)  # value = 0.digits × 10^n
+    digits = digits.rstrip("0")
+    k = len(digits)
+    if k <= n <= 21:
+        s = digits + "0" * (n - k)
+    elif 0 < n <= 21:
+        s = digits[:n] + "." + digits[n:]
+    elif -6 < n <= 0:
+        s = "0." + "0" * -n + digits
+    else:
+        s = digits[0] + ("." + digits[1:] if k > 1 else "") + "e" + ("-" if n < 1 else "+") + str(abs(n - 1))
+    return ("-" if f < 0 else "") + s
+
+
+def _js_str(v) -> str:
+    """String(v) for a value Bun's YAML parser returns."""
+    if v is None:
+        return "null"
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, (int, float)):
+        return _js_num(v)
+    if isinstance(v, list):
+        return ",".join("" if x is None else _js_str(x) for x in v)
+    if isinstance(v, dict):
+        return "[object Object]"
+    return str(v)
+
+
+def _js_number(v) -> float:
+    """Number(v), or parseInt(v) where that is NaN, as Claude Code reads a number from the
+    environment: "12k" is 12."""
+    if v is None:
+        return math.nan
+    s = str(v).strip(_JS_WS)
+    if not s:
+        return 0.0
+    if re.match(r"[+-]?(?:Infinity|(?:[0-9]+\.?[0-9]*|\.[0-9]+)(?:[eE][+-]?[0-9]+)?)\Z", s):
+        return float(s.replace("Infinity", "inf"))
+    m = re.match(r"0([xXoObB])([0-9a-fA-F]+)\Z", s)
+    if m:
+        try:
+            return float(int(m.group(2), {"x": 16, "o": 8, "b": 2}[m.group(1).lower()]))
+        except ValueError:
+            return math.nan
+    m = re.match(r"[+-]?[0-9]+", s)
+    return float(m.group(0)) if m else math.nan
+
+
+def _env_on(v) -> bool:
+    return isinstance(v, str) and v.strip().lower() in _ENV_ON
+
+
+def _flag(v) -> bool | None:
+    """A yes-or-no frontmatter field as Claude Code reads it: a boolean, or 1, true, yes, on and
+    0, false, no, off in any case; anything else is unset."""
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (str, int, float)):
+        s = _js_str(v).strip(_JS_WS).lower()
+        if s in _ENV_ON:
+            return True
+        if s in _ENV_OFF:
+            return False
+    return None
+
+
+def _given(v) -> str | None:
+    """A description as Claude Code takes it from frontmatter: text trimmed, a number or a
+    boolean as text; empty, or anything else, gives none."""
+    if isinstance(v, str):
+        return v.strip(_JS_WS) or None
+    if isinstance(v, (bool, int, float)):
+        return _js_str(v)
+    return None
+
+
+_HEADING = re.compile("#+" + _JS_S + "+(" + _JS_NS + _JS_DOT + r"*)\Z")
+
+
+def _first_line(body: str, default: str) -> str:
+    """Claude Code's description for a skill that gives none: the first line of its text, a
+    heading's # dropped, cut at 100 characters; with no text, `default`."""
+    for line in body.split("\n"):
+        t = line.strip(_JS_WS)
+        if t:
+            m = _HEADING.match(t)
+            if m:
+                t = m.group(1)
+            return _cut16(t, 97, "\u200b") + "..." if _len16(t) > 100 else t
+    return default
+
+
+# Columns, as Bun.stringWidth(text, {ambiguousIsNarrow: true}) counts them (Bun 1.4.4, which
+# Claude Code 2.1.322 runs), from unicodedata alone: no table to keep up to date.
+_ZERO_WIDTH = ((0x1160, 0x11FF), (0xD7B0, 0xD7FF), (0x200B, 0x200F), (0x202A, 0x202E), (0x2060, 0x206F),
+               (0x1BCA0, 0x1BCA3), (0x1D173, 0x1D17A), (0x180B, 0x180F), (0x1AB0, 0x1AFF), (0x20D0, 0x20FF),
+               (0xD800, 0xDFFF), (0x600, 0x605), (0xE0000, 0xE007F))
+_WIDE_FREE = ((0x3400, 0x4DBF), (0x4E00, 0x9FFF), (0xF900, 0xFAFF), (0x20000, 0x2FFFD), (0x30000, 0x3FFFD),
+              (0x1F300, 0x1F64F), (0x1F680, 0x1F6FF), (0x1F7E0, 0x1F7FF), (0x1F900, 0x1F9FF), (0x1FA70, 0x1FAFF))
+
+
+def _cp_width(cp: int) -> int:
+    """Bun's width of one code point: 0 for controls, marks and invisible format characters
+    (its rules, with an Indic vowel-sign heuristic), 2 for East Asian Wide and Fullwidth, else 1."""
+    if cp < 0x20 or 0x7F <= cp <= 0x9F or cp in (0xAD, 0x61C, 0x6DD, 0x70F, 0x8E2, 0xFEFF):
+        return 0
+    if cp < 0x300:
+        return 1
+    if 0x900 <= cp <= 0xD4F:
+        o = cp & 0x7F
+        if o <= 2 or 0x3A <= o <= 0x4D and o != 0x3D or 0x51 <= o <= 0x57 or 0x62 <= o <= 0x63:
+            return 0
+    cat = unicodedata.category(chr(cp))
+    if cat in ("Mn", "Me") or any(a <= cp <= b for a, b in _ZERO_WIDTH):
+        return 0
+    if cat == "Cn":
+        # newer than this Python's Unicode: the blocks whose free code points East Asian Width
+        # counts wide (the CJK ones), and the emoji blocks, where new emoji go
+        return 2 if any(a <= cp <= b for a, b in _WIDE_FREE) else 1
+    return 2 if unicodedata.east_asian_width(chr(cp)) in ("W", "F") else 1
+
+
+def _pictograph(cp: int) -> bool:
+    """Roughly the code points emoji are made of: symbols from U+203C up and the emoji planes,
+    without the regional indicators and skin tones, which are not bases."""
+    return cp in (0xA9, 0xAE, 0x3030, 0x303D, 0x3297, 0x3299) or 0x203C <= cp < 0x2C00 or \
+        0x1F000 <= cp < 0x20000 and not 0x1F1E6 <= cp <= 0x1F1FF and not 0x1F3FB <= cp <= 0x1F3FF
+
+
+def str_width(text: str) -> int:
+    """Columns `text` takes in a terminal, as Claude Code measures its skill listing."""
+    if text.isascii():
+        return sum(1 for c in text if " " <= c < "\x7f")
+    total = cur = 0  # cur: the width of the character being built (a grapheme cluster)
+    emoji = joined = False  # it is an emoji; a zero width joiner ends it
+    for ch in text:
+        cp = ord(ch)
+        if emoji and (cp == 0xFE0F or 0x1F3FB <= cp <= 0x1F3FF or cp == 0x200D):
+            total += 2 - cur  # emoji presentation, a skin tone or a joiner: an emoji, two columns
+            cur, joined = 2, cp == 0x200D
+            continue
+        if joined and _pictograph(cp):
+            joined = False  # joined into the emoji before it
+            continue
+        w = _cp_width(cp)
+        if w == 0:
+            if cp == 0x20E3 and cur == 1:
+                total, cur = total + 1, 2  # a keycap
+            continue
+        total, cur, emoji, joined = total + w, w, _pictograph(cp), False
+    return total
+
+
+# Claude Code cleans each description before listing it: terminal codes go, each run of hidden
+# characters becomes one space (joiners inside an emoji or an Indic conjunct stay), and < and >
+# are escaped.
+_ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[PX^_][^\x1b]*\x1b\\"
+                   r"|\x1b[@-Z\\-_]|\x9b[0-?]*[ -/]*[@-~]")
+_JOINERS = re.compile("[\u200c\u200d\ufe0f\U000e007f]")
+_IGNORABLE = ((0xAD, 0xAD), (0x34F, 0x34F), (0x61C, 0x61C), (0x115F, 0x1160), (0x17B4, 0x17B5),
+              (0x180B, 0x180F), (0x200B, 0x200F), (0x202A, 0x202E), (0x2060, 0x206F), (0x3164, 0x3164),
+              (0xFE00, 0xFE0F), (0xFEFF, 0xFEFF), (0xFFA0, 0xFFA0), (0xFFF0, 0xFFF8), (0x1BCA0, 0x1BCA3),
+              (0x1D173, 0x1D17A), (0xE0000, 0xE0FFF))  # Default_Ignorable_Code_Point
+_INDIC = (0x900, 0x980, 0xA80, 0xB00, 0xC00, 0xC80, 0xD00)  # blocks whose conjuncts take joiners
+
+
+def _hidden(cp: int) -> bool:
+    """A character Claude Code does not let through: controls, format characters, surrogates,
+    private use, unassigned code points, line and paragraph separators, default ignorables and
+    the blank braille pattern."""
+    if cp < 0x80:
+        return cp < 0x20 or cp == 0x7F
+    if cp in (0x2028, 0x2029, 0x2800) or any(a <= cp <= b for a, b in _IGNORABLE):
+        return True
+    return unicodedata.category(chr(cp)) in ("Cc", "Cf", "Cs", "Co", "Cn")
+
+
+def _indic_joiner(s: str, k: int) -> bool:
+    """The joiner at s[k] sits between two consonants, the first with a virama (and maybe a
+    nukta): it shapes a conjunct."""
+    if not 1 <= k < len(s) - 1:
+        return False
+    before, after = ord(s[k - 1]), ord(s[k + 1])
+    for e in _INDIC:
+        if before == e + 0x4D and e + 0x15 <= after <= e + 0x39:
+            b = k - 2
+            if b >= 0 and e != 0xD00 and ord(s[b]) == e + 0x3C:
+                b -= 1
+            if b >= 0 and e + 0x15 <= ord(s[b]) <= e + 0x39:
+                return True
+    return s[k] == "\u200d" and before == 0xDCA and 0xD9A <= after <= 0xDC6 and k >= 2 \
+        and 0xD9A <= ord(s[k - 2]) <= 0xDC6  # Sinhala
+
+
+def _kept_joiners(s: str) -> set:
+    """Indexes of the joiners Claude Code keeps, approximately: U+FE0F giving a text-style
+    pictograph or a keycap emoji presentation, U+200D between pictographs, the tags of a flag,
+    and a joiner inside an Indic conjunct."""
+    keep = set()
+    for k, ch in enumerate(s):
+        cp = ord(ch)
+        if cp == 0xFE0F and k:
+            prev = ord(s[k - 1])
+            if _pictograph(prev) and _cp_width(prev) == 1 or \
+                    s[k - 1] in "#*0123456789" and s[k + 1:k + 2] == "\u20e3":
+                keep.add(k)
+        elif cp in (0x200C, 0x200D):
+            b = k - 1
+            while b >= 0 and (s[b] == "\ufe0f" or 0x1F3FB <= ord(s[b]) <= 0x1F3FF):
+                b -= 1
+            if cp == 0x200D and b >= 0 and _pictograph(ord(s[b])) and k + 1 < len(s) and \
+                    _pictograph(ord(s[k + 1])) or _indic_joiner(s, k):
+                keep.add(k)
+        elif 0xE0020 <= cp <= 0xE007F:
+            b = k - 1
+            while b >= 0 and 0xE0020 <= ord(s[b]) <= 0xE007E:
+                b -= 1
+            if b >= 0 and ord(s[b]) == 0x1F3F4:
+                keep.add(k)
+    return keep
+
+
+def _cc_clean(text: str) -> str:
+    """A description as Claude Code lists it."""
+    s = "".join("\u200b" if "\ud800" <= c <= "\udfff" else c for c in text)
+    s = _ANSI.sub("", s)
+    keep = _kept_joiners(s) if _len16(s) <= 4096 and _JOINERS.search(s) else set()
+    out, run = [], None
+    for k, ch in enumerate(s):
+        if _hidden(ord(ch)):
+            if run is None:
+                run = []
+            if k in keep:
+                run.append(ch)
+            elif not run or run[-1] != " ":
+                run.append(" ")
+            continue
+        if run is not None:
+            out += run
+            run = None
+        out.append(ch)
+    if run is not None:
+        out += run
+    return "".join(out).replace("<", "&lt;").replace(">", "&gt;")
+
+
+_NAME_EDGES = re.compile(r"(?:^|:) | (?::|$)|^:|:$")
+_NAME_BLANKS = re.compile("[\u00a0\u1680\u2000-\u200a\u202f\u205f\u3000\ufffc\U0001d159\U00013441\U00013442"
+                          "\U00016910\U00016fe4]")
+
+
+def _cc_name_ok(name: str) -> bool:
+    """Claude Code's rule for the names it offers, approximately: at most 256 characters, no
+    hidden, direction-changing or blank-like characters but single spaces between words, no <
+    or >, no combining mark with nothing to sit on, and no space or colon at either end or
+    beside a colon. A refused skill is not loaded at all."""
+    if not name or _len16(name) > 256 or "<" in name or ">" in name or "  " in name or "\u20e3" in name:
+        return False
+    if _NAME_EDGES.search(name) or _NAME_BLANKS.search(name) or re.search("\ufe0f[\U0001f3fb-\U0001f3ff]", name):
+        return False
+    keep = _kept_joiners(name)
+    if any(_hidden(ord(c)) and k not in keep for k, c in enumerate(name)):
+        return False
+    marks = 0
+    for k, c in enumerate(name):
+        if unicodedata.category(c)[0] == "M" or 0x1160 <= ord(c) <= 0x11FF or 0xD7B0 <= ord(c) <= 0xD7FF:
+            if marks == 0 and (k == 0 or unicodedata.category(name[k - 1])[0] not in "LNM"):
+                return False
+            marks += 1
+            if marks >= 9:
+                return False
+        else:
+            marks = 0
+    return True
+
+
+class _YamlError(ValueError):
+    """YAML that Bun's parser refuses."""
+
+
+_Y_ESC = {"0": "\0", "a": "\a", "b": "\b", "t": "\t", "\t": "\t", "n": "\n", "v": "\v", "f": "\f", "r": "\r",
+          "e": "\x1b", " ": " ", '"': '"', "/": "/", "\\": "\\", "N": "\x85", "_": "\xa0", "L": "\u2028",
+          "P": "\u2029"}
+_Y_HEX = {"x": 2, "u": 4, "U": 8}
+_Y_COLON = re.compile(r":(?:[ \t]|\Z)")
+_Y_COMMENT = re.compile(r"[ \t]#")
+_Y_FLOW_STOP = re.compile(r"[,\[\]{}]|:(?=[ \t,\[\]{}]|\Z)|[ \t]+#|\Z")
+
+
+def _y_resolve(s: str):
+    """A plain value as YAML 1.2's core schema reads it."""
+    if s in ("", "~", "null", "Null", "NULL"):
+        return None
+    if s in ("true", "True", "TRUE"):
+        return True
+    if s in ("false", "False", "FALSE"):
+        return False
+    if re.match(r"[-+]?[0-9]+\Z", s):
+        return int(s)
+    if re.match(r"0o[0-7]+\Z", s):
+        return int(s[2:], 8)
+    if re.match(r"0x[0-9a-fA-F]+\Z", s):
+        return int(s[2:], 16)
+    if re.match(r"[-+]?(?:\.[0-9]+|[0-9]+(?:\.[0-9]*)?)(?:[eE][-+]?[0-9]+)?\Z", s):
+        return float(s)
+    if re.match(r"[-+]?\.(?:inf|Inf|INF)\Z", s):
+        return -math.inf if s[0] == "-" else math.inf
+    if re.match(r"\.(?:nan|NaN|NAN)\Z", s):
+        return math.nan
+    return s
+
+
+class _Yaml:
+    """Enough YAML for skill frontmatter, read as Bun.YAML.parse reads it: block mappings and
+    lists, plain, quoted and block values, flow lists and mappings, comments, anchors and
+    aliases, and the core schema's null, booleans and numbers. What Bun refuses (a colon and
+    space in a plain value, a tab as indentation, a stray quote) raises _YamlError."""
+
+    def __init__(self, text: str):
+        self.lines = text.replace("\r\n", "\n").split("\n")
+        self.i = 0
+        self.anchors: dict = {}
+        self.at = [0, 0]  # the cursor in a flow collection: line, column
+
+    def parse(self):
+        if self._next() is None:
+            return None
+        value = self._node(-1)
+        if self._next() is not None:
+            raise _YamlError("more after the document")
+        return value
+
+    # lines
+    def _next(self):
+        """The next line with content, past blank lines and comments; None at the end."""
+        while self.i < len(self.lines):
+            t = self.lines[self.i].strip(" \t")
+            if t and not t.startswith("#"):
+                return self.i
+            self.i += 1
+        return None
+
+    def _head(self, i):
+        """(indentation, text) of line i."""
+        raw = self.lines[i]
+        text = raw.lstrip(" ")
+        if text.startswith("\t"):
+            raise _YamlError("a tab as indentation")
+        return len(raw) - len(text), text
+
+    def _rest_is_empty(self, j, k):
+        rest = self.lines[j][k:]
+        t = rest.lstrip(" \t")
+        if t and not (t.startswith("#") and len(t) < len(rest)):
+            raise _YamlError("more after a value")
+
+    @staticmethod
+    def _is_item(text):
+        return text == "-" or text.startswith(("- ", "-\t"))
+
+    # block nodes
+    def _node(self, parent):
+        """The block node on the next content line, which must be indented past `parent`."""
+        i = self._next()
+        if i is None:
+            return None
+        n, text = self._head(i)
+        if n <= parent:
+            return None
+        if self._is_item(text):
+            return self._seq(n)
+        if self._key(text) is not None:
+            return self._map(n)
+        return self._value(i, n, parent)
+
+    def _key(self, text):
+        """(key, the text after its colon) when `text` opens a mapping entry, else None."""
+        if self._is_item(text):
+            return None
+        if text[0] in "\"'":
+            try:
+                key, end, _, _ = self._scan(text, 1, text[0])
+            except _YamlError:
+                return None
+            t = text[end:].lstrip(" \t") if end is not None else ""
+            if t.startswith(":") and (len(t) == 1 or t[1] in " \t"):
+                return key, t[1:]
+            return None
+        if text[0] in "[]{},&*!|>%@`#" or text.startswith(("? ", "?\t")) or text == "?":
+            return None
+        m = _Y_COLON.search(text)
+        if not m or _Y_COMMENT.search(text[:m.start()]):
+            return None
+        return _js_str(_y_resolve(text[:m.start()].rstrip(" \t"))), text[m.start() + 1:]
+
+    def _map(self, n):
+        out: dict = {}
+        while True:
+            i = self._next()
+            if i is None:
+                break
+            m, text = self._head(i)
+            if m < n:
+                break
+            if m > n:
+                raise _YamlError("an entry indented too far")
+            kv = self._key(text)
+            if kv is None:
+                raise _YamlError("an entry without a key")
+            if kv[0] in out:
+                raise _YamlError("a key given twice")
+            out[kv[0]] = self._after_colon(i, n, kv[1])
+        return out
+
+    def _after_colon(self, i, n, rest):
+        """The value of the entry on line i, indented n; `rest` follows its colon."""
+        s = rest.lstrip(" \t")
+        if s and not s.startswith("#"):
+            return self._value(i, len(self.lines[i]) - len(s), n)
+        self.i = i + 1
+        j = self._next()
+        if j is not None:
+            m, text = self._head(j)
+            if m == n and self._is_item(text):
+                return self._seq(n)  # a list may sit level with its key
+        return self._node(n)
+
+    def _seq(self, n):
+        out = []
+        while True:
+            i = self._next()
+            if i is None:
+                break
+            m, text = self._head(i)
+            if m < n or m == n and not self._is_item(text):
+                break
+            if m > n or not self._is_item(text):
+                raise _YamlError("an item indented too far")
+            s = text[1:].lstrip(" \t")
+            if not s or s.startswith("#"):
+                self.i = i + 1
+                out.append(self._node(n))
+                continue
+            col = len(self.lines[i]) - len(s)
+            self.lines[i] = " " * col + s  # the item's node starts where its text does
+            out.append(self._node(n))
+        return out
+
+    def _value(self, i, col, parent, resolve=True):
+        """The value at column `col` of line i: lines it goes on to must be indented past
+        `parent`."""
+        line = self.lines[i]
+        c = line[col]
+        if c in "&!*":
+            k = col + 1
+            while k < len(line) and line[k] not in " \t,[]{}":
+                k += 1
+            mark = line[col:k]
+            if c == "*":
+                if mark[1:] not in self.anchors:
+                    raise _YamlError("an alias to no anchor")
+                self._rest_is_empty(i, k)
+                self.i = i + 1
+                return self.anchors[mark[1:]]
+            rest = line[k:].lstrip(" \t")
+            if not rest or rest.startswith("#"):
+                self.i = i + 1
+                v = self._node(parent)
+            else:
+                v = self._value(i, len(line) - len(rest), parent, resolve and mark != "!!str")
+            if c == "&":
+                self.anchors[mark[1:]] = v
+            return v
+        if c in "|>":
+            return self._block(i, col, parent)
+        if c in "\"'":
+            v, j, k = self._quoted(i, col)
+            self._rest_is_empty(j, k)
+            self.i = j + 1
+            return v
+        if c in "[{":
+            self.at = [i, col]
+            v = self._flow(0)
+            j, k = self.at
+            self._rest_is_empty(j, k)
+            self.i = j + 1
+            return v
+        s = line[col:]
+        if c in "@`%,]}#" or self._is_item(s) or s[:2] in ("? ", ": ", "?\t", ":\t") or s in ("?", ":"):
+            raise _YamlError("a value cannot start with " + c)
+        return self._plain(i, col, parent, resolve)
+
+    @staticmethod
+    def _plain_part(s):
+        """One line of a plain value, up to a comment (which ends the value)."""
+        m = _Y_COMMENT.search(s)
+        if m:
+            s = s[:m.start()]
+        s = s.rstrip(" \t")
+        if _Y_COLON.search(s):
+            raise _YamlError("a colon and space in a plain value")
+        return s, bool(m)
+
+    def _plain(self, i, col, parent, resolve=True):
+        text, ended = self._plain_part(self.lines[i][col:])
+        parts = [text]
+        j, blank = i + 1, 0
+        while not ended and j < len(self.lines):
+            raw = self.lines[j]
+            t = raw.strip(" \t")
+            if not t:
+                blank, j = blank + 1, j + 1
+                continue
+            if len(raw) - len(raw.lstrip(" ")) <= parent or t.startswith("#"):
+                break
+            piece, ended = self._plain_part(t)
+            parts += ["\n" * blank if blank else " ", piece]
+            blank, j = 0, j + 1
+        self.i = j
+        v = "".join(parts)
+        return _y_resolve(v) if resolve else v
+
+    def _block(self, i, col, parent):
+        """A literal (|) or folded (>) value; its header is at column `col` of line i."""
+        line = self.lines[i]
+        k, chomp, step = col + 1, "", 0
+        while k < len(line) and line[k] in "+-123456789":
+            if line[k] in "+-":
+                if chomp:
+                    raise _YamlError("two chomping indicators")
+                chomp = line[k]
+            elif step:
+                raise _YamlError("two indentation indicators")
+            else:
+                step = int(line[k])
+            k += 1
+        self._rest_is_empty(i, k)
+        j = i + 1
+        if step:
+            indent = max(parent, 0) + step
+        else:
+            indent, lead = parent + 1, 0
+            for raw in self.lines[j:]:
+                if raw.strip(" "):
+                    indent = max(indent, len(raw) - len(raw.lstrip(" ")))
+                    break
+                lead = max(lead, len(raw))
+            if lead > indent:
+                raise _YamlError("a blank line indented past the text below it")
+        body = []
+        while j < len(self.lines):
+            raw = self.lines[j]
+            if raw.strip(" ") and len(raw) - len(raw.lstrip(" ")) < indent:
+                break
+            body.append(raw[indent:])
+            j += 1
+        self.i = j
+        end = len(body)
+        while end and not body[end - 1].strip(" "):
+            end -= 1
+        text, trail = body[:end], len(body) - end
+        if not text:
+            return "\n" * trail if chomp == "+" else ""
+        v = "\n".join(text) if line[col] == "|" else self._fold(text)
+        return v if chomp == "-" else v + "\n" * (1 + (trail if chomp == "+" else 0))
+
+    @staticmethod
+    def _fold(lines):
+        """Folded style: a break between two lines of text becomes a space; blank lines and
+        more indented lines keep their breaks."""
+        out, prev, blank = [], None, 0
+        for ln in lines:
+            if not ln.strip(" "):
+                blank += 1
+                continue
+            spaced = ln[0] in " \t"
+            if prev is None:
+                out.append("\n" * blank)
+            elif prev == "text" and not spaced:
+                out.append("\n" * blank if blank else " ")
+            else:
+                out.append("\n" * (blank + 1))
+            out.append(ln)
+            prev, blank = "spaced" if spaced else "text", 0
+        return "".join(out)
+
+    # quoted values
+    @staticmethod
+    def _scan(line, k, q):
+        """A quoted value on one line from column k: (its text, the column after the closing
+        quote or None, whether the line ends in an escaped break, trailing blanks)."""
+        out, trail = [], 0
+        while k < len(line):
+            c = line[k]
+            if c == q:
+                if q == "'" and line[k + 1:k + 2] == "'":
+                    out.append("'")
+                    trail, k = 0, k + 2
+                    continue
+                return "".join(out), k + 1, False, 0
+            if c == "\\" and q == '"':
+                if k + 1 == len(line):
+                    return "".join(out), None, True, 0
+                e = line[k + 1]
+                if e in _Y_ESC:
+                    out.append(_Y_ESC[e])
+                    k += 2
+                elif e in _Y_HEX:
+                    h = line[k + 2:k + 2 + _Y_HEX[e]]
+                    if len(h) != _Y_HEX[e] or not re.match(r"[0-9a-fA-F]+\Z", h) or int(h, 16) > 0x10FFFF:
+                        raise _YamlError("a bad escape")
+                    out.append(chr(int(h, 16)))
+                    k += 2 + _Y_HEX[e]
+                else:
+                    raise _YamlError("a bad escape")
+                trail = 0
+                continue
+            out.append(c)
+            trail = trail + 1 if c in " \t" else 0
+            k += 1
+        return "".join(out), None, False, trail
+
+    def _quoted(self, i, col):
+        """A quoted value from column `col` of line i, maybe over several lines, folded as
+        YAML folds them: (value, line, column after the closing quote)."""
+        q = self.lines[i][col]
+        out, j, k = [], i, col + 1
+        while True:
+            text, end, escaped, trail = self._scan(self.lines[j], k, q)
+            if end is not None:
+                out.append(text)
+                v = "".join(out)
+                if q == '"' and re.search("[\ud800-\udfff]", v):  # a pair written as two escapes
+                    v = v.encode("utf-16-le", "surrogatepass").decode("utf-16-le", "surrogatepass")
+                return v, j, end
+            out.append(text[:len(text) - trail])
+            blank, j = 0, j + 1
+            while j < len(self.lines) and not self.lines[j].strip(" \t"):
+                blank, j = blank + 1, j + 1
+            if j >= len(self.lines):
+                raise _YamlError("a quote not closed")
+            out.append("\n" * blank if blank else "" if escaped else " ")
+            k = len(self.lines[j]) - len(self.lines[j].lstrip(" \t"))
+
+    # flow collections
+    def _char(self):
+        j, k = self.at
+        if j >= len(self.lines):
+            return ""
+        return self.lines[j][k] if k < len(self.lines[j]) else "\n"
+
+    def _skip(self):
+        """Past blanks, line breaks and comments inside a flow collection."""
+        while self.at[0] < len(self.lines):
+            j, k = self.at
+            line = self.lines[j]
+            if k < len(line) and line[k] in " \t":
+                self.at[1] += 1
+            elif k >= len(line) or line[k] == "#" and (k == 0 or line[k - 1] in " \t"):
+                self.at = [j + 1, 0]
+            else:
+                return
+
+    def _flow(self, depth):
+        if depth > 200:
+            raise _YamlError("nested too deep")
+        self._skip()
+        c = self._char()
+        if c == "":
+            raise _YamlError("a flow collection not closed")
+        if c in "[{":
+            close = "]" if c == "[" else "}"
+            self.at[1] += 1
+            out = [] if c == "[" else {}
+            while True:
+                self._skip()
+                c = self._char()
+                if c == close:
+                    self.at[1] += 1
+                    return out
+                if c in ("", ",", "]", "}"):
+                    raise _YamlError("a bad flow collection")
+                key = self._flow(depth + 1)
+                self._skip()
+                pair = self._char() == ":"
+                value = None
+                if pair:
+                    self.at[1] += 1
+                    self._skip()
+                    if self._char() not in (",", close):
+                        value = self._flow(depth + 1)
+                    self._skip()
+                if isinstance(out, list):
+                    out.append({_js_str(key) if not isinstance(key, str) else key: value} if pair else key)
+                else:
+                    name = key if isinstance(key, str) else _js_str(key)
+                    if name in out:
+                        raise _YamlError("a key given twice")
+                    out[name] = value
+                c = self._char()
+                if c == ",":
+                    self.at[1] += 1
+                elif c != close:
+                    raise _YamlError("a bad flow collection")
+        if c in "\"'":
+            v, j, k = self._quoted(*self.at)
+            self.at = [j, k]
+            return v
+        if c in "@`%&*!|>#":
+            raise _YamlError("a flow value cannot start with " + c)
+        return self._flow_plain()
+
+    def _flow_plain(self):
+        parts, blank = [], 0
+        while True:
+            j, k = self.at
+            line = self.lines[j]
+            m = _Y_FLOW_STOP.search(line, k)
+            piece = line[k:m.start()].strip(" \t")
+            if piece:
+                parts += [("\n" * blank if blank else " ") if parts else "", piece]
+            if m.group(0):  # an indicator or a comment ends it
+                self.at = [j, m.start()]
+                break
+            nj, blank = j + 1, 0
+            while nj < len(self.lines) and not self.lines[nj].strip(" \t"):
+                nj, blank = nj + 1, blank + 1
+            nxt = self.lines[nj].lstrip(" \t") if nj < len(self.lines) else ""
+            if not nxt or nxt[0] in ",[]{}#" or _Y_FLOW_STOP.match(nxt).group(0).startswith(":"):
+                self.at = [j, len(line)]
+                break
+            self.at = [nj, len(self.lines[nj]) - len(nxt)]
+        return _y_resolve("".join(parts))
+
+
+def _cc_yaml(text: str):
+    """Bun.YAML.parse(text), or _YamlError."""
+    try:
+        return _Yaml(text).parse()
+    except RecursionError:
+        raise _YamlError("nested too deep")
+
+
+_AF_LINE = re.compile("([a-zA-Z_-]+):" + _JS_S + "+(" + _JS_NS + _JS_DOT + r"*)\Z")
+_AF_SPECIAL = re.compile(r"[{}\[\]*&#!|>%@`]|: ")
+
+
+def _af(block: str) -> str:
+    """Claude Code's repair of frontmatter its YAML parser refused: a one-line value holding
+    one of YAML's special characters goes in double quotes, unless it is quoted already or is
+    a list; then leading tabs become two spaces each."""
+    out = []
+    for line in block.split("\n"):
+        m = _AF_LINE.match(line)
+        if m:
+            key, val = m.groups()
+            listed = False
+            if val.startswith("[") and val.endswith("]"):
+                try:
+                    listed = isinstance(_cc_yaml(val), list)
+                except _YamlError:
+                    pass
+            if not (val[0] == val[-1] == '"' or val[0] == val[-1] == "'" or listed) and _AF_SPECIAL.search(val):
+                line = key + ': "' + val.replace("\\", "\\\\").replace('"', '\\"') + '"'
+        out.append(line)
+    return re.sub(r"(?m)^\t+", lambda t: "  " * len(t.group(0)), "\n".join(out))
+
+
+_FM_BLOCK = re.compile("---" + _JS_S + "*\n(.*?)---" + _JS_S + "*\n?", re.S)
+
+
+def _cc_frontmatter(text: str) -> tuple[dict, str]:
+    """(frontmatter, body) as Claude Code splits a skill file. The frontmatter ends at the
+    first --- after the opening one, even inside a line; YAML its parser refuses is repaired
+    once (_af), and frontmatter that still fails, or is not a mapping, counts as empty."""
+    m = _FM_BLOCK.match(text) if text.find("---", 3) >= 0 else None
+    if not m:
+        return {}, text
+    try:
+        fm = _cc_yaml(m.group(1))
+    except _YamlError:
+        try:
+            fm = _cc_yaml(_af(m.group(1)))
+        except _YamlError:
+            fm = {}
+    return (fm if isinstance(fm, dict) else {}), text[m.end():]
+
+
+def _conditional(paths) -> bool:
+    """A skill with `paths:` patterns lists only once a matching file is touched; none, or
+    only **, means everywhere."""
+    items = paths if isinstance(paths, list) else [paths]
+    pats = []
+    for it in items:
+        if not isinstance(it, str):
+            continue
+        depth, cur = 0, ""
+        for ch in it + ",":
+            if ch == "," and depth == 0:
+                pats.append(cur.strip())
+                cur = ""
+                continue
+            depth += (ch == "{") - (ch == "}")
+            cur += ch
+    pats = [p[:-3] if p.endswith("/**") else p for p in pats]
+    pats = [p for p in pats if p]
+    return bool(pats) and any(p != "**" for p in pats)
+
+
+def _json_file(path) -> dict:
+    try:
+        return _dict(json.loads(read_text(path) or "{}"))
+    except ValueError:
+        return {}
+
+
+def _merge(a: dict, b: dict) -> dict:
+    """b over a, nested mappings merged key by key."""
+    out = dict(a)
+    for k, v in b.items():
+        out[k] = _merge(out[k], v) if isinstance(v, dict) and isinstance(out.get(k), dict) else v
+    return out
+
+
+def _claude_settings(cwd) -> dict:
+    """User, project and local settings merged as Claude Code merges them: later files win, key
+    by key inside nested settings such as enabledPlugins and env."""
+    root = project_root(cwd)
+    merged: dict = {}
+    for p in (claude_dir() / "settings.json", root / ".claude" / "settings.json",
+              root / ".claude" / "settings.local.json"):
+        merged = _merge(merged, _json_file(p))
+    return merged
+
+
+def _claude_env(settings: dict) -> dict:
+    """The environment Claude Code runs with: settings' env over the process's."""
+    env = dict(os.environ)
+    env.update((str(k), _js_str(v)) for k, v in _dict(settings.get("env")).items())
+    return env
+
+
+def _policy_dir() -> Path:
+    if sys.platform == "darwin":
+        return Path("/Library/Application Support/ClaudeCode")
+    return Path(r"C:\Program Files\ClaudeCode") if os.name == "nt" else Path("/etc/claude-code")
+
+
+def _claude_project_dirs(cwd, kind: str) -> list[Path]:
+    """<folder>/.claude/<kind> for each folder from `cwd` up to its git root, nearest first, as
+    Claude Code walks them; outside a repository up to home (not included) or the filesystem
+    root. A git worktree without its own folder reads the main checkout's."""
+    here = Path(cwd).resolve()
+    root = git_root(here)
+    h = str(home())
+    out = []
+    for d in [here, *here.parents]:
+        if (str(d).lower() == h.lower()) if os.name == "nt" else str(d) == h:
+            break
+        out.append(d / ".claude" / kind)
+        if d == root:
+            break
+    out = [p for p in out if _is_dir(p) and "connector-downloads" not in p.parts]
+    main = _main_checkout(root) if root else None
+    if main is not None and root / ".claude" / kind not in out and _is_dir(main / ".claude" / kind):
+        out.append(main / ".claude" / kind)
+    return out
+
+
+def _skill_folders(directory: Path, kind: str) -> list[tuple[str, Path]]:
+    """(folder, SKILL.md) for each skill in a skills folder, as Claude Code reads one: every
+    folder or link to one, hidden ones too, holding a SKILL.md file. `synced` is the account's
+    (kind "skills"), and a synced name may not hold a colon."""
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return []
+    out = []
+    for name in sorted(names, key=lambda n: (n.casefold(), n)):
+        p = directory / name
+        if kind == "skills" and name == "synced" or kind == "synced" and ":" in name:
+            continue
+        if (_is_dir(p) or os.path.islink(p)) and _is_file(p / "SKILL.md"):
+            out.append((name, p / "SKILL.md"))
+    return out
+
+
+def _command_files(base: Path) -> list[tuple[str, Path]]:
+    """(name, file) for each command in a commands folder: every .md file at any depth, named
+    by its folders and file name joined with colons; a folder holding a SKILL.md (any case) is
+    one command, named by the folder."""
+    if not _is_dir(base):
+        return []
+    out, seen = [], set()
+    for top, dirs, files in os.walk(base, followlinks=True):
+        real = os.path.realpath(top)
+        if real in seen:
+            dirs[:] = []
+            continue
+        seen.add(real)
+        dirs.sort()
+        rel = os.path.relpath(top, base)
+        parts = [] if rel == "." else list(Path(rel).parts)
+        md = sorted(f for f in files if f.endswith(".md"))
+        skill = [f for f in md if f.lower() == "skill.md"]
+        if skill:
+            if parts:
+                out.append((":".join(parts), Path(top) / skill[0]))
+            continue
+        out += [(":".join(parts + [f[:-3]]), Path(top) / f) for f in md]
+    return out
+
+
+def _claude_config(env: dict) -> dict:
+    """Claude Code's own state file, .claude.json: the account it is signed in with, how often
+    each skill ran."""
+    cfg = Path(env["CLAUDE_CONFIG_DIR"]) / ".claude.json" if env.get("CLAUDE_CONFIG_DIR") else home() / ".claude.json"
+    return _json_file(cfg)
+
+
+def _claude_synced_dir(env: dict) -> Path | None:
+    """The folder of the skills synced from the claude.ai account Claude Code is signed in
+    with, or None when it is signed in to none."""
+    account = _dict(_claude_config(env).get("oauthAccount"))
+    org = env.get("CLAUDE_CODE_ORGANIZATION_UUID") or account.get("organizationUuid")
+    if not isinstance(org, str) or not org:
+        return None
+    user = account.get("accountUuid") or env.get("CLAUDE_CODE_ACCOUNT_UUID") or "unbound"
+    return claude_dir() / "skills" / "synced" / f"{org}_{user}".lower()
+
+
+def _claude_plugins(settings: dict) -> list[tuple[str, Path, dict]]:
+    """(name, folder, manifest) for each enabled plugin with an installed copy on disk, in the
+    order settings name them."""
+    cd = claude_dir()
+    installed = _dict(_json_file(cd / "plugins" / "installed_plugins.json").get("plugins"))
+    out = []
+    for key, on in _dict(settings.get("enabledPlugins")).items():
+        if on in (None, False, 0, "") or on != on or key.endswith("@builtin"):
+            continue
+        plugin, _, market = key.partition("@")
+        entries = installed.get(key)
+        entries = [e for e in entries if isinstance(e, dict)] if isinstance(entries, list) else []
+        candidates = [Path(str(e["installPath"])) for e in entries if e.get("installPath")]
+        candidates += [cd / "plugins" / "cache" / market / plugin / str(e["version"])
+                       for e in entries if e.get("version")]
+        root = next((c for c in candidates if _is_dir(c)), None)
+        if root is not None:
+            manifest = _json_file(root / ".claude-plugin" / "plugin.json")
+            name = manifest.get("name")
+            out.append((name if isinstance(name, str) and name else plugin, root, manifest))
+    return out
+
+
+def _plugin_skills(name: str, root: Path, manifest: dict) -> list[tuple[str, Path]]:
+    """(skill name, SKILL.md) for a plugin's skills: in skills/ and the manifest's skill paths,
+    or the plugin's own SKILL.md when it has neither."""
+    extra = manifest.get("skills")
+    extra = [extra] if isinstance(extra, str) else [x for x in extra if isinstance(x, str)] \
+        if isinstance(extra, list) else []
+    paths = [root / "skills"] + [root / x for x in extra if not os.path.isabs(x) and ".." not in Path(x).parts]
+    if not manifest.get("skills") and not _is_dir(root / "skills") and _is_file(root / "SKILL.md"):
+        paths = [root]
+    out = []
+    for p in paths:
+        if _is_file(p / "SKILL.md"):
+            own = _cc_frontmatter(read_text(p / "SKILL.md") or "")[0].get("name")
+            own = _js_str(own) if own is not None else ""
+            own = own[len(name) + 1:] if own.startswith(name + ":") else own
+            out.append((name + ":" + re.sub(r"[^a-zA-Z0-9_-]", "-", own or p.name), p / "SKILL.md"))
+        elif _is_dir(p):
+            out += [(name + ":" + re.sub(r"[^a-zA-Z0-9_-]", "-", d), sm) for d, sm in _skill_folders(p, "plugin")]
+    return out
+
+
+def _plugin_commands(name: str, root: Path) -> list[tuple[str, Path]]:
+    d = root / "commands"
+    try:
+        files = sorted(os.listdir(d))
+    except OSError:
+        return []
+    return [(name + ":" + f[:-3], d / f) for f in files if f.endswith(".md") and _is_file(d / f)]
+
+
+def _shown_ok(name: str) -> bool:
+    """A shown name Claude Code puts beside the skill's own: letters, marks, digits, _ : . -"""
+    return 0 < _len16(name) <= 256 and all(unicodedata.category(c)[0] in "LMN" or c in "_:.-" for c in name)
+
+
+def _claude_listing(cwd, settings: dict, env: dict) -> dict:
+    overrides = _dict(settings.get("skillOverrides"))
+    cap = settings.get("skillListingMaxDescChars")
+    cap = cap if isinstance(cap, int) and not isinstance(cap, bool) and cap > 0 else CLAUDE_DESC_CAP
+    found, seen = [], set()
+
+    def add(kind, files):
+        for name, path in files:
+            try:
+                real = os.path.realpath(path)
+            except (OSError, ValueError):
+                real = str(path)
+            if real not in seen:
+                seen.add(real)
+                found.append((kind, name, path))
+
+    if not _env_on(env.get("CLAUDE_CODE_DISABLE_POLICY_SKILLS")):
+        add("skill", _skill_folders(_policy_dir() / ".claude" / "skills", "skills"))
+    add("skill", _skill_folders(claude_dir() / "skills", "skills"))
+    for d in _claude_project_dirs(cwd, "skills"):
+        add("skill", _skill_folders(d, "skills"))
+    for d in (_policy_dir() / ".claude" / "commands", claude_dir() / "commands", *_claude_project_dirs(cwd, "commands")):
+        add("command", _command_files(d))
+    plugins = _claude_plugins(settings)
+    for name, root, _ in plugins:
+        add("plugin command", _plugin_commands(name, root))
+    for name, root, manifest in plugins:
+        add("plugin skill", _plugin_skills(name, root, manifest))
+    synced = _claude_synced_dir(env)
+    if synced is not None:
+        add("synced", [("anthropic-skills:" + n, p) for n, p in _skill_folders(synced, "synced")])
+
+    hidden: Counter = Counter()
+    loaded = []
+    for kind, name, path in found:
+        if not _cc_name_ok(name.split(":", 1)[1] if kind == "synced" else name):
+            hidden["name"] += 1
+            continue
+        text = read_text(path)
+        if text is None:
+            continue
+        fm, body = _cc_frontmatter(text)
+        command = kind in ("command", "plugin command")
+        desc = _given(fm.get("description"))
+        e = {"kind": kind, "name": name, "path": str(path), "has_desc": desc is not None,
+             "desc": _cc_clean(desc if desc is not None else _first_line(body, "Custom command" if command else "Skill")),
+             "when": None if fm.get("when_to_use") is None else _cc_clean(_js_str(fm["when_to_use"])),
+             "manual": _flag(fm.get("disable-model-invocation")) is True,
+             "scoped": not command and _conditional(fm.get("paths"))}
+        own = None if command or fm.get("name") is None else _js_str(fm["name"])
+        own = own if own is None or _len16(own) <= 256 else None
+        if kind == "plugin skill" and own:
+            prefix = name.split(":", 1)[0] + ":"
+            e["shown"], e["aliases"] = (own if own.startswith(prefix) else prefix + own), [own] if ":" not in own else []
+        else:
+            e["shown"], e["aliases"] = own or name, []
+        loaded.append(e)
+
+    first: dict = {}
+    for k, e in enumerate(loaded):
+        if not e["scoped"]:
+            for key in (e["name"], e["shown"], *e["aliases"]):
+                first.setdefault(key, k)
+    entries, listed = [], set()
+    for k, e in enumerate(loaded):
+        plugin = e["kind"] in ("plugin skill", "plugin command")
+        mode = overrides.get(e["name"]) if not plugin and e["kind"] != "synced" else None
+        reason = ("paths" if e["scoped"] else "disable-model-invocation" if e["manual"]
+                  else "skillOverrides" if mode in ("off", "user-invocable-only")
+                  else "no description" if plugin and not (e["has_desc"] or e["when"])
+                  else "same name" if e["name"] in listed else None)  # the first one listed wins
+        if reason:
+            hidden[reason] += 1
+            continue
+        listed.add(e["name"])
+        r, name = e["shown"], e["name"]
+        same = r == name or name.endswith(":" + r) or not _shown_ok(r) or first.get(r) != k
+        label = name if same else f"{name} ({r})"
+        desc = _cap16(e["desc"] + (" - " + e["when"] if e["when"] else ""), cap)
+        name_only = mode == "name-only"
+        entries.append({"line": "- " + name if name_only else f"- {label}: {desc}", "short": "- " + label,
+                        "name": name, "label": label, "kind": e["kind"], "path": e["path"],
+                        "desc_chars": 0 if name_only else len(desc), "name_only": name_only})
+    return {"entries": entries, "hidden": dict(hidden)}
+
+
+def claude_listing(cwd) -> dict:
+    """The skill listing Claude Code builds at startup in `cwd`: {"entries": its lines in load
+    order, "hidden": how many skills it leaves out, by reason}. Skills built into Claude Code,
+    MCP skills and folders added with --add-dir are not on disk here and are not counted."""
+    settings = _claude_settings(cwd)
+    return _claude_listing(cwd, settings, _claude_env(settings))
+
+
+# Claude Code's model, from which it takes the window and the characters per token.
+_CC_MODEL_NAMES = [(re.compile(p), "claude-" + n) for p, n in (
+    (r"fable-5-2(?![0-9]{3})", "fable-5-2"), ("fable-5-1", "fable-5-1"), ("fable-5", "fable-5"),
+    (r"mythos-5-2(?![0-9]{3})", "mythos-5-2"), ("mythos-5-1", "mythos-5-1"), ("mythos-5", "mythos-5"),
+    ("opus-5-5", "opus-5-5"), ("opus-5", "opus-5"), ("opus-4-8", "opus-4-8"), ("opus-4-7", "opus-4-7"),
+    ("opus-4-6", "opus-4-6"), ("opus-4-5", "opus-4-5"), ("opus-4-1", "opus-4-1"),
+    (r"claude-opus-4(?!-[0-9](?![0-9]))", "opus-4-0"), ("sonnet-5-5", "sonnet-5-5"), ("sonnet-5", "sonnet-5"),
+    ("sonnet-4-6", "sonnet-4-6"), ("sonnet-4-5", "sonnet-4-5"), (r"claude-sonnet-4(?!-[0-9](?![0-9]))", "sonnet-4-0"),
+    ("haiku-5-5", "haiku-5-5"), ("haiku-4-5", "haiku-4-5"), ("3-7-sonnet", "3-7-sonnet"),
+    ("3-5-sonnet", "3-5-sonnet"), ("3-5-haiku", "3-5-haiku"), ("3-opus", "3-opus"), ("3-sonnet", "3-sonnet"),
+    ("3-haiku", "3-haiku"))]
+_CC_NATIVE_1M = ("claude-opus-4-7", "claude-opus-4-8", "claude-opus-5", "claude-opus-5-5", "claude-sonnet-5",
+                 "claude-sonnet-5-5", "claude-haiku-5-5")
+_CC_FOUR_CHARS = ("claude-3-opus", "claude-3-sonnet", "claude-3-haiku", "claude-3-5-sonnet", "claude-3-5-haiku",
+                  "claude-3-7-sonnet", "claude-opus-4-0", "claude-opus-4-1", "claude-opus-4-5", "claude-opus-4-6",
+                  "claude-sonnet-4-0", "claude-sonnet-4-5", "claude-sonnet-4-6", "claude-haiku-4-5")
+
+
+def _canonical_model(model: str) -> str:
+    s = re.sub(r"(claude-(?:[a-z]+-)?[0-9]{1,2})\.(?=[0-9])", r"\1-", model.lower())
+    return next((n for p, n in _CC_MODEL_NAMES if p.search(s)), None) or re.sub(r"-[0-9]{8}\Z", "", s)
+
+
+def _claude_cpt(model: str | None) -> int:
+    """Characters per token Claude Code assumes: 4 for the older models, 3 for the rest and for
+    today's default."""
+    return 4 if model and re.sub(r"[._]", "-", _canonical_model(model)) in _CC_FOUR_CHARS else 3
+
+
+def _claude_window(model: str | None, env: dict) -> tuple[int, str]:
+    """(context window, where it came from) as Claude Code sizes it for `model`; with no model,
+    today's default model's 1M window."""
+    cap = _int(env.get("CLAUDE_CODE_MAX_CONTEXT_TOKENS"))
+    if _env_on(env.get("DISABLE_COMPACT")) and cap > 0:
+        return cap, "CLAUDE_CODE_MAX_CONTEXT_TOKENS"
+    if model is None:
+        window, source = CLAUDE_1M, "assumed"
+    else:
+        canon = _canonical_model(model)
+        big = "[1m]" in model.lower() or canon in _CC_NATIVE_1M or canon.startswith(("claude-fable-5", "claude-mythos-5"))
+        window, source = CLAUDE_1M if big else CLAUDE_WINDOW, "model"
+    if _env_on(env.get("CLAUDE_CODE_DISABLE_1M_CONTEXT")):
+        window = min(window, CLAUDE_WINDOW)
+    return window, source
+
+
+def _first_cwd(f: Path) -> str | None:
+    try:
+        with open(f, encoding="utf-8", errors="replace") as fh:
+            for n, line in enumerate(fh):
+                if n > 200:
+                    break
+                if '"cwd"' in line:
+                    try:
+                        d = json.loads(line)
+                    except ValueError:
+                        continue
+                    if isinstance(d, dict) and isinstance(d.get("cwd"), str) and d["cwd"]:
+                        return d["cwd"]
+    except OSError:
+        pass
+    return None
+
+
+def _log_model(f: Path) -> str | None:
+    """The model of the last main-thread reply in a Claude Code session log."""
+    def last(lines):
+        found = None
+        for line in lines:
+            if b'"assistant"' not in line:
+                continue
+            try:
+                d = json.loads(line.decode("utf-8", "replace"))
+            except ValueError:
+                continue
+            if isinstance(d, dict) and d.get("type") == "assistant" and not d.get("isSidechain"):
+                for m in (d.get("requestedModel"), _dict(d.get("message")).get("model")):
+                    if isinstance(m, str) and m and m != "<synthetic>":
+                        found = m
+                        break
+        return found
+    try:
+        with open(f, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            fh.seek(max(0, size - 262_144))
+            model = last(fh.read().split(b"\n"))
+            if model or size <= 262_144:
+                return model
+            fh.seek(0)
+            return last(fh)
+    except OSError:
+        return None
+
+
+def _claude_model(cwd, settings: dict, env: dict) -> tuple[str | None, str | None]:
+    """(model, where it came from): the newest session log of this project, else
+    ANTHROPIC_MODEL, else settings' model, else the newest session log of any project. An alias
+    (opus, sonnet[1m]) names no model and is passed over."""
+    base = claude_dir() / "projects"
+    logs = []
+    try:
+        for f in base.glob("*/*.jsonl") if _is_dir(base) else []:
+            try:
+                logs.append((-f.stat().st_mtime, str(f), f))
+            except OSError:
+                pass
+    except OSError:
+        pass
+    logs.sort()
+    here = project_key(str(project_root(cwd)))
+    ours: dict = {}
+    for _, _, f in logs:
+        if f.parent not in ours:  # a folder's newest log says which project it holds
+            first = _first_cwd(f)
+            ours[f.parent] = bool(first) and _same_dir(project_key(first), here)
+        if ours[f.parent]:
+            model = _log_model(f)
+            if model:
+                return model, "project log"
+    for model, source in ((env.get("ANTHROPIC_MODEL"), "ANTHROPIC_MODEL"), (settings.get("model"), "settings")):
+        if isinstance(model, str) and model.strip() and not re.match(r"[a-z]+(?:\[1m\])?\Z", model.strip()):
+            return model.strip(), source
+    for _, _, f in logs[:50]:
+        model = _log_model(f)
+        if model:
+            return model, "latest log"
+    return None, None
+
+
+def _usage_score(record, now_ms: float) -> float:
+    """How Claude Code ranks a skill for keeping its description: the times it ran, halved for
+    each week since it last ran, but never below a tenth of them."""
+    if not isinstance(record, dict):
+        return 0.0
+    count, last = record.get("usageCount"), record.get("lastUsedAt")
+    if not all(isinstance(x, (int, float)) and not isinstance(x, bool) for x in (count, last)):
+        return 0.0
+    try:
+        decay = 0.5 ** ((now_ms - last) / 86_400_000 / 7)
+    except OverflowError:  # last run in the future
+        decay = math.inf
+    return count * max(decay, 0.1)
+
+
+def _claude_skills(cwd, window: int | None = None) -> dict:
+    """Claude Code's skill listing against its budget: columns, as it measures them."""
+    settings = _claude_settings(cwd)
+    env = _claude_env(settings)
+    listing = _claude_listing(cwd, settings, env)
+    entries = listing["entries"]
+    model, model_source = _claude_model(cwd, settings, env)
+    cpt = _claude_cpt(model)
+    w, w_source = (window, "--window") if window else _claude_window(model, env)
+    fixed = _js_number(env.get("SLASH_COMMAND_TOOL_CHAR_BUDGET"))
+    if fixed and fixed == fixed and not math.isinf(fixed):
+        budget, basis = math.floor(fixed), "SLASH_COMMAND_TOOL_CHAR_BUDGET"
+    else:
+        frac = settings.get("skillListingBudgetFraction")
+        if isinstance(frac, bool) or not isinstance(frac, (int, float)) or not 0 < frac <= 1:
+            frac = CLAUDE_LISTING_FRACTION
+        budget = max(1, math.floor(w * cpt * frac))
+        basis = f"{frac * 100:g}% of a {fmt_k(w)}-token window at {cpt} characters per token"
+    n = len(entries)
+    widths = [str_width(e["line"]) for e in entries]
+    used = sum(widths) + max(0, n - 1)
+    losing = []
+    if used > budget:
+        # Over budget, Claude Code keeps name-only lines whole, cuts every other line back to
+        # "- name", then gives descriptions back in order of use while they fit. Skills built
+        # into Claude Code keep theirs too and are not on disk, so more can lose them.
+        usage = _dict(_claude_config(env).get("skillUsage"))
+        now = dt.datetime.now(dt.timezone.utc).timestamp() * 1000
+        short = [str_width(e["short"]) for e in entries]
+        room = budget - sum(wd if e["name_only"] else s for e, wd, s in zip(entries, widths, short)) - max(0, n - 1)
+        for k in sorted((k for k in range(n) if not entries[k]["name_only"]),
+                        key=lambda k: -_usage_score(usage.get(entries[k]["name"]), now)):
+            if widths[k] - short[k] <= room:
+                room -= widths[k] - short[k]
+            else:
+                losing.append(k)
+    heaviest = sorted(zip(widths, range(n)), key=lambda t: (-t[0], t[1]))[:5]
+    return {"count": n, "tokens": sum(est_tokens(e["line"] + "\n") for e in entries),
+            "chars": len("\n".join(e["line"] for e in entries)), "used": used,
+            "desc_chars": sum(e["desc_chars"] for e in entries), "budget": budget, "budget_unit": "chars",
+            "window": w, "window_source": w_source, "model": model, "model_source": model_source,
+            "chars_per_token": cpt, "basis": basis, "over_budget": used > budget,
+            "lose_descriptions": len(losing), "losing_descriptions": [entries[k]["label"] for k in sorted(losing)],
+            "hidden": listing["hidden"],
+            "heaviest": [{"name": entries[k]["label"], "tokens": est_tokens(entries[k]["line"])} for _, k in heaviest]}
+
 
 def _skill_dirs(cwd) -> dict[str, list[tuple[Path, str]]]:
     root = project_root(cwd)
@@ -713,7 +2043,6 @@ def _skill_dirs(cwd) -> dict[str, list[tuple[Path, str]]]:
         return [(d / rel, "") for d in upward]
 
     return {
-        "claude": [(cd / "skills", ""), *proj(".claude/skills"), *_claude_plugin_skill_dirs()],
         "codex": [*proj(".agents/skills"), (h / ".agents" / "skills", ""), (xd / "skills", ""),
                   (Path("/etc/codex/skills"), ""), (xd / "skills" / ".system", "")],
         "gemini": [*proj(".gemini/skills"), *proj(".agents/skills"), (h / ".gemini" / "skills", ""),
@@ -721,41 +2050,6 @@ def _skill_dirs(cwd) -> dict[str, list[tuple[Path, str]]]:
         "opencode": [*proj(".opencode/skills"), *proj(".claude/skills"), *proj(".agents/skills"),
                      (h / ".config" / "opencode" / "skills", ""), (cd / "skills", ""), (h / ".agents" / "skills", "")],
     }
-
-
-def _json_file(path) -> dict:
-    try:
-        return _dict(json.loads(read_text(path) or "{}"))
-    except ValueError:
-        return {}
-
-
-def _claude_plugin_skill_dirs() -> list[tuple[Path, str]]:
-    cd = claude_dir()
-    enabled = [k for k, v in _dict(_json_file(cd / "settings.json").get("enabledPlugins")).items() if v]
-    installed = _dict(_json_file(cd / "plugins" / "installed_plugins.json").get("plugins"))
-    dirs = []
-    for key in sorted(enabled):
-        plugin, _, market = key.partition("@")
-        entries = installed.get(key)
-        entries = [e for e in entries if isinstance(e, dict)] if isinstance(entries, list) else []
-        candidates = [Path(str(e["installPath"])) for e in entries if e.get("installPath")]
-        candidates += [cd / "plugins" / "cache" / market / plugin / str(e["version"])
-                       for e in entries if e.get("version")]
-        hit = next((c for c in candidates if _is_dir(c / "skills")), None)
-        if hit:
-            dirs.append((hit / "skills", plugin + ":"))
-    return dirs
-
-
-def _claude_settings(cwd) -> dict:
-    """User, project and local settings, later files winning, as Claude Code merges them."""
-    root = project_root(cwd)
-    merged: dict = {}
-    for p in (claude_dir() / "settings.json", root / ".claude" / "settings.json",
-              root / ".claude" / "settings.local.json"):
-        merged.update(_json_file(p))
-    return merged
 
 
 def _codex_window() -> int | None:
@@ -782,20 +2076,8 @@ def _codex_window() -> int | None:
     return None
 
 
-def _listing_budget(h: str, cwd, window: int | None) -> dict:
+def _listing_budget(h: str, window: int | None) -> dict:
     """Budget for one harness's skill listing, with where each number came from."""
-    if h == "claude":
-        fixed = _int(os.environ.get("SLASH_COMMAND_TOOL_CHAR_BUDGET"))
-        w, w_src = (window, "--window") if window else (DEFAULT_WINDOW, "default")
-        if fixed > 0:
-            return {"budget": fixed, "budget_unit": "chars", "window": w, "window_source": w_src,
-                    "basis": "SLASH_COMMAND_TOOL_CHAR_BUDGET"}
-        try:
-            frac = float(_claude_settings(cwd).get("skillListingBudgetFraction") or CLAUDE_LISTING_FRACTION)
-        except (TypeError, ValueError):
-            frac = CLAUDE_LISTING_FRACTION
-        return {"budget": int(w * CHARS_PER_WINDOW_TOKEN * frac), "budget_unit": "chars", "window": w,
-                "window_source": w_src, "basis": f"{frac * 100:g}% of a {fmt_k(w)}-token window"}
     if h == "codex":
         # Codex records its own window; --window is Claude Code's and only fills in when the logs have none.
         w, w_src = _codex_window(), "codex logs"
@@ -812,8 +2094,10 @@ def _listing_budget(h: str, cwd, window: int | None) -> dict:
 def scan_skills(cwd, harnesses, window: int | None = None) -> dict:
     result = {}
     all_dirs = _skill_dirs(cwd)
-    desc_cap = _int(_claude_settings(cwd).get("skillListingMaxDescChars")) or CLAUDE_DESC_CAP
     for h in harnesses:
+        if h == "claude":
+            result[h] = _claude_skills(cwd, window)
+            continue
         found: dict[str, dict] = {}
         for directory, prefix in all_dirs[h]:
             if not _is_dir(directory):
@@ -832,18 +2116,16 @@ def scan_skills(cwd, harnesses, window: int | None = None) -> dict:
                 desc = fm.get("description", "")
                 if fm.get("when_to_use"):
                     desc += " " + fm["when_to_use"]
-                if h == "claude":
-                    desc = desc[:desc_cap]
                 line = f"- {name}: {desc}\n"
                 found[name] = {"path": str(sm), "desc_chars": len(desc), "chars": len(line),
                                "tokens": est_tokens(line)}
         tokens = sum(s["tokens"] for s in found.values())
         chars = sum(s["chars"] for s in found.values())
-        b = _listing_budget(h, cwd, window)
+        b = _listing_budget(h, window)
         used = chars if b["budget_unit"] == "chars" else tokens
         over = b["budget"] is not None and used > b["budget"]
         heaviest = sorted(found.items(), key=lambda kv: -kv[1]["tokens"])[:5]
-        result[h] = {"count": len(found), "tokens": tokens, "chars": chars,
+        result[h] = {"count": len(found), "tokens": tokens, "chars": chars, "used": used,
                      "desc_chars": sum(s["desc_chars"] for s in found.values()), **b, "over_budget": over,
                      "heaviest": [{"name": k, "tokens": v["tokens"]} for k, v in heaviest]}
     return result
@@ -2034,22 +3316,25 @@ def print_files(result: dict) -> None:
 
 
 def print_skills(result: dict) -> None:
-    assumed = False
     for h, r in result.items():
         if r["budget"]:
-            used = r["chars"] if r["budget_unit"] == "chars" else r["tokens"]
-            budget = f"{fmt_k(used)} of {fmt_k(r['budget'])} {r['budget_unit']}: {r['basis']}"
-            if r["window_source"] == "default":
-                budget += " (assumed)"
-                assumed = True
+            budget = f"{fmt_k(r['used'])} of {fmt_k(r['budget'])} {r['budget_unit']}: {r['basis']}"
+            if r["window_source"] == "assumed":
+                budget += ", assumed"
         else:
             budget = r["basis"]
-        flag = "  OVER: descriptions get dropped, names stay" if r["over_budget"] else ""
+        flag = ""
+        if r["over_budget"]:
+            lose = r.get("lose_descriptions")
+            flag = f"  OVER: at least {lose} lose their descriptions" if lose else "  OVER: descriptions get dropped"
         print(f"{h:9} {r['count']:4} skills  ~{fmt_k(r['tokens'])} tokens listing  ({budget}){flag}")
+        if r.get("hidden"):
+            print("          not listed: " + ", ".join(f"{n} ({why})" for why, n in r["hidden"].items()))
         if r["heaviest"]:
             print("          heaviest: " + ", ".join(f"{x['name']} {fmt_k(x['tokens'])}" for x in r["heaviest"]))
-    if assumed:
-        print(f"  · window assumed {fmt_k(DEFAULT_WINDOW)} tokens; pass --window 1000000 for a 1M-context model")
+        if r["window_source"] == "assumed":
+            print(f"          window assumed {fmt_k(r['window'])} tokens: no model in this project's logs or "
+                  "settings. For a 200k-context model, pass --window 200000")
 
 
 def _name(key: str, width: int) -> str:
@@ -2108,8 +3393,7 @@ def findings(files: dict, skills: dict, stats: dict, target: int) -> list[str]:
         out.append(f"[all] cannot read {short(u)}: it is not counted, and the agent cannot load it either")
     for h, r in skills.items():
         if r["over_budget"]:
-            used = r["chars"] if r["budget_unit"] == "chars" else r["tokens"]
-            out.append(f"[{h}] {r['count']} skills need ~{fmt_k(used)} {r['budget_unit']} of listing, budget "
+            out.append(f"[{h}] {r['count']} skills need ~{fmt_k(r['used'])} {r['budget_unit']} of listing, budget "
                        f"{fmt_k(r['budget'])} ({r['basis']}): the least-used lose their descriptions and stop "
                        "triggering reliably. Uninstall unused skills or plugins")
     return out
@@ -2417,7 +3701,7 @@ def render_svg(rep: dict, theme: str = "auto") -> str:
         y += 12
         for h, r in budgets:
             y += 30
-            used = r["chars"] if r["budget_unit"] == "chars" else r["tokens"]
+            used = r["used"]
             share = used / r["budget"]
             g.text(L, y + 4, AGENT_NAMES[h], 14)
             mx0, mw = L + 130, 360
@@ -2430,11 +3714,11 @@ def render_svg(rep: dict, theme: str = "auto") -> str:
                          if share > 1 else "near budget")
                 g.badge(R - _text_px(label, 13) - 14, y, kind)
                 g.text(R, y + 4, label, 13, "b r")
-        assumed = [AGENT_NAMES[h] for h, r in budgets if r.get("window_source") == "default"]
+        assumed = [(AGENT_NAMES[h], r["window"]) for h, r in budgets if r.get("window_source") == "assumed"]
         if assumed:
             y += 30
-            g.text(L, y, f"{' and '.join(assumed)}: budget assumes a {DEFAULT_WINDOW:,}-token window. "
-                         "For a 1M-context model, pass --window 1000000.", 12, "m")
+            g.text(L, y, f"{assumed[0][0]}: budget assumes a {assumed[0][1]:,}-token window, as no model was found. "
+                         "For a 200k-context model, pass --window 200000.", 12, "m")
         y += 26
 
     # measured sessions
@@ -2997,8 +4281,9 @@ def _main(argv=None) -> int:
     p.add_argument("--max-tokens", type=int, help="exit 1 if this repo's instructions exceed N tokens for any "
                    "harness, or if Codex would cut any of them off; exit 2 on a bad path")
 
-    window_help = (f"Claude Code's context window in tokens, which its logs do not record (default {DEFAULT_WINDOW}). "
-                   "Codex reads its own window from its logs and uses this only when they have none")
+    window_help = ("Claude Code's context window in tokens (default: the window of the model in this project's "
+                   "newest session log, ANTHROPIC_MODEL or settings, else 1M). Codex reads its own window from "
+                   "its logs and uses this only when they have none")
     p = sub.add_parser("skills", help="skill listing size against budgets")
     common(p)
     p.add_argument("--window", type=int, help=window_help)
