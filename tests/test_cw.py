@@ -186,8 +186,11 @@ class CwTest(unittest.TestCase):
         self.assertFalse(res.get("cross"))
         (self.repo / "CLAUDE.md").unlink()
         write(self.repo / "AGENTS.md", "a" * 30_000)
+        # Claude Code loads AGENTS.md where no CLAUDE.md is, unless set to read CLAUDE.md only.
+        write(self.home / ".claude" / "settings.json", json.dumps(
+            {"pluginConfigs": {"cc-plugin-agents-md@builtin": {"options": {"instructionFiles": "claude-md"}}}}))
         res = self.cw_json("files", str(self.repo), "--harness", "claude,codex")
-        self.assertTrue(res.get("cross"), "AGENTS.md with no CLAUDE.md went unflagged")
+        self.assertTrue(res.get("cross"), "AGENTS.md that only Codex reads went unflagged")
         (self.repo / "AGENTS.md").unlink()
         res = self.cw_json("files", str(self.repo), "--harness", "claude,codex")
         self.assertFalse(res.get("cross"))
@@ -233,6 +236,309 @@ class CwTest(unittest.TestCase):
         r = self.cw_json("files", str(self.repo), "--harness", "claude")["claude"]
         self.assertEqual([Path(f["path"]).relative_to(self.repo.resolve()).as_posix() for f in self.mine(r["files"])],
                          [".claude/CLAUDE.md"])
+
+    # ------------------------------------------------------------------ what Claude Code loads
+    _CLAUDE_NAMES = ("CLAUDE.md", ".claude/CLAUDE.md", "CLAUDE.local.md")
+
+    def _claude_md_above(self):
+        """A CLAUDE.md this machine keeps above the temp folder, if any. Claude Code reads
+        AGENTS.md only where no CLAUDE.md is in the start folder or above it."""
+        for d in self.tmp_path.resolve().parents:
+            if d == Path(d.anchor):
+                continue  # Claude Code does not read the filesystem root
+            for name in self._CLAUDE_NAMES:
+                try:
+                    if (d / name).is_file() and (d / name).read_text(encoding="utf-8", errors="replace").strip():
+                        return d / name
+                except OSError:
+                    pass
+        return None
+
+    def _skip_if_claude_md_above(self):
+        above = self._claude_md_above()
+        if above:
+            self.skipTest(f"{above} keeps AGENTS.md out of Claude Code on this machine")
+
+    def _claude_rel(self, files):
+        """(path under the test's temp folder, role) for each Claude Code entry in it."""
+        top = self.tmp_path.resolve()
+        return [(Path(f["path"]).resolve().relative_to(top).as_posix(), f["role"]) for f in self.mine(files)]
+
+    def _claude_loads(self, path):
+        return [rel for rel, _ in self._claude_rel(self.cw_json("files", str(path), "--harness", "claude")["claude"]["files"])]
+
+    def test_claude_reads_agents_md_when_no_claude_md(self):
+        # Claude Code 2.1.277+ loads AGENTS.md where no CLAUDE.md is: every AGENTS.md and
+        # .claude/AGENTS.md from the start folder up, with its @imports. The user's own
+        # ~/.claude/CLAUDE.md is not such a file; AGENTS.local.md, .agents/ and a subfolder's
+        # AGENTS.md do not load at startup.
+        self._skip_if_claude_md_above()
+        write(self.home / ".claude" / "CLAUDE.md", "my own rules\n")
+        write(self.repo / "AGENTS.md", rules("shared", 50) + "@docs/more.md\n")
+        write(self.repo / "docs" / "more.md", "more rules\n")
+        write(self.repo / ".claude" / "AGENTS.md", "kept under .claude\n")
+        write(self.repo.parent / "AGENTS.md", "workspace rules\n")
+        for name in ("AGENTS.local.md", ".agents/AGENTS.md", "sub/AGENTS.md"):
+            write(self.repo / name, "not read by Claude Code at startup\n")
+        res = self.cw_json("files", str(self.repo), "--harness", "claude,codex")
+        r = res["claude"]
+        self.assertEqual(self._claude_rel(r["files"]), [
+            ("home/.claude/CLAUDE.md", "user"),
+            ("work/AGENTS.md", "project"),
+            ("work/repo/AGENTS.md", "project"),
+            ("work/repo/docs/more.md", "project import"),
+            ("work/repo/.claude/AGENTS.md", "project"),
+        ])
+        self.assertTrue(any("AGENTS.md" in n and "no CLAUDE.md" in n for n in r["notes"]), r["notes"])
+        in_repo = [f for f, (rel, _) in zip(self.mine(r["files"]), self._claude_rel(r["files"]))
+                   if rel.startswith("work/repo/")]
+        self.assertEqual(r["repo_tokens"], sum(f["tokens"] for f in in_repo))
+        self.assertFalse(res.get("cross"))  # both agents read this AGENTS.md
+
+    def test_any_claude_md_up_the_tree_keeps_agents_md_out(self):
+        self._skip_if_claude_md_above()
+        write(self.repo / "AGENTS.md", "agents rules\n")
+        start = self.repo / "pkg"
+        start.mkdir()
+        for spot in ("work/repo/pkg/CLAUDE.md", "work/repo/.claude/CLAUDE.md", "work/repo/CLAUDE.local.md",
+                     "work/CLAUDE.md", "work/.claude/CLAUDE.md"):
+            p = write(self.tmp_path / spot, "claude rules\n")
+            self.assertEqual(self._claude_loads(start), [spot], spot)
+            p.unlink()
+        # A CLAUDE.md that holds nothing loads nothing, so it does not count.
+        write(self.repo / "CLAUDE.md", " \n\n")
+        self.assertEqual(self._claude_loads(start), ["work/repo/AGENTS.md"])
+        # The user's own CLAUDE.md does not count either, also for a repo inside the home folder,
+        # where it sits at the home folder's .claude/CLAUDE.md.
+        repo2 = self.home / "code" / "r2"
+        (repo2 / ".git").mkdir(parents=True)
+        write(repo2 / "AGENTS.md", "agents rules\n")
+        write(self.home / ".claude" / "CLAUDE.md", "my own rules\n")
+        self.assertEqual(self._claude_loads(repo2), ["home/.claude/CLAUDE.md", "home/code/r2/AGENTS.md"])
+
+    def _plugin_options(self, options, plugin="cc-plugin-agents-md@builtin", where=None):
+        settings = {"pluginConfigs": {plugin: {"options": options}}}
+        write(where or self.home / ".claude" / "settings.json", json.dumps(settings))
+
+    def test_instruction_files_setting_picks_what_claude_code_loads(self):
+        # Claude Code's built-in agents-md plugin reads its instructionFiles option (and the older
+        # projectInstructions) from user settings only, under either plugin id; /plugin can turn
+        # the plugin off in any settings file, and then AGENTS.md never loads.
+        self._skip_if_claude_md_above()
+        write(self.home / ".claude" / "CLAUDE.md", "my own rules\n")
+        write(self.repo / "CLAUDE.md", "claude rules\n")
+        write(self.repo / "AGENTS.md", "agents rules\n")
+        write(self.repo / ".claude" / "rules" / "r.md", "a rule\n")
+        slug = "".join(c if c.isascii() and c.isalnum() else "-" for c in str(self.repo.resolve()))
+        write(self.home / ".claude" / "projects" / slug / "memory" / "MEMORY.md", "remember this\n")
+        U, C, A, R = "home/.claude/CLAUDE.md", "work/repo/CLAUDE.md", "work/repo/AGENTS.md", "work/repo/.claude/rules/r.md"
+        M = f"home/.claude/projects/{slug}/memory/MEMORY.md"
+        modes = {"default": ([U, C, R, M], [U, R, A, M]), "claude-md": ([U, C, R, M], [U, R, M]),
+                 "and": ([U, C, R, A, M], [U, R, A, M]), "managed-only": ([M], [M])}
+        cases = [({}, "default"),
+                 ({"instructionFiles": "claude-md-or-agents-md"}, "default"),
+                 ({"instructionFiles": "claude-md"}, "claude-md"),
+                 ({"instructionFiles": "claude-md-and-agents-md"}, "and"),
+                 ({"instructionFiles": "managed-only"}, "managed-only"),
+                 ({"instructionFiles": "bogus"}, "default"),
+                 ({"projectInstructions": "none"}, "managed-only"),
+                 ({"projectInstructions": "claude"}, "claude-md"),
+                 ({"projectInstructions": "agents-fallback"}, "default"),
+                 ({"projectInstructions": "both"}, "and"),
+                 ({"projectInstructions": "bogus"}, "claude-md"),
+                 ({"projectInstructions": 7}, "claude-md"),
+                 ({"projectInstructions": None}, "claude-md"),
+                 # projectInstructions counts only while instructionFiles is the default
+                 ({"instructionFiles": "claude-md-and-agents-md", "projectInstructions": "none"}, "and"),
+                 ({"instructionFiles": "claude-md-or-agents-md", "projectInstructions": "both"}, "and")]
+        for options, mode in cases:
+            for plugin in ("cc-plugin-agents-md@builtin", "agents-md@builtin"):
+                self._plugin_options(options, plugin)
+                for with_claude_md, expect in zip((True, False), modes[mode]):
+                    if not with_claude_md:
+                        os.replace(self.repo / "CLAUDE.md", self.tmp_path / "parked.md")
+                    try:
+                        self.assertEqual(self._claude_loads(self.repo), expect, (options, plugin, with_claude_md))
+                    finally:
+                        if not with_claude_md:
+                            os.replace(self.tmp_path / "parked.md", self.repo / "CLAUDE.md")
+        # Project and local settings do not set the option.
+        write(self.home / ".claude" / "settings.json", "{}")
+        for name in ("settings.json", "settings.local.json"):
+            self._plugin_options({"instructionFiles": "managed-only"}, where=self.repo / ".claude" / name)
+            self.assertEqual(self._claude_loads(self.repo), modes["default"][0], name)
+            (self.repo / ".claude" / name).unlink()
+        # Turned off through enabledPlugins: the highest settings file that names it decides.
+        (self.repo / "CLAUDE.md").unlink()
+        off = [U, R, M]
+        for files, expect in (({"user": {"cc-plugin-agents-md@builtin": False}}, off),
+                              ({"project": {"agents-md@builtin": False}}, off),
+                              ({"user": {"cc-plugin-agents-md@builtin": False},
+                                "local": {"cc-plugin-agents-md@builtin": True}}, modes["default"][1]),
+                              ({"user": {"cc-plugin-agents-md@builtin": True}}, modes["default"][1])):
+            paths = {"user": self.home / ".claude" / "settings.json",
+                     "project": self.repo / ".claude" / "settings.json",
+                     "local": self.repo / ".claude" / "settings.local.json"}
+            for scope, value in files.items():
+                write(paths[scope], json.dumps({"enabledPlugins": value}))
+            self.assertEqual(self._claude_loads(self.repo), expect, files)
+            for p in paths.values():
+                if p.exists():
+                    p.unlink()
+
+    def test_agents_md_beside_claude_md_loads_once(self):
+        # claude-md-and-agents-md skips an AGENTS.md that CLAUDE.md already imports or links to,
+        # and one whose text is the same as a loaded project file.
+        self._plugin_options({"instructionFiles": "claude-md-and-agents-md"})
+        write(self.repo / "AGENTS.md", "agents rules\n")
+        for claude_md in ("@AGENTS.md\n", "agents rules\n\n"):
+            write(self.repo / "CLAUDE.md", claude_md)
+            names = [Path(rel).name for rel in self._claude_loads(self.repo)]
+            self.assertEqual(sorted(names), sorted({"@AGENTS.md\n": ["CLAUDE.md", "AGENTS.md"],
+                                                    "agents rules\n\n": ["CLAUDE.md"]}[claude_md]), claude_md)
+        if os.name != "nt":
+            (self.repo / "CLAUDE.md").unlink()
+            (self.repo / "CLAUDE.md").symlink_to("AGENTS.md")
+            self.assertEqual(len(self._claude_loads(self.repo)), 1)
+
+    def test_before_and_after_weighs_agents_md_as_claude_code_loaded_it(self):
+        self._skip_if_claude_md_above()
+        self._git_repo()
+        write(self.repo / ".gitignore", "CLAUDE.local.md\n")
+        write(self.repo / "AGENTS.md", rules("rule", 300))  # 30,600 bytes, under Codex's 32 KiB
+        self._commit("rules", "2026-01-01T00:00:00+00:00")
+        write(self.repo / "AGENTS.md", "short\n")
+        slim = self._commit("slim", "2026-02-01T00:00:00+00:00")
+        args = ("report", str(self.repo), "--days", "40000", "--harness", "claude,codex")
+        cut = {"before": 10_200, "after": 2, "now": 2}
+        # No CLAUDE.md anywhere: Claude Code loaded the old AGENTS.md too, though the old commit is
+        # weighed in a temp folder that here has a CLAUDE.md above it.
+        under = self.tmp_path / "under"
+        write(under / "CLAUDE.md", "not on this repo's path\n")
+        (under / "tmp").mkdir()
+        saved = dict(self.env)
+        self.env.update(TMPDIR=str(under / "tmp"), TEMP=str(under / "tmp"), TMP=str(under / "tmp"))
+        try:
+            c = self.cw_json(*args)["compare"]
+        finally:
+            self.env = saved
+        self.assertEqual((c["commit"], c["files"]), (slim, {"claude": cut, "codex": cut}))
+        # A CLAUDE.md above the repo, or a CLAUDE.local.md git ignores, kept AGENTS.md out for
+        # Claude Code then as it does now, though neither is in the old commit.
+        for spot in (self.repo.parent / "CLAUDE.md", self.repo / "CLAUDE.local.md"):
+            write(spot, "claude rules\n")
+            c = self.cw_json(*args)["compare"]
+            self.assertEqual((c["commit"], c["files"]), (slim, {"codex": cut}), spot)
+            spot.unlink()
+
+    def test_claude_rules_load_from_every_folder_up_the_tree(self):
+        start = self.repo / "packages" / "api"
+        for rel in ("work/.claude/rules/org.md", "work/repo/.claude/rules/root.md",
+                    "work/repo/packages/.claude/rules/mid.md", "work/repo/packages/api/.claude/rules/api.md"):
+            write(self.tmp_path / rel, "a rule\n")
+        write(start / ".claude" / "rules" / "scoped.md", "---\npaths:\n  - src/**\n---\nonly for src\n")
+        write(self.repo / "other" / ".claude" / "rules" / "off.md", "not on the path\n")
+        write(self.home / ".claude" / "rules" / "mine.md", "user rule\n")
+        write(self.home / ".claude" / "rules" / "scoped.md", "---\npaths:\n  - x/**\n---\nonly for x\n")
+        r = self.cw_json("files", str(start), "--harness", "claude")["claude"]
+        self.assertEqual(self._claude_rel(r["files"]), [
+            ("home/.claude/rules/mine.md", "user rule"),
+            ("work/.claude/rules/org.md", "project rule"),
+            ("work/repo/.claude/rules/root.md", "project rule"),
+            ("work/repo/packages/.claude/rules/mid.md", "project rule"),
+            ("work/repo/packages/api/.claude/rules/api.md", "project rule"),
+        ])
+        self.assertTrue(any("2 path-scoped" in n for n in r["notes"]), r["notes"])
+        # In a repo inside the home folder, ~/.claude/rules are the user's rules, counted once.
+        repo2 = self.home / "code" / "r2"
+        (repo2 / ".git").mkdir(parents=True)
+        r = self.cw_json("files", str(repo2), "--harness", "claude")["claude"]
+        self.assertEqual(self._claude_rel(r["files"]), [("home/.claude/rules/mine.md", "user rule")])
+        self.assertTrue(any("1 path-scoped" in n for n in r["notes"]), r["notes"])
+
+    def test_nested_worktree_skips_the_main_checkout_folders(self):
+        # Claude Code's own worktrees live inside the main checkout (.claude/worktrees/<name>) and
+        # hold their own copy of its files, so it skips the main checkout's folders there.
+        self._git_repo()
+        write(self.repo / "CLAUDE.md", "main rules\n")
+        write(self.repo / ".claude" / "rules" / "r.md", "a rule\n")
+        self._commit("start", "2026-01-01T00:00:00+00:00")
+        wt = self.repo / ".claude" / "worktrees" / "feat"
+        self._git("worktree", "add", "-q", "-b", "feat", str(wt))
+        write(self.repo.parent / "CLAUDE.md", "workspace rules\n")  # above the main checkout: still read
+        r = self.cw_json("files", str(wt), "--harness", "claude")["claude"]
+        self.assertEqual(self._claude_rel(r["files"]), [
+            ("work/CLAUDE.md", "project"),
+            ("work/repo/.claude/worktrees/feat/CLAUDE.md", "project"),
+            ("work/repo/.claude/worktrees/feat/.claude/rules/r.md", "project rule"),
+        ])
+
+    def test_auto_memory_follows_the_repository_and_its_switches(self):
+        # One auto memory per git repository, shared by its subfolders and worktrees; it can be
+        # turned off or moved.
+        self._git_repo()
+        write(self.repo / "README.md", "x\n")
+        self._commit("start", "2026-01-01T00:00:00+00:00")
+        wt = self.repo.parent / "repo-wt"
+        self._git("worktree", "add", "-q", "-b", "wt", str(wt))
+        (self.repo / "sub").mkdir()
+        slug = "".join(c if c.isascii() and c.isalnum() else "-" for c in str(self.repo.resolve()))
+        mem = write(self.home / ".claude" / "projects" / slug / "memory" / "MEMORY.md", "remember this\n").resolve()
+        user, project = self.home / ".claude" / "settings.json", self.repo / ".claude" / "settings.json"
+
+        def memory(path, **env):
+            saved = dict(self.env)
+            self.env.update(env)
+            try:
+                r = self.cw_json("files", str(path), "--harness", "claude")["claude"]
+            finally:
+                self.env = saved
+            return [Path(f["path"]).resolve() for f in r["files"] if f["role"] == "user memory"]
+
+        for where in (self.repo, self.repo / "sub", wt):
+            self.assertEqual(memory(where), [mem], where)
+        self.assertEqual(memory(self.repo, CLAUDE_CODE_DISABLE_AUTO_MEMORY="1"), [])
+        write(user, json.dumps({"autoMemoryEnabled": False}))
+        self.assertEqual(memory(self.repo), [])
+        self.assertEqual(memory(self.repo, CLAUDE_CODE_DISABLE_AUTO_MEMORY="0"), [mem])  # set but false: on
+        write(user, json.dumps({"autoMemoryEnabled": True}))
+        write(project, json.dumps({"autoMemoryEnabled": False}))
+        self.assertEqual(memory(self.repo), [])
+        project.unlink()
+        moved = write(self.tmp_path / "elsewhere" / "MEMORY.md", "moved\n").resolve()
+        write(user, json.dumps({"autoMemoryDirectory": str(moved.parent)}))
+        self.assertEqual(memory(self.repo), [moved])
+        notes = write(self.home / "notes" / "MEMORY.md", "notes\n").resolve()
+        write(project, json.dumps({"autoMemoryDirectory": "~/notes"}))  # project settings beat user ones
+        self.assertEqual(memory(self.repo), [notes])
+        project.unlink()
+        user.unlink()
+        # CLAUDE_CODE_PROJECT_DIR_NAME beside CLAUDE_CONFIG_DIR names the project folder.
+        named = write(self.home / ".claude" / "projects" / "shared" / "memory" / "MEMORY.md", "shared\n").resolve()
+        self.assertEqual(memory(self.repo, CLAUDE_CONFIG_DIR=str(self.home / ".claude"),
+                                CLAUDE_CODE_PROJECT_DIR_NAME="shared"), [named])
+        self.assertEqual(memory(self.repo, CLAUDE_CODE_PROJECT_DIR_NAME="shared"), [mem])  # needs both
+
+    def test_worktree_sessions_count_for_the_repository(self):
+        # A session started in a worktree, Claude Code's own (.claude/worktrees/<name>) or a
+        # sibling one, is a session in this repository.
+        self._git_repo()
+        self._slim_history()
+        nested = self.repo / ".claude" / "worktrees" / "feat"
+        sibling = self.repo.parent / "repo-wt"
+        self._git("worktree", "add", "-q", "-b", "feat", str(nested))
+        self._git("worktree", "add", "-q", "-b", "wt", str(sibling))
+        for i, day in enumerate(("10", "12", "14")):
+            self._claude_log(f"b{i}", self.repo, f"2026-01-{day}T12:00:00Z", [80_000])
+        for i, (where, day) in enumerate(((nested, "10"), (sibling, "12"), (nested, "14"))):
+            self._claude_log(f"a{i}", where, f"2026-02-{day}T12:00:00Z", [30_000])
+        for path in (self.repo, nested, sibling):
+            res = self.cw_json("report", str(path), "--days", "40000", "--harness", "claude")
+            self.assertEqual(res["sessions"]["claude"]["sessions"], 6, path)
+            s = res["compare"]["sessions"]["claude"]
+            self.assertEqual((s["before"]["sessions"], s["after"]["sessions"]), (3, 3), path)
+        groups = self.cw_json("sessions", "--harness", "claude", "--since", "2026-01-01")
+        self.assertEqual(sorted(groups), [f"claude {self.repo.resolve()}"])
 
     def test_opencode_fallbacks(self):
         write(self.home / ".claude" / "CLAUDE.md", "claude global")
@@ -712,7 +1018,8 @@ class CwTest(unittest.TestCase):
         c = self.cw_json(*args, "--compare-at", "2150-01-01")["compare"]  # git reads no date that late
         self.assertEqual(c["files"]["claude"]["before"], 40_000)
         c = self.cw_json(*args, "--compare-at", "2026-08-19 22:00Z")["compare"]
-        self.assertEqual(c["files"]["claude"]["before"], 0)          # no CLAUDE.md yet
+        # No CLAUDE.md yet, so Claude Code read AGENTS.md, unless a CLAUDE.md sits above.
+        self.assertEqual(c["files"]["claude"]["before"], 0 if self._claude_md_above() else 2)
         self.assertEqual(c["files"]["claude"]["after"], 40_000)      # no cut since: today
         self.assertIn("did not shrink", self.run_cw(*args, "--compare-at", "2026-08-19 22:00Z"))
         c = self.cw_json(*args, "--compare-at", slim)["compare"]

@@ -285,10 +285,16 @@ def _claude_imports(path: Path, text: str, depth: int, seen: set, out: list, rol
         if str(target) in seen:
             continue
         seen.add(str(target))
+        if not _holds_text(target):
+            continue  # Claude Code loads nothing from a file that holds nothing
         entry = file_entry(target, f"{role} import", via=path)
         if entry:
             out.append(entry)
             _claude_imports(target, read_text(target) or "", depth + 1, seen, out, role)
+
+
+def _holds_text(p) -> bool:
+    return _is_file(p) and bool((read_text(p) or "").strip())
 
 
 def _rules(directory: Path) -> tuple[list[Path], int]:
@@ -304,12 +310,138 @@ def _rules(directory: Path) -> tuple[list[Path], int]:
     return eager, scoped
 
 
-def claude_files(cwd) -> dict:
+# Claude Code's built-in agents-md plugin (2.1.277+; read in 2.1.322 on 2026-11-12) decides
+# whether AGENTS.md loads. See references/harnesses.md.
+CLAUDE_MD_NAMES = ("CLAUDE.md", ".claude/CLAUDE.md", "CLAUDE.local.md")
+AGENTS_MD_NAMES = ("AGENTS.md", ".claude/AGENTS.md")
+AGENTS_PLUGIN_IDS = ("cc-plugin-agents-md@builtin", "agents-md@builtin")
+AGENTS_FALLBACK = "claude-md-or-agents-md"
+INSTRUCTION_MODES = (AGENTS_FALLBACK, "claude-md", "claude-md-and-agents-md", "managed-only")
+LEGACY_INSTRUCTIONS = {"none": "managed-only", "claude": "claude-md", "agents-fallback": AGENTS_FALLBACK,
+                       "both": "claude-md-and-agents-md"}
+_MODE_NOTES = {
+    "claude-md": "Claude Code is set to read CLAUDE.md only (instructionFiles): no AGENTS.md loads",
+    "claude-md-and-agents-md": "Claude Code is set to load AGENTS.md beside CLAUDE.md (instructionFiles)",
+    "managed-only": "Claude Code is set to load managed instructions only (instructionFiles): no user or "
+                    "project file loads, and managed files are not read here",
+}
+
+
+def _instruction_mode(cwd) -> tuple[str, str | None]:
+    """Which project instruction files Claude Code loads, and a note unless it is the default.
+    Its agents-md plugin loads AGENTS.md where no CLAUDE.md is (claude-md-or-agents-md), never
+    (claude-md), beside CLAUDE.md (claude-md-and-agents-md), or no user or project file at all
+    (managed-only). /plugin can turn the plugin off in any settings file, the highest one that
+    names it deciding; its options are read from user settings only."""
+    root = project_root(cwd)
+    for p in (root / ".claude" / "settings.local.json", root / ".claude" / "settings.json",
+              claude_dir() / "settings.json"):
+        enabled = _dict(_json_file(p).get("enabledPlugins"))
+        key = next((k for k in AGENTS_PLUGIN_IDS if k in enabled), None)
+        if key is not None:
+            if enabled[key] is not True:  # false, null or anything else turns it off
+                return "claude-md", f"Claude Code's agents-md plugin is off in {short(p)}: no AGENTS.md loads"
+            break
+    configs = _dict(_json_file(claude_dir() / "settings.json").get("pluginConfigs"))
+    options = next((_dict(_dict(configs[k]).get("options")) for k in AGENTS_PLUGIN_IDS if k in configs), {})
+    mode = options.get("instructionFiles")
+    if mode not in INSTRUCTION_MODES:
+        mode = AGENTS_FALLBACK
+    if "projectInstructions" in options and mode == AGENTS_FALLBACK:  # the option's older name
+        old = options["projectInstructions"]
+        mode = LEGACY_INSTRUCTIONS.get(old, "claude-md") if isinstance(old, str) else "claude-md"
+    return mode, _MODE_NOTES.get(mode)
+
+
+def _main_checkout(root: Path) -> Path | None:
+    """The main checkout of the git worktree at `root`, or None. A worktree's .git is a file that
+    names its gitdir, which holds `commondir` (a submodule's gitdir has none); the common dir is
+    the main checkout's .git (a bare repository has no checkout)."""
+    lines = (read_text(root / ".git") or "").strip().splitlines() if _is_file(root / ".git") else []
+    if not lines or not lines[0].startswith("gitdir:"):
+        return None
+    gitdir = Path(lines[0][len("gitdir:"):].strip())
+    if not gitdir.is_absolute():
+        gitdir = root / gitdir
+    common = (read_text(gitdir / "commondir") or "").strip()
+    if not common:
+        return None
+    try:
+        common_dir = (Path(common) if Path(common).is_absolute() else gitdir / common).resolve()
+    except (OSError, RuntimeError):
+        return None
+    if common_dir.name != ".git" or not _is_dir(common_dir.parent):
+        return None
+    return common_dir.parent
+
+
+def _nested_worktree(cwd) -> tuple[Path, Path] | None:
+    """(worktree root, main checkout) for a worktree inside its main checkout, as Claude Code
+    makes them (.claude/worktrees/<name>); None otherwise."""
+    root = git_root(cwd)
+    main = _main_checkout(root) if root else None
+    if main is None:
+        return None
+    for p in root.parents:
+        if _same_dir(p, main):
+            return root, p
+    return None
+
+
+def _claude_walk(cwd) -> list[Path]:
+    """Folders Claude Code reads CLAUDE.md files and rules from, top down: the start folder and
+    each one above it, not the filesystem root. In a worktree inside its main checkout it skips
+    the main checkout's own folders, since the worktree holds its own copy of their files."""
+    dirs = [d for d in top_down(cwd) if d != Path(d.anchor)]
+    nested = _nested_worktree(cwd)
+    if nested:
+        wt, main = nested
+        dirs = [d for d in dirs if not (_inside(d, main) and not _inside(d, wt))]
+    return dirs
+
+
+_ENV_ON, _ENV_OFF = ("1", "true", "yes", "on"), ("0", "false", "no", "off")
+
+
+def _auto_memory_file(cwd) -> Path | None:
+    """MEMORY.md of Claude Code's auto memory here, or None when it is off. One per git
+    repository, shared by its worktrees and subfolders: <config dir>/projects/<project>/memory/,
+    where CLAUDE_CODE_PROJECT_DIR_NAME, set beside CLAUDE_CONFIG_DIR, names <project>, and
+    autoMemoryDirectory (an absolute path or ~/...) moves it."""
+    switch = os.environ.get("CLAUDE_CODE_DISABLE_AUTO_MEMORY", "").strip().lower()
+    if switch in _ENV_ON:
+        return None
+    settings = _claude_settings(cwd)
+    if switch not in _ENV_OFF and settings.get("autoMemoryEnabled", True) in (False, None, 0, ""):
+        return None  # a set but false switch turns it on whatever the settings say
+    moved = settings.get("autoMemoryDirectory")
+    if isinstance(moved, str) and (os.path.isabs(moved) or moved.startswith("~/")):
+        return Path(os.path.expanduser(moved)) / "MEMORY.md"
+    name = os.environ.get("CLAUDE_CODE_PROJECT_DIR_NAME")
+    if not (name and os.environ.get("CLAUDE_CONFIG_DIR")):
+        root = git_root(cwd)
+        main = _main_checkout(root) if root else None
+        name = re.sub(r"[^A-Za-z0-9]", "-", str(_true_case(main or project_root(cwd))))
+    return claude_dir() / "projects" / name / "memory" / "MEMORY.md"
+
+
+def claude_files(cwd, copy_root=None, claude_md_outside=False, mode=None) -> dict:
+    """What Claude Code loads at startup in `cwd`: the user's CLAUDE.md and rules; in each folder
+    of _claude_walk, CLAUDE.md, .claude/CLAUDE.md, CLAUDE.local.md and .claude/rules; AGENTS.md
+    as the mode says (_instruction_mode); auto memory. A file that holds nothing loads nothing.
+
+    `copy_root`: an old commit copied there is weighed. Only folders from it down count, and
+    `claude_md_outside` says whether a CLAUDE.md the copy cannot hold (above the repo, or one git
+    ignores) kept AGENTS.md out; `mode` then comes from the real repo's settings."""
     out: list[dict] = []
     seen: set[str] = set()
     notes: list[str] = []
+    if mode is None:
+        mode, note = _instruction_mode(cwd)
+        if note:
+            notes.append(note)
 
-    def add(p: Path, role: str) -> None:
+    def add(p: Path, role: str, into: list) -> None:
         try:
             if not _is_file(p):
                 return
@@ -319,33 +451,59 @@ def claude_files(cwd) -> dict:
         if rp in seen:
             return
         seen.add(rp)
+        text = read_instruction(p)
+        if not (text and text.strip()):
+            return
         entry = file_entry(p, role)
         if entry:
-            out.append(entry)
-            _claude_imports(Path(rp), read_text(p) or "", 1, seen, out, role)
+            into.append(entry)
+            _claude_imports(Path(rp), text, 1, seen, into, role)
 
     cd = claude_dir()
-    add(cd / "CLAUDE.md", "user")
-    eager, scoped = _rules(cd / "rules")
-    for r in eager:
-        add(r, "user rule")
-    for d in top_down(cwd):
-        add(d / "CLAUDE.md", "project")
-        add(d / ".claude" / "CLAUDE.md", "project")
-        add(d / "CLAUDE.local.md", "local")
-    eager, scoped2 = _rules(project_root(cwd) / ".claude" / "rules")
-    for r in eager:
-        add(r, "project rule")
+    walk = _claude_walk(cwd)
+    if copy_root is not None:
+        top = Path(copy_root).resolve()
+        walk = [d for d in walk if _inside(d, top)]
+    scoped = 0
+    if mode != "managed-only":
+        add(cd / "CLAUDE.md", "user", out)
+        eager, scoped = _rules(cd / "rules")
+        for r in eager:
+            add(r, "user rule", out)
+        for d in walk:
+            add(d / "CLAUDE.md", "project", out)
+            add(d / ".claude" / "CLAUDE.md", "project", out)
+            add(d / "CLAUDE.local.md", "local", out)
+            if not _same_dir(d / ".claude", cd):  # in the home folder ~/.claude/rules are the user's
+                eager, n = _rules(d / ".claude" / "rules")
+                scoped += n
+                for r in eager:
+                    add(r, "project rule", out)
+    if mode in (AGENTS_FALLBACK, "claude-md-and-agents-md"):
+        user_md = cd / "CLAUDE.md"
+        has_claude_md = claude_md_outside or any(
+            _holds_text(d / n) and not _same_dir(d / n, user_md) for d in walk for n in CLAUDE_MD_NAMES)
+        if mode != AGENTS_FALLBACK or not has_claude_md:
+            # An AGENTS.md part (the file or one it imports) that is a loaded file, or holds the
+            # same text as a loaded project file, is skipped.
+            known = {(read_text(e["path"]) or "").strip() for e in out if not e["role"].startswith("user")}
+            agents: list[dict] = []
+            for d in walk:
+                for n in AGENTS_MD_NAMES:
+                    add(d / n, "project", agents)
+            agents = [e for e in agents if (read_text(e["path"]) or "").strip() not in known]
+            out += agents
+            if agents and mode == AGENTS_FALLBACK:
+                notes.append("no CLAUDE.md here or above, so Claude Code (2.1.277+) loads AGENTS.md instead")
     # Auto memory: Claude Code loads the start of MEMORY.md (first 200 lines / 25 KB).
-    slug = re.sub(r"[^A-Za-z0-9]", "-", str(project_root(cwd)))
-    mem = cd / "projects" / slug / "memory" / "MEMORY.md"
-    text = read_instruction(mem) if _is_file(mem) else None
+    mem = _auto_memory_file(cwd) if copy_root is None else None
+    text = read_instruction(mem) if mem and _is_file(mem) else None
     if text:
         head = "\n".join(text.splitlines()[:200]).encode("utf-8")[:25_000].decode("utf-8", errors="ignore")
         out.append({"path": str(mem), "role": "user memory", "via": None, "bytes": len(head.encode("utf-8")),
                     "chars": len(head), "lines": len(head.splitlines()), "tokens": est_tokens(head)})
-    if scoped + scoped2:
-        notes.append(f"{scoped + scoped2} path-scoped rule file(s) load on demand, not counted")
+    if scoped:
+        notes.append(f"{scoped} path-scoped rule file(s) load on demand, not counted")
 
     warnings = []
     for e in out:
@@ -504,11 +662,13 @@ def _inside(path, root: Path) -> bool:
     return p == root or root in p.parents
 
 
-def scan_files(cwd, harnesses) -> dict:
+def scan_files(cwd, harnesses, copy_root=None, claude_md_outside=False, mode=None) -> dict:
+    """Each harness's startup files. The other arguments are claude_files' and are given only
+    when an old commit's copy is weighed."""
     root = project_root(cwd)
     result = {}
     for h in harnesses:
-        r = FILE_SCANNERS[h](cwd)
+        r = claude_files(cwd, copy_root, claude_md_outside, mode) if h == "claude" else FILE_SCANNERS[h](cwd)
         repo = [e for e in r["files"] if _inside(e["path"], root)]
         r["total_tokens"] = sum(e["tokens"] for e in r["files"])
         r["repo_tokens"] = sum(e["tokens"] for e in repo)                          # what the harness loads
@@ -526,9 +686,14 @@ def scan_files(cwd, harnesses) -> dict:
     if "claude" in result and "codex" in result and (c or x):
         ct = sum(e["tokens"] for e in c)
         xt = sum(e["tokens"] for e in x)
-        linked = any("@AGENTS.md" in (read_text(e["path"]) or "") for e in c) or any(
-            Path(e["path"]).is_symlink() for e in c + x)
-        if not linked and max(ct, xt) > 2 * max(1, min(ct, xt)):
+        # Linked when both load one real file: an @import, a symlink, or AGENTS.md read by both.
+        def real(e):
+            try:
+                return str(Path(e["path"]).resolve())
+            except (OSError, RuntimeError):
+                return e["path"]
+        shared = {real(e) for e in result["claude"]["files"] if _inside(e["path"], root)} & {real(e) for e in x}
+        if not shared and max(ct, xt) > 2 * max(1, min(ct, xt)):
             result.setdefault("cross", []).append(
                 f"Claude Code loads ~{fmt_k(ct)} tokens of project instructions, Codex ~{fmt_k(xt)}: "
                 "the harnesses follow different rules in this repo")
@@ -859,12 +1024,20 @@ def summarize(sessions: list[Session], threshold: int) -> dict | None:
 
 
 def project_key(cwd: str) -> str:
-    """Git root of the session's cwd; a deleted subdirectory folds into its repo."""
+    """Git repository of the session's cwd: a deleted subdirectory folds into its repo, and a
+    worktree into its main checkout."""
     p = Path(cwd)
     while not _exists(p) and p.parent != p:
         p = p.parent
     root = git_root(p)
-    return str(root) if root else cwd
+    if not root:
+        return cwd
+    if str(root) not in _MAIN_CHECKOUT:
+        _MAIN_CHECKOUT[str(root)] = _main_checkout(root)
+    return str(_MAIN_CHECKOUT[str(root)] or root)
+
+
+_MAIN_CHECKOUT: dict[str, Path | None] = {}
 
 
 _SAME_DIR: dict[tuple[str, str], bool] = {}
@@ -1008,6 +1181,10 @@ class _Repo:
         self.skip = ("160000",) if plain_links else ("120000", "160000")
         self.listed = _opencode_patterns(read_text(root / "opencode.json"))  # files opencode.json lists
         self.snaps: dict = {}  # (rev, harnesses) -> _snapshot_load
+        # Claude Code's instruction mode, from the real settings (a copy holds none of them), and
+        # whether a CLAUDE.md no copy holds kept AGENTS.md out (_claude_md_kept_out).
+        self.claude_mode: str | None = None
+        self.claude_md_outside = False
 
     def on_path(self, rel: str) -> bool:
         d = _load_dir(rel)
@@ -1430,7 +1607,9 @@ def _weigh_snapshot(repo: _Repo, rev: str, hs):
                 cwd.mkdir(parents=True, exist_ok=True)
             except OSError:  # the folder was a link that leads nowhere in the old commit
                 cwd = dest
-            return _repo_load(scan_files(str(cwd), hs), dest, None)
+            scan = scan_files(str(cwd), hs, copy_root=dest, claude_md_outside=repo.claude_md_outside,
+                              mode=repo.claude_mode)
+            return _repo_load(scan, dest, None)
     finally:
         del UNREADABLE[seen_unreadable:]  # the copies are gone; warn only about the real files
 
@@ -1550,6 +1729,26 @@ def _cut_since(repo: _Repo, rev: str, hs, snap, today):
     return load, files
 
 
+def _claude_md_kept_out(path, root: Path, ignored) -> bool:
+    """Did a CLAUDE.md that no old commit's copy holds keep AGENTS.md out of Claude Code? One
+    in a folder above the repo, or one git ignores (CLAUDE.local.md) on the way down to `path`,
+    which is taken to have been there all along."""
+    user_md = claude_dir() / "CLAUDE.md"
+    skip = set(ignored or ())
+    folders = [d for d in skip if d.endswith("/")]
+    for d in _claude_walk(path):
+        for n in CLAUDE_MD_NAMES:
+            p = d / n
+            if not _holds_text(p) or _same_dir(p, user_md):
+                continue
+            if not _inside(d, root):
+                return True
+            rel = (d / n).relative_to(root).as_posix()
+            if rel in skip or any(rel.startswith(f) for f in folders):
+                return True
+    return False
+
+
 def compare(path, hs, files_now: dict, sessions, days: int, threshold: int, at=None):
     """Before and after the last cut of this repo's instruction files.
 
@@ -1578,6 +1777,8 @@ def compare(path, hs, files_now: dict, sessions, days: int, threshold: int, at=N
     if work is None:
         return None
     tracked, other, ignored = work
+    repo.claude_mode = _instruction_mode(path)[0]
+    repo.claude_md_outside = _claude_md_kept_out(path, root, ignored)
     after, after_files = _repo_load(files_now, root, ignored)
     after_all, after_all_files = _repo_load(files_now, root, None)
     local = {h: after_all.get(h, 0) - after.get(h, 0) for h in after_all}  # what ignored files load now
@@ -1647,7 +1848,7 @@ def compare(path, hs, files_now: dict, sessions, days: int, threshold: int, at=N
                for rel in set(before_files) | set(cut_files)
                if before_files.get(rel, 0) != cut_files.get(rel, 0)]
     changed.sort(key=lambda x: (-abs(x["after"] - x["before"]), x["path"]))
-    key = str(root)
+    key = project_key(str(root))  # a worktree's sessions are its repository's
     mine = [(s, _when(s.start)) for s in sessions if s.reqs and _same_dir(project_key(s.cwd), key)]
     try:
         lo = at_time - dt.timedelta(days=days)
@@ -2911,7 +3112,7 @@ def _main(argv=None) -> int:
         # Sessions logged under another spelling of this folder (letter case) are this project too.
         groups: dict[tuple[str, str], list[Session]] = {}
         for (h, key), v in group_sessions(all_sessions, since=since).items():
-            if _same_dir(key, root):
+            if _same_dir(key, project_key(root)):  # a worktree's sessions are its repository's
                 groups.setdefault((h, root), []).extend(v)
         stats = {h: summarize(v, a.threshold) for (h, _), v in groups.items()}
         found = findings(files, skills, stats, a.target)
