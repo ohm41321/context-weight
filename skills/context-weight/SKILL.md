@@ -22,43 +22,53 @@ history.
 
 ## 1. Weigh (read-only)
 
+Every time this skill runs, start here and show the user the picture:
+
 ```bash
-python3 <skill-dir>/scripts/cw.py report <repo> --days 30 --svg
+python3 <skill-dir>/scripts/cw.py report <repo> --days 30 --open
 ```
 
-`--svg` also draws the report as one picture in the system temp folder and
-prints its path on the last line (`Picture: ...`). Give the user that path so
-they can read the numbers at a glance; add `--open` to open it for them when they
-ask to see it. Use `--svg FILE` to choose the place, never a path inside the repo
-unless the user asks.
+`--open` draws the report as one picture in a fresh folder in the system temp
+folder, opens it in the user's viewer, and prints its path on the last line
+(`Picture: ...`). Always give the user that path too: on a remote or headless
+machine nothing opens, and `cw.py` says so on stderr. Use `--svg FILE` to choose
+the place, never a path inside the repo unless the user asks.
 
-The text output has up to five parts:
+The picture reads top to bottom: the verdict, the startup load, where it comes
+from (this repo's files, files outside it, the skill listing), at most three
+things to do, then the details. The text output starts with the same verdict
+(`Verdict: ...`), then has up to five parts:
 
 - **Before and after**, when git shows a slimming: uncommitted changes that cut
   the instruction files, or the newest commit or merge on the main line that
   did. It shows this repo's files before and right after the change (and now,
   when they grew back), and measured startup in the sessions before and after it;
 - the instruction files each harness loads at startup, in estimated tokens;
-- the skill listing against each harness's budget;
+- the skill listing against each harness's budget, with a `fix:` line when it
+  is over;
 - measured session numbers for this repo;
-- ranked findings.
+- findings, the most urgent first.
 
 Narrower views: `files <repo>`, `skills <repo>`, `sessions --top 20`,
 `sessions --project <name> --compare-at YYYY-MM-DD`. Add `--json` to any of
-them.
+them; `report --json` also has `verdict` and, with `--open` or `--svg`,
+`picture`.
 
 When you report to the user, give:
 
-- startup tokens per harness;
+- the verdict, in plain words and the user's language;
+- startup tokens per harness and where they come from;
 - `start` (median context of a session's first request);
 - `start%` (share of all input that is that startup load being re-sent);
 - the `>threshold tok` share;
-- the findings.
+- the top findings, each with the lever it names.
 
 Say which numbers are estimates (`files`, `skills`) and which are measured
 (`sessions`). The Claude Code skill budget depends on the model's context
-window, which the logs do not record: `cw.py` assumes 200k and says so. If the
-user runs a 1M-context model, rerun with `--window 1000000`.
+window. `cw.py` takes the model from this repo's logs; with none it assumes
+today's default 1M window and says so. For a 200k-context model, rerun with
+`--window 200000`. For Codex it uses the window Codex logged, and assumes 272k
+when there are no Codex logs.
 
 ## 2. Pick the lever the numbers point at
 
@@ -68,7 +78,7 @@ user runs a 1M-context model, rerun with `--window 1000000`.
 | `>threshold tok` over 50% | Session hygiene (step 4) |
 | "harnesses follow different rules" | One canonical AGENTS.md (step 3) |
 | Codex "never sees" warning | Slim, or move parts into nested AGENTS.md files |
-| skill listing over budget | Uninstall unused skills or plugins. Ask first: it is the user's setup |
+| skill listing over budget | The finding's `Fix:` names the setting: turn off or hide unused skills, keep hand-run skills out of the listing, shorten the longest descriptions, or raise the budget. Ask first: it is the user's setup |
 
 Start with the largest number. Leave alone anything the numbers do not point at.
 

@@ -43,7 +43,7 @@ from collections import Counter, deque
 from pathlib import Path, PurePosixPath
 from xml.sax.saxutils import escape
 
-VERSION = "0.3.2"
+VERSION = "0.4.0"
 HARNESSES = ("claude", "codex", "gemini", "opencode")
 
 CLAUDE_FILE_WARN_CHARS = 40_000   # Claude Code startup warning: "Large CLAUDE.md will impact performance"
@@ -2087,7 +2087,8 @@ def _claude_skills(cwd, window: int | None = None) -> dict:
             else:
                 losing.append(k)
     heaviest = sorted(zip(widths, range(n)), key=lambda t: (-t[0], t[1]))[:5]
-    return {"count": n, "tokens": sum(est_tokens(e["line"] + "\n") for e in entries),
+    tokens = sum(est_tokens(e["line"] + "\n") for e in entries)
+    return {"count": n, "tokens": tokens, "loaded_tokens": tokens if used <= budget else tokens * budget // used,
             "chars": len("\n".join(e["line"] for e in entries)), "used": used,
             "desc_chars": sum(e["desc_chars"] for e in entries), "budget": budget, "budget_unit": "chars",
             "window": w, "window_source": w_source, "model": model, "model_source": model_source,
@@ -3070,6 +3071,7 @@ def codex_listing(cwd, window: int | None = None) -> dict:
     text = roots_used + [e["line"] for e in entries]
     return {"entries": entries, "roots": roots_used, "count": len(entries), "aliases": len(roots_used),
             "tokens": sum(est_tokens(x + "\n") for x in text), "chars": len("\n".join(text)), "used": used,
+            "loaded_tokens": sum(est_tokens(x + "\n") for x in text),
             "loaded": extra + layout[3], "desc_chars": sum(len(d) for _, d, _ in rows), **b,
             "over_budget": used > b["budget"], "lose_descriptions": len(losing), "losing_descriptions": losing,
             "omitted": omitted, "hidden": dict(hidden), "heaviest": [{"name": n, "tokens": t} for t, n in heaviest]}
@@ -4400,8 +4402,31 @@ def print_sessions(groups: dict, threshold: int, top: int) -> None:
 
 # --------------------------------------------------------------------------- findings
 
-def findings(files: dict, skills: dict, stats: dict, target: int) -> list[str]:
+def _warning_title(h: str, w: str) -> tuple[str, str]:
+    a = AGENT_NAMES[h]
+    if "project_doc_max_bytes" in w:
+        return f"{a} never reads the end of an instruction file", "crit"
+    if " chars > " in w:
+        return f"shorten a large {a} instruction file", "warn"
+    if " lines > " in w:
+        return f"shorten a long {a} instruction file", "warn"
+    if "imported with @" in w:
+        return f"check what an @import adds to {a}", "warn"
+    return f"check a {a} loading warning", "warn"
+
+
+def finding_items(files: dict, skills: dict, stats: dict, target: int) -> list[dict]:
+    """What to fix, in the report's order: [{"who": agent or "all", "title": a short imperative,
+    "text": the full finding, "level": "crit" or "warn"}]."""
     out = []
+
+    def add(who, title, text, level):
+        out.append({"who": who, "title": title, "text": text, "level": level})
+
+    def slim(h, f):
+        return f"slim {AGENT_NAMES[h]}'s repo instructions to ~{fmt_k(target)} tokens", \
+            "crit" if f["repo_tokens"] > 2 * target else "warn"
+
     for h, s in stats.items():
         f = files.get(h)
         if not (f and s):
@@ -4409,32 +4434,83 @@ def findings(files: dict, skills: dict, stats: dict, target: int) -> list[str]:
         cut = f["repo_tokens"] - target
         if cut > FINDING_MIN_CUT:
             saved = cut * s["requests"]
-            out.append(f"[{h}] repo instructions ~{fmt_k(f['repo_tokens'])} tokens are re-sent on every request. "
-                       f"Slimming to ~{fmt_k(target)} would have saved ~{fmt_k(saved)} of "
-                       f"{fmt_k(s['input_tokens'])} input tokens in this window ({pct(saved / s['input_tokens'])}, "
-                       "estimated at today's file size). See references/slimming.md")
+            title, level = slim(h, f)
+            add(h, title, f"repo instructions ~{fmt_k(f['repo_tokens'])} tokens are re-sent on every request. "
+                f"Slimming to ~{fmt_k(target)} would have saved ~{fmt_k(saved)} of {fmt_k(s['input_tokens'])} "
+                f"input tokens in this window ({pct(saved / s['input_tokens'])}, estimated at today's file size). "
+                "See references/slimming.md", level)
         if s["over_threshold_tokens"] > 0.5:
-            out.append(f"[{h}] {pct(s['over_threshold_tokens'])} of input tokens came from requests above the "
-                       "threshold: long sessions dominate. Hand off and start fresh sessions earlier")
+            add(h, f"start fresh {AGENT_NAMES[h]} sessions sooner",
+                f"{pct(s['over_threshold_tokens'])} of input tokens came from requests above the threshold: long "
+                "sessions dominate. Hand off and start fresh sessions earlier", "warn")
     for h in HARNESSES:
         f = files.get(h)
         if not f:
             continue
         if h not in stats and f["repo_tokens"] - target > FINDING_MIN_CUT:
-            out.append(f"[{h}] repo instructions ~{fmt_k(f['repo_tokens'])} tokens load at startup "
-                       "(no session logs in this window to measure the cost)")
+            title, level = slim(h, f)
+            add(h, title, f"repo instructions ~{fmt_k(f['repo_tokens'])} tokens load at startup "
+                "(no session logs in this window to measure the cost)", level)
         for w in f["warnings"]:
-            out.append(f"[{h}] {w}")
+            title, level = _warning_title(h, w)
+            add(h, title, w, level)
     for w in files.get("cross", []):
-        out.append(f"[all] {w}. Keep one canonical AGENTS.md and import it from CLAUDE.md")
+        add("all", "give every agent the same rules", f"{w}. Keep one canonical AGENTS.md and import it from CLAUDE.md",
+            "warn")
     for u in files.get("unreadable", []):
-        out.append(f"[all] cannot read {short(u)}: it is not counted, and the agent cannot load it either")
+        add("all", "fix an instruction file no agent can read",
+            f"cannot read {short(u)}: it is not counted, and the agent cannot load it either", "warn")
     for h, r in skills.items():
-        if r["over_budget"]:
-            out.append(f"[{h}] {r['count']} skills need ~{fmt_k(r['used'])} {r['budget_unit']} of listing, budget "
-                       f"{fmt_k(r['budget'])} ({r['basis']}), over by ~{fmt_k(r['used'] - r['budget'])}: "
-                       f"{skill_loss(h, r)}. Fix: {skill_fix(h, r)}")
+        if r.get("over_budget"):
+            add(h, f"fit {AGENT_NAMES[h]}'s skill listing in its budget",
+                f"{r['count']} skills need ~{fmt_k(r['used'])} {r['budget_unit']} of listing, budget "
+                f"{fmt_k(r['budget'])} ({r['basis']}), over by ~{fmt_k(r['used'] - r['budget'])}: "
+                f"{skill_loss(h, r)}. Fix: {skill_fix(h, r)}", "crit")
     return out
+
+
+def findings(files: dict, skills: dict, stats: dict, target: int) -> list[str]:
+    return [f"[{x['who']}] {x['text']}" for x in _ranked(finding_items(files, skills, stats, target))]
+
+
+def _ranked(items: list[dict]) -> list[dict]:
+    """Urgent first, otherwise in the report's order."""
+    return sorted(items, key=lambda x: x["level"] != "crit")
+
+
+def _skill_tokens(r: dict | None) -> int:
+    """About how many tokens of skill listing load: what fits the budget."""
+    if not r:
+        return 0
+    return r.get("loaded_tokens", r.get("tokens", 0))
+
+
+def _startup(files: dict, skills: dict, h: str) -> int:
+    return files[h]["total_tokens"] + _skill_tokens(skills.get(h))
+
+
+def verdict(files: dict, skills: dict, stats: dict, target: int) -> dict:
+    """The report in one line: {"level": "crit", "warn" or "good", "headline", "detail"}."""
+    items = _ranked(finding_items(files, skills, stats, target))
+    if items:
+        first = items[0]
+        crit = first["level"] == "crit"
+        level, headline = ("crit" if crit else "warn"), ("Fix this first: " if crit else "Worth a look: ") + first["title"]
+    else:
+        near = _over_target(files, target)
+        level, headline = ("warn", near) if near else ("good", "Nothing to fix: startup context is within target.")
+    agents = [h for h in HARNESSES if h in files]
+    heavy = max(agents, key=lambda h: _startup(files, skills, h), default=None)
+    detail = ""
+    if heavy:
+        detail = f"{AGENT_NAMES[heavy]} loads ~{fmt_k(_startup(files, skills, heavy))} tokens before your first message"
+        s = stats.get(heavy)
+        if s and s.get("input_tokens"):
+            detail += f", and that load was {pct(s['startup_share'])} of its input here, re-sent with every request"
+        detail += "."
+        if len(items) > 1:
+            detail += f" {len(items)} things to fix in all."
+    return {"level": level, "headline": headline, "detail": detail}
 
 
 def _names(names, most=3) -> str:
@@ -4494,10 +4570,10 @@ AGENT_NAMES = {"claude": "Claude Code", "codex": "Codex", "gemini": "Gemini CLI"
 
 _LIGHT = {"surface": "#fcfcfb", "ink": "#0b0b0b", "ink2": "#52514e", "muted": "#7a7873", "grid": "#e1e0d9",
           "border": "rgba(11,11,11,0.10)", "repo": "#2a78d6", "other": "#eb6834", "warn": "#fab219",
-          "crit": "#d03b3b", "good": "#0ca30c"}
+          "crit": "#d03b3b", "good": "#0ca30c", "skill": "#1baf7a", "panel": "#f3f2ee"}
 _DARK = {"surface": "#1a1a19", "ink": "#f0efec", "ink2": "#c3c2b7", "muted": "#9a988f", "grid": "#2c2c2a",
          "border": "rgba(255,255,255,0.10)", "repo": "#3987e5", "other": "#d95926", "warn": "#fab219",
-         "crit": "#d03b3b", "good": "#0ca30c"}
+         "crit": "#d03b3b", "good": "#0ca30c", "skill": "#199e70", "panel": "#222220"}
 
 
 def _css_vars(c: dict) -> str:
@@ -4517,7 +4593,7 @@ def _svg_style(theme: str) -> str:
             "fill:var(--ink)}"
             ".s{fill:var(--ink2)}.m{fill:var(--muted)}.b{font-weight:600}.n{font-variant-numeric:tabular-nums}"
             ".r{text-anchor:end}.bg{fill:var(--surface);stroke:var(--border)}.hl{stroke:var(--grid)}"
-            ".tgt{stroke:var(--muted)}.repo{fill:var(--repo)}.other{fill:var(--other)}.track{fill:var(--grid)}"
+            ".tgt{stroke:var(--muted)}.repo{fill:var(--repo)}.other{fill:var(--other)}.skill{fill:var(--skill)}.panel{fill:var(--panel)}.track{fill:var(--grid)}"
             ".warn{fill:var(--warn)}.crit{fill:var(--crit)}.good{fill:var(--good)}.on{fill:#fff}.on-dark{fill:#0b0b0b}")
 
 
@@ -4566,10 +4642,10 @@ class _Svg:
         tip = f"<title>{_xml(title)}</title>" if title else ""
         self.parts.append(f'<text x="{x:.1f}" y="{y:.1f}" font-size="{size}" class="{cls}">{tip}{_xml(s)}</text>')
 
-    def lead(self, x, y, lead, rest, size=14):
+    def lead(self, x, y, lead, rest, size=14, cls=""):
         """One line that opens with a bold lead-in, such as an agent name."""
-        self.parts.append(f'<text x="{x:.1f}" y="{y:.1f}" font-size="{size}"><tspan class="b">{_xml(lead)}</tspan>'
-                          f"{_xml(rest)}</text>")
+        self.parts.append(f'<text x="{x:.1f}" y="{y:.1f}" font-size="{size}" class="{cls}"><tspan class="b">'
+                          f"{_xml(lead)}</tspan>{_xml(rest)}</text>")
 
     def rect(self, x, y, w, h, cls, rx=0, title=None):
         tip = f"<title>{_xml(title)}</title>" if title else ""
@@ -4599,13 +4675,29 @@ class _Svg:
                           f'class="b {ink}">{glyph}</text>')
 
 
+def _svg_items(rep: dict) -> list[dict]:
+    """The findings to draw, most urgent first. A report put together by hand, without the
+    numbers a verdict needs, gives its finding texts alone."""
+    if "verdict" in rep:
+        return _ranked(finding_items(rep["files"], rep["skills"], rep["sessions"], rep["target"]))
+    out = []
+    for x in rep["findings"]:
+        m = re.match(r"\[(\w+)\] ", x)
+        out.append({"who": m.group(1) if m else "all", "title": "", "text": x[m.end():] if m else x,
+                    "level": "warn"})
+    return out
+
+
 def render_svg(rep: dict, theme: str = "auto") -> str:
-    """The report as one SVG picture: what loads at startup, the heaviest files, the skill
-    listing, measured sessions and what to do. Same numbers as the text report."""
+    """The report as one SVG picture, read top to bottom: the verdict, the startup load, where it
+    comes from, what to do, before and after, then the details. Same numbers as the text report."""
     W, L, R = 960, 40, 920
     files, skills, stats = rep["files"], rep["skills"], rep["sessions"]
     target, days = rep["target"], rep["days"]
     agents = [h for h in HARNESSES if h in files]
+    measured = {h: s for h, s in stats.items() if s}
+    items = _svg_items(rep)
+    v = rep.get("verdict") or verdict(files, skills, stats, target)
     g = _Svg()
     y = 52.0
 
@@ -4615,19 +4707,30 @@ def render_svg(rep: dict, theme: str = "auto") -> str:
     g.text(L, y, _fit(short(rep["project"]), R - L, 26), 26, "b")
     y += 22
     g.text(L, y, "Instruction sizes are estimates. Session numbers are measured from local logs.", 13, "m")
-    y += 26
+    y += 20
 
-    # hero: the heaviest startup load, then up to three stat tiles
-    heavy = max(agents, key=lambda h: files[h]["total_tokens"], default=None)
+    # the verdict: one sentence, then the numbers behind it
+    head = _wrap(v["headline"], R - L - 70, 18) or [""]
+    sub = _wrap(v["detail"], R - L - 70, 14) if v["detail"] else []
+    box_h = 26 + 24 * len(head) + (6 + 20 * len(sub) if sub else 0)
+    g.rect(L, y, R - L, box_h, "panel", rx=10)
+    g.badge(L + 24, y + 26, v["level"])
+    for j, ln in enumerate(head):
+        g.text(L + 44, y + 32 + 24 * j, ln, 18, "b")
+    for j, ln in enumerate(sub):
+        g.text(L + 44, y + 32 + 24 * (len(head) - 1) + 26 + 20 * j, ln, 14, "s")
+    y += box_h + 8
+
+    # hero: the heaviest startup load, then up to three tiles about the same agent
+    heavy = max(agents, key=lambda h: _startup(files, skills, h), default=None)
     hero_top = y
     if heavy:
-        g.text(L, y + 54, f"~{fmt_k(files[heavy]['total_tokens'])}", 52, "b")
-        caption = f"tokens of instruction files load at startup in {AGENT_NAMES[heavy]}"
+        g.text(L, y + 54, f"~{fmt_k(_startup(files, skills, heavy))}", 52, "b")
+        caption = f"tokens load at startup in {AGENT_NAMES[heavy]}, before your first message"
         for j, ln in enumerate(_wrap(caption, 300, 14)[:2]):
             g.text(L, y + 80 + 18 * j, ln, 14, "s")
     # Every tile describes the hero's agent: mixing agents in one row reads as one agent's numbers.
     tiles = []
-    measured = {h: s for h, s in stats.items() if s}
     s = measured.get(heavy)
     if s:
         name = AGENT_NAMES[heavy]
@@ -4653,9 +4756,86 @@ def render_svg(rep: dict, theme: str = "auto") -> str:
     y = hero_top + 118
     g.line(L, y, R, y, "hl")
 
+    # where the startup tokens come from: each agent's load in up to three parts, on one scale
+    parts = (("repo", "This repo", "this repo", "this repo"),
+             ("other", "Outside this repo", "outside", "outside this repo"),
+             ("skill", "Skill listing", "skill listing", "skill listing"))
+    rows = [(h, (files[h]["repo_tokens"], max(0, files[h]["total_tokens"] - files[h]["repo_tokens"]),
+                 _skill_tokens(skills.get(h)))) for h in agents]
+    y += 38
+    g.text(L, y, "Where the startup tokens come from", 17, "b")
+    lx = R
+    for k in reversed([k for k in range(3) if any(a[k] for _, a in rows)]):
+        lx -= _text_px(parts[k][1], 13) + 34
+        g.rect(lx, y - 10, 12, 12, parts[k][0], rx=3)
+        g.text(lx + 18, y, parts[k][1], 13, "s")
+    y += 20
+    g.text(L, y, "Estimated tokens each agent reads before your first message, and sends again with every request.",
+           13, "m")
+    y += 18
+    x0, x1 = L + 130, R - 92
+    scale = (x1 - x0) / max([sum(a) for _, a in rows] + [target, 1])
+    tx = x0 + target * scale
+    g.text(tx + 4, y + 6, f"target ~{fmt_k(target)} for this repo", 11, "m")
+    for h, amounts in rows:
+        cy = y + 22
+        g.line(tx, cy - 13, tx, cy + 13, "tgt")  # only across the bar: a long line would cut the labels
+        g.text(L, cy + 5, AGENT_NAMES[h], 14)
+        total = sum(amounts)
+        if total == 0:
+            g.text(x0, cy + 5, "nothing loads", 13, "m")
+        else:
+            n = len(files[h]["files"])
+            tip = f"{AGENT_NAMES[h]}: ~{fmt_k(total)} tokens from {n} file{'' if n == 1 else 's'}"
+            tip += " and the skill listing" if amounts[2] else ""
+            x, last = x0, max(k for k in range(3) if amounts[k])
+            for k in range(3):
+                if not amounts[k]:
+                    continue
+                gap = 2 if x > x0 else 0
+                w = amounts[k] * scale
+                g.bar(x + gap, cy - 9, w - gap, 18, parts[k][0], round_end=k == last,
+                      title=f"{tip}; {parts[k][2]} ~{fmt_k(amounts[k])}")
+                x += w
+            g.text(x + 10, cy + 5, f"~{fmt_k(total)}", 14, "b n")
+            label = " · ".join(f"{parts[k][3]} ~{fmt_k(amounts[k])}" for k in range(3) if amounts[k])
+            g.text(x0, cy + 27, _fit(label, R - x0, 12, left=False), 12, "m")
+        y += 50
+    y += 16
+
+    # what to do: the three that matter most, each with its reason and the lever to pull
+    g.line(L, y, R, y, "hl")
+    y += 38
+    g.text(L, y, "What to do", 17, "b")
+    if not items:
+        y += 30
+        g.text(L, y, "Nothing large to fix. The details below show what each agent loads." if v["level"] == "warn"
+               else "Nothing to do. Run this again when an instruction file or a skill changes.", 14, "s")
+    for i, item in enumerate(items[:3], 1):
+        y += 34
+        g.text(L, y, f"{i}.", 14, "b n")
+        who = (AGENT_NAMES.get(item["who"], "All agents") + ": ")
+        if item["title"]:
+            title = item["title"][:1].upper() + item["title"][1:]
+            for j, ln in enumerate(_wrap(title, R - L - 26, 15) or [""]):
+                y += 20 if j else 0
+                g.text(L + 26, y, ln, 15, "b")
+            y += 20
+        for j, ln in enumerate(_wrap(who + item["text"], R - L - 26, 13) or [""]):
+            y += 18 if j else 0
+            if j == 0 and ln.startswith(who):
+                g.lead(L + 26, y, who, ln[len(who):], 13, "s")
+            else:
+                g.text(L + 26, y, ln, 13, "s")
+    if len(items) > 3:
+        y += 30
+        g.text(L + 26, y, f"{len(items) - 3} more in the text report: cw.py report", 13, "m")
+    y += 34
+
     # before and after the last slimming, when git shows one
     c = rep.get("compare")
     if c:
+        g.line(L, y, R, y, "hl")
         y += 38
         g.text(L, y, "Before and after", 17, "b")
         g.text(R, y, _fit(_compare_label(c, 40), 700, 13, left=False), 13, "m r")
@@ -4697,47 +4877,14 @@ def render_svg(rep: dict, theme: str = "auto") -> str:
         if hint:
             y += 30
             g.text(L, y, hint, 13, "m")
-        y += 30
-        g.line(L, y, R, y, "hl")
+        y += 34
 
-    # startup load per agent: stacked bar, this repo vs everything outside it
+    # details: the numbers behind everything above
+    g.line(L, y, R, y, "hl")
     y += 38
-    g.text(L, y, "Instruction files at startup", 17, "b")
-    lx = R
-    for cls, label in (("other", "Outside this repo"), ("repo", "This repo")):
-        lx -= _text_px(label, 13) + 34
-        g.rect(lx, y - 10, 12, 12, cls, rx=3)
-        g.text(lx + 18, y, label, 13, "s")
+    g.text(L, y, "Details", 17, "b")
     y += 20
-    g.text(L, y, "Estimated tokens each agent reads before your first message, sent again with every request.",
-           13, "m")
-    y += 22
-    x0, x1 = L + 130, R - 92
-    top = max([files[h]["total_tokens"] for h in agents] + [target, 1])
-    scale = (x1 - x0) / top
-    rows_top = y
-    for h in agents:
-        f = files[h]
-        repo_t, total = f["repo_tokens"], f["total_tokens"]
-        other_t = max(0, total - repo_t)
-        cy = y + 20
-        g.text(L, cy + 5, AGENT_NAMES[h], 14)
-        n = len(f["files"])
-        if total == 0:
-            g.text(x0, cy + 5, "nothing loads", 13, "m")
-        else:
-            w_repo, w_other = repo_t * scale, other_t * scale
-            tip = f"{AGENT_NAMES[h]}: ~{fmt_k(total)} tokens from {n} file{'' if n == 1 else 's'}"
-            g.bar(x0, cy - 9, w_repo, 18, "repo", round_end=w_other < 1,
-                  title=f"{tip}; this repo ~{fmt_k(repo_t)}")
-            gap = 2 if w_repo > 0 and w_other > 0 else 0
-            g.bar(x0 + w_repo + gap, cy - 9, w_other - gap, 18, "other", title=f"{tip}; outside ~{fmt_k(other_t)}")
-            g.text(x0 + total * scale + 10, cy + 5, f"~{fmt_k(total)}", 14, "b n")
-        y += 40
-    tx = x0 + target * scale
-    g.line(tx, rows_top + 2, tx, y - 2, "tgt")
-    g.text(tx + 4, rows_top + 2, f"target ~{fmt_k(target)}", 11, "m")
-    y += 10
+    g.text(L, y, "The files, skill listing and sessions behind the numbers above.", 13, "m")
 
     # heaviest files, each counted once even when several agents load it
     seen: dict[str, dict] = {}
@@ -4751,10 +4898,9 @@ def render_svg(rep: dict, theme: str = "auto") -> str:
             item["cut"] = max(item["cut"], e.get("truncated_bytes") or 0)
     heaviest = sorted(seen.items(), key=lambda kv: -kv[1]["tokens"])[:5]
     if heaviest:
-        g.line(L, y, R, y, "hl")
-        y += 38
-        g.text(L, y, "Heaviest files", 17, "b")
-        y += 14
+        y += 36
+        g.text(L, y, "Heaviest files", 15, "b")
+        y += 4
         peak = max(1, heaviest[0][1]["tokens"])
         for path, it in heaviest:
             y += 30
@@ -4769,17 +4915,14 @@ def render_svg(rep: dict, theme: str = "auto") -> str:
                 g.badge(L + 410 + bw + 14, y - 4, "crit")
                 g.text(R, y + 18, f"Codex cuts {it['cut']:,} bytes", 12, "s r")
             y += 18
-        y += 18
 
     # skill listing against each agent's budget
     budgets = [(h, r) for h, r in skills.items() if r.get("budget")]
     if budgets:
-        g.line(L, y, R, y, "hl")
-        y += 38
-        g.text(L, y, "Skill listing", 17, "b")
+        y += 40
+        g.text(L, y, "Skill listing", 15, "b")
         y += 20
-        g.text(L, y, "Names and descriptions of installed skills, also loaded at startup.", 13, "m")
-        y += 12
+        g.text(L, y, "Names and descriptions of installed skills, against the room each agent gives them.", 13, "m")
         for h, r in budgets:
             y += 30
             used = r["used"]
@@ -4788,24 +4931,31 @@ def render_svg(rep: dict, theme: str = "auto") -> str:
             mx0, mw = L + 130, 360
             g.rect(mx0, y - 4, mw, 8, "track", rx=4)
             kind = "crit" if share > 1 else "warn" if share > 0.8 else "good"
-            g.rect(mx0, y - 4, mw * min(1.0, share), 8, kind if kind != "good" else "repo", rx=4)
+            g.rect(mx0, y - 4, mw * min(1.0, share), 8, kind if kind != "good" else "skill", rx=4)
             g.text(mx0 + mw + 20, y + 4, f"{fmt_k(used)} of {fmt_k(r['budget'])} {r['budget_unit']}", 13, "n")
             if kind != "good":
                 label = (f"{share:.1f}× budget" if share >= 1.1 else f"{pct(share - 1)} over budget"
                          if share > 1 else "near budget")
                 g.badge(R - _text_px(label, 13) - 14, y, kind)
                 g.text(R, y + 4, label, 13, "b r")
-        assumed = [(AGENT_NAMES[h], r["window"]) for h, r in budgets if r.get("window_source") == "assumed"]
-        if assumed:
-            y += 30
-            g.text(L, y, f"{assumed[0][0]}: budget assumes a {assumed[0][1]:,}-token window, as no model was found. "
-                         "For a 200k-context model, pass --window 200000.", 12, "m")
-        y += 26
+            lose, omitted = r.get("lose_descriptions") or 0, r.get("omitted") or 0
+            if share > 1 and (lose or omitted):
+                words = (f"{lose} lose part of their descriptions" if h == "codex" else
+                         f"at least {lose} lose their descriptions") if lose else ""
+                words += (", " if words else "") + f"{omitted} left out" if omitted else ""
+                g.text(mx0, y + 22, _fit(words, R - mx0, 12, left=False), 12, "m")
+                y += 14
+        for h, r in budgets:
+            if r.get("window_source") == "assumed" and r.get("window"):
+                why = ("there are no Codex logs on this machine" if h == "codex" else
+                       "no model was found. For a 200k-context model, pass --window 200000")
+                y += 28
+                g.text(L, y, _fit(f"{AGENT_NAMES[h]}: the budget assumes a {r['window']:,}-token window, as {why}.",
+                                  R - L, 12, left=False), 12, "m")
 
     # measured sessions
-    g.line(L, y, R, y, "hl")
-    y += 38
-    g.text(L, y, "Sessions in this repo", 17, "b")
+    y += 40
+    g.text(L, y, "Sessions in this repo", 15, "b")
     y += 20
     sub_text = (f"Measured from local session logs, last {days} days. Startup is a session's first request: "
                 "instruction files plus the system prompt, tools and skill listing.")
@@ -4825,49 +4975,21 @@ def render_svg(rep: dict, theme: str = "auto") -> str:
             g.text(L, y, AGENT_NAMES[h], 14)
             vals = [f"{s['sessions']:,}", f"{s['requests']:,}", fmt_k(s["baseline_median"]),
                     fmt_k(s["ctx_median"]), fmt_k(s["ctx_max"]), pct(s["startup_share"]), fmt_k(s["input_tokens"])]
-            for (_, cx), v in zip(cols, vals):
-                g.text(cx, y, v, 14, "n r")
+            for (_, cx), val in zip(cols, vals):
+                g.text(cx, y, val, 14, "n r")
         y += 14
     else:
         y += 30
         g.text(L, y, "No session logs for this repo in this window.", 14, "s")
     y += 26
-
-    # findings
-    found = rep["findings"]
-    g.line(L, y, R, y, "hl")
-    y += 38
-    g.text(L, y, "What to do", 17, "b")
-    if not found:
-        y += 32
-        near = _over_target(files, target)
-        g.badge(L + 7, y - 5, "warn" if near else "good")
-        note = _fit(near, R - L - 24, 14) if near else "Nothing to fix: startup context is within target."
-        g.text(L + 24, y, note, 14)
-    for i, item in enumerate(found[:6], 1):
-        y += 32
-        g.text(L, y, f"{i}.", 14, "b n")
-        m = re.match(r"\[(\w+)\] ", item)
-        who = (AGENT_NAMES.get(m.group(1), "All agents") + ": ") if m else ""
-        lines = _wrap(who + (item[m.end():] if m else item), R - L - 26, 14) or [""]
-        for j, ln in enumerate(lines):
-            if j == 0 and who and ln.startswith(who):
-                g.lead(L + 26, y, who, ln[len(who):])
-            else:
-                g.text(L + 26, y + 20 * j, ln, 14)
-        y += 20 * (len(lines) - 1)
-    if len(found) > 6:
-        y += 28
-        g.text(L + 26, y, f"{len(found) - 6} more in the text report: cw.py report", 13, "m")
-    y += 34
     g.line(L, y, R, y, "hl")
     y += 26
     g.text(L, y, f"cw.py {VERSION} · about 3 ASCII characters, or 1 Thai or CJK character, per token", 12, "m")
     g.text(R, y, "github.com/ohm41321/context-weight", 12, "m r")
     H = y + 28
 
-    summary = (f"context-weight report for {short(rep['project'])}: " +
-               "; ".join(f"{AGENT_NAMES[h]} loads about {fmt_k(files[h]['total_tokens'])} tokens at startup"
+    summary = (f"context-weight report for {short(rep['project'])}. {v['headline']} " +
+               "; ".join(f"{AGENT_NAMES[h]} loads about {fmt_k(_startup(files, skills, h))} tokens at startup"
                          for h in agents))
     return (f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H:.0f}" width="{W}" height="{H:.0f}" '
             f'role="img" aria-labelledby="cw-title cw-desc">'
@@ -5483,8 +5605,8 @@ def _main(argv=None) -> int:
         stats = {h: summarize(v, a.threshold) for (h, _), v in groups.items()}
         found = findings(files, skills, stats, a.target)
         cmp = compare(path, hs, files, all_sessions, a.days, a.threshold, a.compare_at)
-        rep = {"project": root, "since": since, "files": files, "skills": skills,
-               "sessions": stats, "findings": found}
+        rep = {"project": root, "since": since, "verdict": verdict(files, skills, stats, a.target), "files": files,
+               "skills": skills, "sessions": stats, "findings": found}
         if cmp:
             rep["compare"] = cmp
         picture = None
@@ -5507,6 +5629,10 @@ def _main(argv=None) -> int:
             _emit(rep, True, None)
             return EXIT_OK
         print(f"project {short(root)}   sessions since {since}\n")
+        print("Verdict: " + rep["verdict"]["headline"])
+        if rep["verdict"]["detail"]:
+            print(rep["verdict"]["detail"])
+        print()
         if cmp:
             print_compare(cmp)
             print()

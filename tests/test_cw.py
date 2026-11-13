@@ -1770,6 +1770,41 @@ class CwTest(unittest.TestCase):
         self.assertIn(f"Picture: {out}", text_out)
         self.assertIn("prefers-color-scheme: dark", out.read_text(encoding="utf-8"))  # auto follows the viewer
 
+    def test_report_leads_with_a_verdict_and_at_most_three_actions(self):
+        write(self.repo / "CLAUDE.md", "a" * 60_000)
+        write(self.repo / "AGENTS.md", "b" * 40_000)  # Codex cuts it
+        write(self.home / ".claude" / "skills" / "big" / "SKILL.md", "---\nname: big\ndescription: " + "d" * 1_000 + "\n---\n")
+        write(self.repo / "GEMINI.md", "c" * 30_000)
+        self._claude_log("s", self.repo, "2099-01-01T00:00:00Z", [90_000, 95_000])
+        out = self.tmp_path / "pic.svg"
+        res = self.cw_json("report", str(self.repo), "--days", "40000", "--window", "10000", "--svg", str(out))
+        v = res["verdict"]
+        self.assertEqual(v["level"], "crit")
+        self.assertTrue(v["headline"].startswith("Fix this first: "), v)
+        self.assertGreater(len(res["findings"]), 3)
+        root, texts = self._svg_texts(out)
+        ns = "{http://www.w3.org/2000/svg}"
+        order = ["".join(t.itertext()) for t in root.iter(ns + "text")]
+        at = lambda s: next(i for i, t in enumerate(order) if s in t)
+        self.assertLess(at(v["headline"]), at("Where the startup tokens come from"))
+        self.assertLess(at("Where the startup tokens come from"), at("What to do"))
+        self.assertLess(at("What to do"), at("Details"))
+        self.assertIn("1.", order)
+        self.assertIn("3.", order)
+        self.assertNotIn("4.", order)
+        self.assertIn(f"{len(res['findings']) - 3} more in the text report", texts)
+        tips = [t.text for t in root.iter(ns + "title")]
+        self.assertTrue(any(t and "; skill listing ~" in t for t in tips), tips)
+        self.assertIn("skill listing ~", texts)  # also written out, not only in a tooltip
+        text = self.run_cw("report", str(self.repo), "--days", "40000", "--window", "10000")
+        self.assertEqual(text.splitlines()[2], "Verdict: " + v["headline"])
+
+    def test_report_verdict_when_all_is_well(self):
+        write(self.repo / "AGENTS.md", "Run the tests.\n")
+        res = self.cw_json("report", str(self.repo), "--harness", "codex")
+        self.assertEqual((res["verdict"]["level"], res["findings"]), ("good", []))
+        self.assertIn("within target", res["verdict"]["headline"])
+
     def test_report_svg_hero_row_describes_one_agent(self):
         # Claude has the heavy file; Codex has more input. The tiles once mixed the two.
         write(self.repo / "CLAUDE.md", "a" * 60_000)

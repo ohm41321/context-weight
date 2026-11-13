@@ -1,5 +1,70 @@
 # Changelog
 
+## 0.4.0 (2026-11-13)
+
+Loading rules and skill listings as Claude Code 2.1.322 and Codex 0.166.0 build them, and a
+report that leads with what to do. Numbers change where 0.3.2 was wrong, and the report's
+layout changes; exit codes do not.
+
+**The report**
+
+- `report` opens with a verdict: the one thing to fix first, or that nothing needs fixing, and
+  the startup load behind it (`Verdict: ...` on the third line of the text, `verdict` in
+  `--json` with `level`, `headline` and `detail`).
+- The picture reads top to bottom: the verdict, the startup load, where it comes from, at most
+  three things to do, before and after, then the details (heaviest files, skill listing,
+  sessions). The startup bars add the skill listing beside this repo's files and those outside
+  it, each part labelled under its bar, not only in a tooltip.
+- Findings are ranked, the most urgent first, in the text, `--json` and the picture alike.
+- A skill listing over budget says by how much, which skills lose their descriptions, and the
+  setting that fixes it: for Claude Code `skillOverrides`, `disable-model-invocation: true`,
+  plugins, shorter descriptions or `skillListingBudgetFraction`; for Codex a
+  `[[skills.config]]` entry, `allow_implicit_invocation: false` in `agents/openai.yaml`,
+  plugins, shorter descriptions or `[skills] max_context_tokens`. `skills` prints it as a
+  `fix:` line.
+- The skill tells the agent to run `report --open` every time and to give the user the verdict
+  first.
+
+**Claude Code**
+
+- AGENTS.md loads as Claude Code's built-in agents-md plugin (2.1.277+) decides: by default only
+  where no CLAUDE.md holds text, here or above. The `instructionFiles` option (`claude-md`,
+  `claude-md-and-agents-md`, `managed-only`, and the older `projectInstructions`) and the plugin
+  being turned off in settings are read, and the report says when they change what loads. An
+  AGENTS.md that is already loaded, or holds the same text as a loaded file, counts once.
+- `.claude/rules/` is read in every folder from the working directory up, not only the repo's.
+- A file that holds only whitespace loads nothing and is no longer counted.
+- In a git worktree inside its main checkout (`.claude/worktrees/<name>`), the main checkout's
+  own files are no longer counted twice. A worktree's sessions count as its repository's.
+- The skill listing is built as Claude Code builds it: managed, user and project skills, commands,
+  the enabled plugins in settings order and skills synced from the signed-in account; each line
+  cleaned, capped and measured in terminal columns; the budget from the model's window and
+  characters per token. With no model in the logs, the window is today's default 1M (0.3.2
+  assumed 200k). Over budget, the skills that lose descriptions follow Claude Code's usage order.
+- Frontmatter YAML is read as Bun 1.4.4 reads it: a repeated key keeps the last value, `|+` keeps
+  the right number of trailing breaks, flow collections take anchors and tags, and more (344
+  cases checked against `Bun.YAML.parse`, 3 unreachable from frontmatter still differ).
+
+**Codex**
+
+- The skill listing is built as Codex 0.166.0 builds it: its roots in its order (project
+  `.codex/skills`, `$CODEX_HOME/skills`, `~/.agents/skills`, bundled, `/etc/codex/skills`,
+  enabled plugins, repo `.agents/skills`), searched 6 folders deep; SKILL.md read with
+  serde_yaml's rules, a skill with no description skipped; `[[skills.config]]` and
+  `agents/openai.yaml` policy honoured; plugin skills named `plugin:skill`; each line with its
+  `(file: ...)` path, and root aliases when they are cheaper.
+- The budget is 2% of the full window in Codex's own token count (4 bytes a token), or
+  `[skills] max_context_tokens`. The logged window is 95% of the full one, so it is divided by
+  0.95; with no Codex logs the window is `--window`, or 272k, printed as assumed (0.3.2 used
+  8,000 characters). Over budget, the report says how many skills lose part of their
+  descriptions and how many are left out, as Codex fits them.
+- New `skills --json` fields include `loaded`, `loaded_tokens`, `omitted`, `aliases` and `hidden`.
+
+**Not modelled**, and said so where it matters: Claude Code's built-in and bundled skills, MCP
+skills, `--add-dir` and session plugins; Codex cloud, remote and executor skills, extra roots an
+app adds, project `.codex/config.toml` skill settings and `-c` flags; a Codex skill under a
+migrated-command root that a native skill of the same plugin shadows.
+
 ## 0.3.2 (2026-11-12)
 
 Fixes from a review of 0.3.1. Output and exit codes change only where 0.3.1 was wrong.

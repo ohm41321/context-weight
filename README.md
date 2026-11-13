@@ -90,7 +90,7 @@ cw.py report . --open
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="assets/report-dark.svg">
-    <img alt="Sample context-weight report. Claude Code loads about 157k tokens of instruction files at startup; its measured first request is 176k tokens, and startup load is 68% of its input. Slimming would save about 346M tokens. Bars per agent, the heaviest files, the skill listing at 5.1 times its budget, measured sessions and six ranked fixes." src="assets/report-light.svg" width="100%">
+    <img alt="Sample context-weight report. Verdict: fix this first, slim Claude Code's repo instructions to about 5k tokens. Claude Code loads about 167k tokens before the first message, and that load is 68% of its input. Bars show where each agent's startup tokens come from: this repo, files outside it and the skill listing. Three things to do, then the heaviest files, the skill listing at 1.4 times its budget and measured sessions." src="assets/report-light.svg" width="100%">
   </picture>
 </p>
 
@@ -98,14 +98,15 @@ cw.py report . --open
 
 | Part | What it tells you |
 | --- | --- |
-| Big number | The largest instruction-file load at startup, in tokens. It is sent again with every request. |
-| Before and after | Shown once you have slimmed. The report finds the change in git by itself (uncommitted, or the commit or merge that cut the files) and sets this repo's files before and right after it (and now, if they grew back) beside measured startup in the sessions before and after it. Fewer than 3 sessions after the change are marked too early. |
+| Verdict | The one thing to fix first, or that nothing needs fixing, and the startup load behind it. |
+| Big number | Everything the heaviest agent loads before your first message: instruction files plus the skill listing. It is sent again with every request. |
 | Tiles | Measured: the real first request (instruction files plus system prompt, tools and skill listing), how much of all input that load is, and what slimming would save. |
-| Loaded at startup | Each agent's load, split into this repo and everything outside it (your global files, plugins). The thin line is your target. |
+| Where the startup tokens come from | Each agent's load in up to three parts: this repo's files, files outside it (your global files, plugins) and the skill listing. The thin mark is your target for this repo. |
+| What to do | The three most urgent fixes. Each names the cause, the size of the effect and the change that fixes it; the text report lists the rest. |
+| Before and after | Shown once you have slimmed. The report finds the change in git by itself (uncommitted, or the commit or merge that cut the files) and sets this repo's files before and right after it (and now, if they grew back) beside measured startup in the sessions before and after it. Fewer than 3 sessions after the change are marked too early. |
 | Heaviest files | What to slim first. A red mark means Codex cuts the file off and never reads the rest. |
-| Skill listing | The installed skills' names and descriptions against each agent's budget. Red means over budget: descriptions get dropped and skills stop triggering. |
+| Skill listing | The installed skills' names and descriptions against each agent's budget. Red means over budget: descriptions get cut and skills trigger less reliably. |
 | Sessions | Measured from your local logs. *Startup* is the median first request; *startup share* is how much of all input was that load being re-sent. |
-| What to do | Ranked fixes. Each names the cause, the size of the effect and the change that fixes it. |
 
 `--svg FILE` writes the picture to FILE, and `--svg` alone puts it in the temp folder.
 `--theme light` or `dark` fixes the colors; the default follows the viewer. Leave out
@@ -115,7 +116,7 @@ cw.py report . --open
 
 | Command | Answers |
 | --- | --- |
-| `cw.py report [PATH]` | Everything for one repo, plus ranked findings and the before and after of your last slimming. `--svg` or `--open` draws it; `--compare-at` takes a commit id, a date or a time to set the split |
+| `cw.py report [PATH]` | Everything for one repo: a verdict, ranked findings and the before and after of your last slimming. `--svg` or `--open` draws it; `--compare-at` takes a commit id, a date or a time to set the split |
 | `cw.py files [PATH]` | Which instruction files each agent loads at startup, in tokens |
 | `cw.py skills [PATH]` | Size of the skill listing against each agent's budget |
 | `cw.py sessions` | Context size per project, measured from logs. `--compare-at DATE` shows before and after |
@@ -298,9 +299,11 @@ context-weight/
   Claude Code logs, they come within about 10%. Session numbers are what the
   provider reported.
 - **Assumptions are printed.** Claude Code's logs do not record the model's
-  context window, so the skill budget assumes 200k and says so. Use
-  `--window 1000000` for 1M-context models. Codex reads its window from its
-  own logs, and `--window` does not override it.
+  context window, so `cw.py` sizes it from the model in the logs, as Claude
+  Code does. With no model it assumes today's default 1M window and says so;
+  use `--window 200000` for a 200k-context model. Codex's window comes from
+  its own logs, and `--window` does not override it; with no Codex logs it
+  takes `--window`, or assumes 272k and says so.
 
 ## FAQ
 

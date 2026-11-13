@@ -30,8 +30,19 @@
 
 - Codex guardian reviewer threads look like user sessions unless `session_meta.payload.source`
   is checked for a `subagent` key. Counting them nearly doubled the session count on a real machine.
-- Claude Code budgets the skill listing in characters (1% of the window), not tokens. The window
-  is not in Claude Code's logs, so it is assumed and printed as assumed.
+- Claude Code budgets the skill listing in terminal columns (1% of the window times its
+  characters per token), not tokens. The window is not always in Claude Code's logs, so with no
+  model it is assumed and printed as assumed.
+- Check a listing model by replay, never by eye: rebuild the listing from the skill set a real
+  session saw and compare it line by line, by counts and hashes only (never print the text).
+  Codex picks one of two layouts, absolute paths or root aliases (`r0` = a root), whichever
+  keeps more; a model of one layout matched 0 lines. A rollout's file time is not its start:
+  `session_meta` can be days older, and skills installed since then are not in its listing.
+- Codex charges a listing line in its own count (UTF-8 bytes plus the break, divided by 4, rounded
+  up). Every number shown against its budget, the heaviest lines too, must use that count, or the
+  report's numbers do not add up.
+- A lever the report prints must work as written: `[[skills.config]] name = "x", enabled = false`
+  on one line is not valid TOML, so the text names the entry's fields instead.
 - `verify-split` once passed while content was lost: it compared sets, skipped lines under 4
   characters and flattened code indentation. It now compares counts and keeps code shape.
 - A fixed picture name in the shared temp folder (`/tmp/context-weight-<repo>.svg`) let another
