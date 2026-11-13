@@ -125,10 +125,28 @@ def est_tokens(text: str) -> int:
     return round(n_ascii / 3 + (len(text) - n_ascii))
 
 
+def _open_file(path, mode="rb", **kw):
+    """open() for a regular file only. A named pipe would block the open, or a read, forever,
+    so it is opened without waiting and refused (OSError), like a folder or a device."""
+    fd = os.open(str(path), os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0))
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError(f"{path}: not a regular file")
+        return open(fd, mode, **kw)
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _read_bytes(path) -> bytes:
+    with _open_file(path) as fh:
+        return fh.read()
+
+
 def read_text(path) -> str | None:
     """UTF-8 text with any byte-order mark removed (a BOM would hide `---` frontmatter)."""
     try:
-        return Path(path).read_bytes().decode("utf-8-sig", errors="replace")
+        return _read_bytes(path).decode("utf-8-sig", errors="replace")
     except (OSError, ValueError):
         return None
 
@@ -262,7 +280,7 @@ def _is_text(path: Path) -> bool:
     if path.suffix.lower() in _BINARY_EXT:
         return False
     try:
-        with open(path, "rb") as fh:
+        with _open_file(path) as fh:
             return b"\0" not in fh.read(4096)
     except OSError:
         return False
@@ -1059,7 +1077,11 @@ def _y_resolve(s: str):
     if s in ("false", "False", "FALSE"):
         return False
     if re.match(r"[-+]?[0-9]+\Z", s):
-        return int(s) if int(s) or s[0] != "-" else -0.0
+        try:
+            n = int(s)
+        except ValueError:  # past Python's 4,300-digit limit: a number that large is a float
+            return float(s)
+        return n if n or s[0] != "-" else -0.0
     if re.match(r"0o[0-7]+\Z", s):
         return int(s[2:], 8)
     if re.match(r"0x[0-9a-fA-F]+\Z", s):
@@ -1725,7 +1747,7 @@ def _command_files(base: Path) -> list[tuple[str, Path]]:
         dirs.sort()
         rel = os.path.relpath(top, base)
         parts = [] if rel == "." else list(Path(rel).parts)
-        md = sorted(f for f in files if f.endswith(".md"))
+        md = sorted(f for f in files if f.endswith(".md") and _is_file(os.path.join(top, f)))  # no pipes
         skill = [f for f in md if f.lower() == "skill.md"]
         if skill:
             if parts:
@@ -1953,7 +1975,7 @@ def _claude_window(model: str | None, env: dict) -> tuple[int, str]:
 
 def _first_cwd(f: Path) -> str | None:
     try:
-        with open(f, encoding="utf-8", errors="replace") as fh:
+        with _open_file(f, "r", encoding="utf-8", errors="replace") as fh:
             for n, line in enumerate(fh):
                 if n > 200:
                     break
@@ -1987,7 +2009,7 @@ def _log_model(f: Path) -> str | None:
                         break
         return found
     try:
-        with open(f, "rb") as fh:
+        with _open_file(f) as fh:
             fh.seek(0, os.SEEK_END)
             size = fh.tell()
             fh.seek(max(0, size - 262_144))
@@ -2286,10 +2308,19 @@ class _Toml:
             return t == "true"
         if t in ("inf", "+inf", "-inf", "nan", "+nan", "-nan"):
             return float(t)
-        if re.match(r"[+-]?(?:0|[1-9](?:_?[0-9])*)\Z", t):
-            return int(t.replace("_", ""))
-        if re.match(r"0(?:x[0-9A-Fa-f](?:_?[0-9A-Fa-f])*|o[0-7](?:_?[0-7])*|b[01](?:_?[01])*)\Z", t):
-            return int(t.replace("_", ""), 0)
+        try:
+            if re.match(r"[+-]?(?:0|[1-9](?:_?[0-9])*)\Z", t):
+                n = int(t.replace("_", ""))
+            elif re.match(r"0(?:x[0-9A-Fa-f](?:_?[0-9A-Fa-f])*|o[0-7](?:_?[0-7])*|b[01](?:_?[01])*)\Z", t):
+                n = int(t.replace("_", ""), 0)
+            else:
+                n = None
+        except ValueError:  # past Python's 4,300-digit limit
+            n = 1 << 64
+        if n is not None:
+            if not -(1 << 63) <= n < 1 << 63:
+                raise _TomlError("an integer TOML cannot hold")  # TOML integers are 64-bit
+            return n
         if re.match(r"[+-]?(?:0|[1-9](?:_?[0-9])*)(?:\.[0-9](?:_?[0-9])*)?(?:[eE][+-]?[0-9](?:_?[0-9])*)?\Z", t):
             return float(t.replace("_", ""))
         if re.match(r"[0-9]{2}:[0-9]{2}|[0-9]{4}-[0-9]{2}-[0-9]{2}", t):
@@ -2532,7 +2563,7 @@ def _codex_frontmatter(text: str, default_name: str):
 def _json_strict(path):
     """A JSON file read as Codex reads one (UTF-8, no byte-order mark), or None."""
     try:
-        return json.loads(Path(path).read_bytes().decode("utf-8"))
+        return json.loads(_read_bytes(path).decode("utf-8"))
     except (OSError, ValueError):
         return None
 
@@ -2651,7 +2682,7 @@ def _codex_scan(root: Path, scope: str, namespace=None, plugin_root=None, depth=
     out, bad = [], 0
     for w, real in pairs:
         try:
-            text = real.read_bytes().decode("utf-8")
+            text = _read_bytes(real).decode("utf-8")
         except (OSError, ValueError):
             bad += 1
             continue
@@ -2855,7 +2886,7 @@ def _codex_policy(skill_dir: Path) -> tuple[bool, bool]:
     file Codex cannot read changes nothing."""
     p = skill_dir / "agents" / "openai.yaml"
     try:
-        doc = _cc_yaml(p.read_bytes().decode("utf-8")) if _is_file(p) else None
+        doc = _cc_yaml(_read_bytes(p).decode("utf-8")) if _is_file(p) else None
     except (OSError, ValueError, _YamlError):
         doc = None
     policy = doc.get("policy") if isinstance(doc, dict) else None
@@ -3069,7 +3100,7 @@ def codex_listing(cwd, window: int | None = None) -> dict:
     # heaviest in Codex's own count, so it adds up against the budget
     heaviest = sorted(((_codex_cost(_codex_line(*r)), r[0]) for r in rows), key=lambda t: (-t[0], t[1]))[:5]
     text = roots_used + [e["line"] for e in entries]
-    return {"entries": entries, "roots": roots_used, "count": len(entries), "aliases": len(roots_used),
+    return {"entries": entries, "roots": roots_used, "count": len(rows), "aliases": len(roots_used),
             "tokens": sum(est_tokens(x + "\n") for x in text), "chars": len("\n".join(text)), "used": used,
             "loaded_tokens": sum(est_tokens(x + "\n") for x in text),
             "loaded": extra + layout[3], "desc_chars": sum(len(d) for _, d, _ in rows), **b,
@@ -3107,7 +3138,7 @@ def _codex_window() -> int | None:
                 pass
     for f in sorted(files, key=lambda p: p.name, reverse=True)[:20]:
         try:
-            with open(f, encoding="utf-8", errors="replace") as fh:
+            with _open_file(f, "r", encoding="utf-8", errors="replace") as fh:
                 for line in fh:
                     if '"model_context_window"' not in line:
                         continue
@@ -3201,7 +3232,7 @@ def claude_sessions(include_subagents=False):
     for f in logs:
         cwd, local, rows, compacted = None, set(), [], False
         try:
-            fh = open(f, encoding="utf-8", errors="replace")
+            fh = _open_file(f, "r", encoding="utf-8", errors="replace")
         except OSError:
             continue
         with fh:
@@ -3266,7 +3297,7 @@ def codex_sessions(include_subagents=False):
     for f in files:
         cwd, reqs, window, last_total, is_sub = None, [], None, None, False
         try:
-            fh = open(f, encoding="utf-8", errors="replace")
+            fh = _open_file(f, "r", encoding="utf-8", errors="replace")
         except OSError:
             continue
         with fh:

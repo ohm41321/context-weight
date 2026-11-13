@@ -570,6 +570,48 @@ class CwTest(unittest.TestCase):
         self.assertEqual(res["codex"]["count"], 1)
         self.assertTrue(res["codex"]["over_budget"])              # budget 200 tokens
 
+    def test_a_huge_number_in_a_skill_or_config_does_not_crash(self):
+        # Python 3.11+ (and patched 3.8 to 3.10) refuse int() past 4,300 digits with ValueError.
+        digits = "1" * 5_000
+        write(self.home / ".claude" / "skills" / "big" / "SKILL.md", f"---\nname: big\ndescription: {digits}\n---\n")
+        write(self.home / ".agents" / "skills" / "big" / "SKILL.md", f"---\nname: big\ndescription: {digits}\n---\n")
+        write(self.home / ".codex" / "config.toml", f"other = {digits}\n")
+        res = self.cw_json("skills", str(self.repo))
+        self.assertEqual((res["claude"]["count"], res["codex"]["count"]), (1, 1))
+        cw = load_cw()
+        with self.assertRaises(cw._TomlError):  # the reader without tomllib: a value TOML cannot hold
+            cw._Toml(f"other = {digits}\n").parse()
+
+    def test_codex_count_includes_skills_left_out_for_room(self):
+        for name in ("one", "two"):
+            write(self.home / ".agents" / "skills" / name / "SKILL.md",
+                  f"---\nname: {name}\ndescription: The {name} helper.\n---\n")
+        write(self.home / ".codex" / "config.toml", "[skills]\nmax_context_tokens = 1\n")
+        r = self.cw_json("skills", str(self.repo), "--harness", "codex")["codex"]
+        self.assertEqual((r["count"], r["omitted"]), (2, 2))
+        found = self.cw_json("report", str(self.repo), "--harness", "codex")["findings"]
+        self.assertTrue(any(f.startswith("[codex] 2 skills need ") for f in found), found)
+
+    @unittest.skipIf(os.name == "nt", "needs a POSIX named pipe")
+    def test_a_named_pipe_is_never_read(self):
+        # Opening a named pipe to read waits for a writer: one pipe hung `files` and `report`.
+        write(self.home / ".claude" / "commands" / "real.md", "Run it.\n")
+        write(self.repo / "CLAUDE.md", "rules\n")
+        for pipe in (self.home / ".claude" / "commands" / "pipe.md", self.home / ".claude" / "rules" / "pipe.md",
+                     self.repo / ".claude" / "rules" / "pipe.md", self.repo / "AGENTS.md",
+                     self.home / ".claude" / "skills" / "p" / "SKILL.md", self.home / ".codex" / "config.toml",
+                     self.home / ".claude" / "projects" / "-x" / "pipe.jsonl",
+                     self.home / ".codex" / "sessions" / "2099" / "01" / "01" / "rollout-pipe.jsonl"):
+            pipe.parent.mkdir(parents=True, exist_ok=True)
+            os.mkfifo(str(pipe))
+        for args in (("skills", str(self.repo), "--harness", "claude"), ("files", str(self.repo)),
+                     ("report", str(self.repo)), ("sessions",)):
+            p = subprocess.run([sys.executable, str(CW), *args, "--json"], env=self.env, capture_output=True,
+                               text=True, encoding="utf-8", timeout=60)
+            self.assertEqual(p.returncode, 0, (args, p.stderr))
+        res = self.cw_json("skills", str(self.repo), "--harness", "claude")
+        self.assertEqual(res["claude"]["count"], 1)
+
     def test_skill_findings_name_the_setting_that_fixes_them(self):
         write(self.home / ".claude" / "skills" / "big" / "SKILL.md",
               "---\nname: big\ndescription: " + "d" * 1_000 + "\n---\n")

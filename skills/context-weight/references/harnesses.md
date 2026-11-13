@@ -163,9 +163,10 @@ across nested directories. `cw.py` applies the cap to the project chain.
   the nearest folder with one of `project_root_markers` (default `.git`).
 - Each root is searched breadth first, at most 6 folders deep, 2,000 folders
   and 20,000 names. Hidden folders are skipped.
-- SKILL.md frontmatter is read with serde_yaml. A skill with no description is
-  skipped; a name is cut at 64 characters, a description at 1,024. A plugin's
-  skills are named `plugin:skill`.
+- SKILL.md frontmatter is read with serde_yaml. A skill with no description, or
+  with a name longer than 64 characters, is skipped. A plugin's skills are named
+  `plugin:skill` (at most 129 characters). The listing cuts a description at
+  1,024 characters.
 - Left out of the listing: skills a `[[skills.config]]` entry turns off (by
   `path` or `name`, `enabled = false`, the last entry winning) and skills whose
   `agents/openai.yaml` sets `policy: allow_implicit_invocation: false`.

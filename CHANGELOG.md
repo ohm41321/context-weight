@@ -60,6 +60,25 @@ layout changes; exit codes do not.
   descriptions and how many are left out, as Codex fits them.
 - New `skills --json` fields include `loaded`, `loaded_tokens`, `omitted`, `aliases` and `hidden`.
 
+**Fixes**
+
+- A named pipe where a file is expected (an instruction file, a rule, a command, a SKILL.md,
+  config.toml, a session log) hung `files`, `skills`, `report` and `sessions`, since opening it
+  waits for a writer. `cw.py` now reads regular files only.
+- A number of more than 4,300 digits in SKILL.md frontmatter crashed `skills` and `report` with
+  exit 1 on Python 3.11 and later (and patched 3.8 to 3.10). It now reads as a float, as YAML
+  does. Without `tomllib`, such a number in config.toml makes the file unreadable, as an integer
+  past 64 bits does in TOML.
+
+**`--json` changes for scripts**
+
+- `skills`: `window_source` is `"model"`, `"assumed"`, `"--window"` or
+  `"CLAUDE_CODE_MAX_CONTEXT_TOKENS"` for Claude Code (0.3.2 said `"default"` for an assumed
+  window), and `"codex logs"`, `"--window"`, `"assumed"` or `"config"` for Codex (0.3.2 said
+  `"unknown"`). Codex's `budget_unit` is always `"tokens"`; 0.3.2 fell back to `"chars"`.
+  Codex's `count` includes skills left out of the listing for room (`omitted` says how many).
+- `report`: new `verdict`; `findings` are ranked, the most urgent first.
+
 **Not modelled**, and said so where it matters: Claude Code's built-in and bundled skills, MCP
 skills, `--add-dir` and session plugins; Codex cloud, remote and executor skills, extra roots an
 app adds, project `.codex/config.toml` skill settings and `-c` flags; a Codex skill under a
