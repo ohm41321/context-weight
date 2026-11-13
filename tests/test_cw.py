@@ -570,6 +570,23 @@ class CwTest(unittest.TestCase):
         self.assertEqual(res["codex"]["count"], 1)
         self.assertTrue(res["codex"]["over_budget"])              # budget 200 tokens
 
+    def test_skill_findings_name_the_setting_that_fixes_them(self):
+        write(self.home / ".claude" / "skills" / "big" / "SKILL.md",
+              "---\nname: big\ndescription: " + "d" * 1_000 + "\n---\n")
+        write(self.home / ".agents" / "skills" / "one" / "SKILL.md", "---\nname: one\ndescription: " + "e" * 1_000 + "\n---\n")
+        found = self.cw_json("report", str(self.repo), "--harness", "claude,codex", "--window", "10000")["findings"]
+        claude = [f for f in found if f.startswith("[claude]") and "listing" in f]
+        codex = [f for f in found if f.startswith("[codex]") and "listing" in f]
+        self.assertEqual((len(claude), len(codex)), (1, 1), found)
+        for want in ("big", "over by", 'skillOverrides {"big": "off"}', "disable-model-invocation: true",
+                     "skillListingBudgetFraction"):
+            self.assertIn(want, claude[0])
+        for want in ("one", "over by", 'a [[skills.config]] entry with name = "one" and enabled = false',
+                     "allow_implicit_invocation: false", "max_context_tokens"):
+            self.assertIn(want, codex[0])
+        out = self.run_cw("skills", str(self.repo), "--harness", "claude,codex", "--window", "10000")
+        self.assertIn("fix: ", out)  # the plain output says it too
+
     def test_project_and_plugin_skills_are_listed(self):
         write(self.repo / ".claude" / "skills" / "local" / "SKILL.md", "---\nname: local\ndescription: hi\n---\n")
         cache = self.home / ".claude" / "plugins" / "cache" / "market" / "tool" / "1.0"

@@ -3065,7 +3065,8 @@ def codex_listing(cwd, window: int | None = None) -> dict:
         entries.append({"name": n, "line": _codex_line(n, d[:k], p), "full": _codex_line(n, d, p),
                         "path": s["path"], "scope": s["scope"], "desc_chars": len(d)})
     used = extra + sum(_codex_cost(_codex_line(*r)) for r in rows)
-    heaviest = sorted(((est_tokens(_codex_line(*r)), r[0]) for r in rows), key=lambda t: (-t[0], t[1]))[:5]
+    # heaviest in Codex's own count, so it adds up against the budget
+    heaviest = sorted(((_codex_cost(_codex_line(*r)), r[0]) for r in rows), key=lambda t: (-t[0], t[1]))[:5]
     text = roots_used + [e["line"] for e in entries]
     return {"entries": entries, "roots": roots_used, "count": len(entries), "aliases": len(roots_used),
             "tokens": sum(est_tokens(x + "\n") for x in text), "chars": len("\n".join(text)), "used": used,
@@ -4365,6 +4366,8 @@ def print_skills(result: dict) -> None:
             print("          not listed: " + ", ".join(f"{n} ({why})" for why, n in r["hidden"].items()))
         if r["heaviest"]:
             print("          heaviest: " + ", ".join(f"{x['name']} {fmt_k(x['tokens'])}" for x in r["heaviest"]))
+        if r["over_budget"]:
+            print(f"          fix: {skill_fix(h, r)}")
         if r["window_source"] == "assumed" and h == "codex":
             print(f"          window assumed {fmt_k(r['window'])} tokens: no Codex logs on this machine")
         elif r["window_source"] == "assumed":
@@ -4429,9 +4432,52 @@ def findings(files: dict, skills: dict, stats: dict, target: int) -> list[str]:
     for h, r in skills.items():
         if r["over_budget"]:
             out.append(f"[{h}] {r['count']} skills need ~{fmt_k(r['used'])} {r['budget_unit']} of listing, budget "
-                       f"{fmt_k(r['budget'])} ({r['basis']}): the least-used lose their descriptions and stop "
-                       "triggering reliably. Uninstall unused skills or plugins")
+                       f"{fmt_k(r['budget'])} ({r['basis']}), over by ~{fmt_k(r['used'] - r['budget'])}: "
+                       f"{skill_loss(h, r)}. Fix: {skill_fix(h, r)}")
     return out
+
+
+def _names(names, most=3) -> str:
+    return ", ".join(names[:most]) + (f" and {len(names) - most} more" if len(names) > most else "")
+
+
+def skill_loss(h: str, r: dict) -> str:
+    """What an over-budget listing costs the agent, in a clause."""
+    names = _names(r.get("losing_descriptions") or [])
+    if h == "codex":
+        loss = f"{r['lose_descriptions']} lose part of their descriptions" + (f" ({names})" if names else "")
+        if r.get("omitted"):
+            loss += f", and {r['omitted']} are left out of the listing"
+        return loss + ", so the agent picks them less reliably"
+    if r.get("lose_descriptions"):
+        return (f"at least {r['lose_descriptions']} lose their descriptions, the least-used first ({names}), "
+                "so the agent picks them less reliably")
+    return "descriptions get dropped, so the agent picks those skills less reliably"
+
+
+def skill_fix(h: str, r: dict) -> str:
+    """The settings that bring a listing back under its budget, in the order to try them."""
+    losing = [n for n in r.get("losing_descriptions") or [] if ":" not in n and " (" not in n]
+    example = losing[0] if losing else "<name>"
+    heavy = ", ".join(f"{x['name']} ~{fmt_k(x['tokens'])} tokens" for x in r.get("heaviest", [])[:3])
+    if h == "codex":
+        need = min(r["used"], CODEX_LISTING_MAX_TOKENS)
+        raise_it = (f"raise [skills] max_context_tokens to {need:,}" if r["used"] <= CODEX_LISTING_MAX_TOKENS else
+                    f"raise [skills] max_context_tokens to {need:,}, its maximum, which is not enough alone")
+        return (f'turn off skills you do not use with a [[skills.config]] entry with name = "{example}" and '
+                "enabled = false in ~/.codex/config.toml; add policy: allow_implicit_invocation: false to the "
+                "agents/openai.yaml of skills you only call by $name; disable unused plugins; shorten the longest "
+                f"descriptions ({heavy}); or {raise_it}")
+    fix = (f'hide skills you do not use with skillOverrides {{"{example}": "off"}} in settings ("name-only" '
+           "keeps the name); add disable-model-invocation: true to skills you only run by hand; disable unused "
+           f"plugins; shorten the longest descriptions ({heavy})")
+    if r.get("window") and r.get("chars_per_token") and "%" in r.get("basis", ""):
+        frac = math.ceil(r["used"] / (r["window"] * r["chars_per_token"]) * 100) / 100
+        if frac <= 1:
+            fix += f"; or raise skillListingBudgetFraction to {frac:g}"
+    elif r.get("basis") == "SLASH_COMMAND_TOOL_CHAR_BUDGET":
+        fix += f"; or raise SLASH_COMMAND_TOOL_CHAR_BUDGET to {r['used']:,}"
+    return fix
 
 
 def _over_target(files: dict, target: int) -> str | None:
