@@ -37,8 +37,10 @@ import sys
 import tempfile
 import unicodedata
 import webbrowser
-from collections import Counter
-from pathlib import Path
+import functools
+import stat
+from collections import Counter, deque
+from pathlib import Path, PurePosixPath
 from xml.sax.saxutils import escape
 
 VERSION = "0.3.2"
@@ -51,8 +53,10 @@ CLAUDE_DESC_CAP = 1_536           # Claude Code: description + when_to_use trunc
 CLAUDE_LISTING_FRACTION = 0.01    # Claude Code: skill listing gets 1% of the window, in columns
 CLAUDE_WINDOW, CLAUDE_1M = 200_000, 1_000_000  # Claude Code: a model's window, and the 1M one
 CODEX_DOC_MAX_DEFAULT = 32 * 1024 # Codex: project_doc_max_bytes default
-CODEX_LISTING_FRACTION = 0.02     # Codex: skill listing gets 2% of the context window
-CODEX_LISTING_FALLBACK_CHARS = 8_000  # Codex: listing budget when the window is unknown
+CODEX_LISTING_PERCENT = 2         # Codex: the skill listing gets 2% of the full context window
+CODEX_USABLE_PERCENT = 95         # Codex logs the window a session may fill: 95% of the full one
+CODEX_ASSUMED_WINDOW = 272_000    # Codex: the window of most of its models, and of an unknown one
+CODEX_LISTING_MAX_TOKENS = 10_000 # Codex: the cap on skills.max_context_tokens
 FINDING_MIN_CUT = 2_000           # a finding needs repo instructions this far above --target
 EXIT_OK, EXIT_FAIL, EXIT_USAGE = 0, 1, 2
 
@@ -1075,6 +1079,9 @@ class _Yaml:
     aliases, and the core schema's null, booleans and numbers. What Bun refuses (a colon and
     space in a plain value, a tab as indentation, a stray quote) raises _YamlError."""
 
+    resolve = staticmethod(_y_resolve)  # what a plain value means
+    mapping = dict                      # what a mapping is built in
+
     def __init__(self, text: str):
         self.lines = text.replace("\r\n", "\n").split("\n")
         if len(self.lines) > 1 and self.lines[-1] == "":
@@ -1153,10 +1160,10 @@ class _Yaml:
         m = _Y_COLON.search(text)
         if not m or _Y_COMMENT.search(text[:m.start()]):
             return None
-        return _js_str(_y_resolve(text[:m.start()].rstrip(" \t"))), text[m.start() + 1:]
+        return _js_str(self.resolve(text[:m.start()].rstrip(" \t"))), text[m.start() + 1:]
 
     def _map(self, n):
-        out: dict = {}
+        out = self.mapping()
         while True:
             i = self._next()
             if i is None:
@@ -1282,7 +1289,7 @@ class _Yaml:
             blank, j = 0, j + 1
         self.i = j
         v = "".join(parts)
-        return _y_resolve(v) if resolve else v
+        return self.resolve(v) if resolve else v
 
     def _block(self, i, col, parent):
         """A literal (|) or folded (>) value; its header is at column `col` of line i."""
@@ -1451,7 +1458,7 @@ class _Yaml:
         if c in "[{":
             close = "]" if c == "[" else "}"
             self.at[1] += 1
-            out = [] if c == "[" else {}
+            out = [] if c == "[" else self.mapping()
             while True:
                 self._skip()
                 c = self._char()
@@ -1534,7 +1541,7 @@ class _Yaml:
             self._flow_indent(nj)
             self.at = [nj, len(self.lines[nj]) - len(nxt)]
         v = "".join(parts)
-        return _y_resolve(v) if resolve else v
+        return self.resolve(v) if resolve else v
 
 
 def _cc_yaml(text: str):
@@ -2090,19 +2097,994 @@ def _claude_skills(cwd, window: int | None = None) -> dict:
             "heaviest": [{"name": entries[k]["label"], "tokens": est_tokens(entries[k]["line"])} for _, k in heaviest]}
 
 
+# --------------------------------------------------------------------------- Codex skill listing
+# Codex 0.166.0 (codex-rs: ext/skills, skills, core-plugins), read from its source: where it looks
+# for skills, how it reads a SKILL.md, and how it fits the listing into its budget.
+
+_RUST_WS = ("\t\n\x0b\x0c\r \x85\xa0            "
+            "    　")  # Rust's char::is_whitespace: not \x1c to \x1f, as Python's is
+_RUST_WS_RUN = re.compile("[" + _RUST_WS + "]+")
+_CODEX_MANIFEST_DIRS = (".codex-plugin", ".claude-plugin", ".cursor-plugin")  # each may hold a plugin.json
+_CODEX_AGENT_SCHEMA = "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json"
+_CODEX_SCOPES = {"system": 0, "admin": 1, "repo": 2, "user": 3}  # the listing's order
+_CODEX_PRODUCTS = ("chatgpt", "codex", "atlas", "CHATGPT", "CODEX", "ATLAS")
+CODEX_SCAN_DEPTH, CODEX_SCAN_DIRS, CODEX_SCAN_ENTRIES = 6, 2_000, 20_000
+CODEX_NAME_MAX, CODEX_QUALIFIED_MAX, CODEX_DESC_MAX = 64, 129, 1_024
+
+
+def _codex_admin_dir() -> Path:
+    return Path("/etc/codex")
+
+
+def _rust_lines(text: str) -> list[str]:
+    """str::lines(): split at \\n, drop a \\r before it, and no empty line after a final break."""
+    parts = text.split("\n")
+    last = parts.pop()
+    out = [x[:-1] if x.endswith("\r") else x for x in parts]
+    return out + [last] if last else out
+
+
+def _rust_words(text: str) -> str:
+    """split_whitespace().join(" ")"""
+    return " ".join(w for w in _RUST_WS_RUN.split(text) if w)
+
+
+class _TomlError(ValueError):
+    pass
+
+
+class _Toml:
+    """The TOML of a Codex config.toml, for Pythons without tomllib (3.8 to 3.10): tables, arrays
+    of tables, dotted and quoted keys, strings, numbers, booleans, arrays and inline tables;
+    dates stay text. What it cannot read raises _TomlError."""
+
+    _BARE = re.compile(r"[A-Za-z0-9_-]+")
+    _ESC = {"b": "\b", "t": "\t", "n": "\n", "f": "\f", "r": "\r", "e": "\x1b", '"': '"', "\\": "\\"}
+    _SCALAR = re.compile(r"[0-9A-Za-z_+\-.:]+(?:[ T][0-9][0-9:.+\-Z]*)?")
+
+    def __init__(self, text: str):
+        self.s = text.replace("\r\n", "\n")
+        self.i = 0
+
+    def parse(self) -> dict:
+        root = cur = {}
+        while True:
+            self._skip(newlines=True)
+            if self.i >= len(self.s):
+                return root
+            if self.s.startswith("[[", self.i):
+                self.i += 2
+                keys = self._keys()
+                self._take("]]")
+                items = self._walk(root, keys[:-1]).setdefault(keys[-1], [])
+                if not isinstance(items, list):
+                    raise _TomlError("a table and an array of tables share a name")
+                cur = {}
+                items.append(cur)
+            elif self.s[self.i] == "[":
+                self.i += 1
+                keys = self._keys()
+                self._take("]")
+                cur = self._walk(root, keys)
+            else:
+                self._pair(cur)
+            self._skip()
+            if self.i < len(self.s):
+                if self.s[self.i] != "\n":
+                    raise _TomlError("more after a value")
+                self.i += 1
+
+    def _pair(self, table: dict) -> None:
+        keys = self._keys()
+        self._take("=")
+        self._skip()
+        value = self._value()
+        t = self._walk(table, keys[:-1])
+        if keys[-1] in t:
+            raise _TomlError("a key given twice")
+        t[keys[-1]] = value
+
+    @staticmethod
+    def _walk(table: dict, keys) -> dict:
+        for k in keys:
+            nxt = table.setdefault(k, {})
+            if isinstance(nxt, list) and nxt and isinstance(nxt[-1], dict):
+                nxt = nxt[-1]  # a table under an array of tables belongs to its last one
+            if not isinstance(nxt, dict):
+                raise _TomlError("a key is both a value and a table")
+            table = nxt
+        return table
+
+    def _skip(self, newlines=False) -> None:
+        """Past blanks and comments, and past line breaks too when `newlines`."""
+        while self.i < len(self.s):
+            c = self.s[self.i]
+            if c in " \t" or newlines and c == "\n":
+                self.i += 1
+            elif c == "#":
+                end = self.s.find("\n", self.i)
+                self.i = len(self.s) if end < 0 else end
+            else:
+                return
+
+    def _take(self, token: str) -> None:
+        self._skip()
+        if not self.s.startswith(token, self.i):
+            raise _TomlError("expected " + token)
+        self.i += len(token)
+
+    def _keys(self) -> list:
+        keys = []
+        while True:
+            self._skip()
+            c = self.s[self.i:self.i + 1]
+            if c == '"':
+                keys.append(self._basic())
+            elif c == "'":
+                keys.append(self._literal())
+            else:
+                m = self._BARE.match(self.s, self.i)
+                if not m:
+                    raise _TomlError("a key expected")
+                keys.append(m.group(0))
+                self.i = m.end()
+            self._skip()
+            if self.s[self.i:self.i + 1] != ".":
+                return keys
+            self.i += 1
+
+    def _value(self):
+        s = self.s
+        for q in ('"""', "'''"):
+            if s.startswith(q, self.i):
+                return self._multiline(q)
+        c = s[self.i:self.i + 1]
+        if c == '"':
+            return self._basic()
+        if c == "'":
+            return self._literal()
+        if c == "[":
+            self.i += 1
+            out = []
+            while True:
+                self._skip(newlines=True)
+                if s[self.i:self.i + 1] == "]":
+                    self.i += 1
+                    return out
+                out.append(self._value())
+                self._skip(newlines=True)
+                if s[self.i:self.i + 1] == ",":
+                    self.i += 1
+                elif s[self.i:self.i + 1] != "]":
+                    raise _TomlError("a bad array")
+        if c == "{":
+            self.i += 1
+            table: dict = {}
+            self._skip()
+            if s[self.i:self.i + 1] == "}":
+                self.i += 1
+                return table
+            while True:
+                self._pair(table)
+                self._skip()
+                c = s[self.i:self.i + 1]
+                self.i += 1
+                if c == "}":
+                    return table
+                if c != ",":
+                    raise _TomlError("a bad inline table")
+        m = self._SCALAR.match(s, self.i)
+        if not m:
+            raise _TomlError("a value expected")
+        self.i = m.end()
+        return self._scalar(m.group(0).rstrip())
+
+    @staticmethod
+    def _scalar(t: str):
+        if t in ("true", "false"):
+            return t == "true"
+        if t in ("inf", "+inf", "-inf", "nan", "+nan", "-nan"):
+            return float(t)
+        if re.match(r"[+-]?(?:0|[1-9](?:_?[0-9])*)\Z", t):
+            return int(t.replace("_", ""))
+        if re.match(r"0(?:x[0-9A-Fa-f](?:_?[0-9A-Fa-f])*|o[0-7](?:_?[0-7])*|b[01](?:_?[01])*)\Z", t):
+            return int(t.replace("_", ""), 0)
+        if re.match(r"[+-]?(?:0|[1-9](?:_?[0-9])*)(?:\.[0-9](?:_?[0-9])*)?(?:[eE][+-]?[0-9](?:_?[0-9])*)?\Z", t):
+            return float(t.replace("_", ""))
+        if re.match(r"[0-9]{2}:[0-9]{2}|[0-9]{4}-[0-9]{2}-[0-9]{2}", t):
+            return t  # a date or a time, kept as text
+        raise _TomlError("a bad value")
+
+    def _basic(self) -> str:
+        s, out = self.s, []
+        self.i += 1
+        while True:
+            c = s[self.i:self.i + 1]
+            if c in ("", "\n"):
+                raise _TomlError("a string not closed")
+            self.i += 1
+            if c == '"':
+                return "".join(out)
+            out.append(self._escape() if c == "\\" else c)
+
+    def _escape(self) -> str:
+        e = self.s[self.i:self.i + 1]
+        self.i += 1
+        if e in self._ESC:
+            return self._ESC[e]
+        n = {"x": 2, "u": 4, "U": 8}.get(e, 0)
+        h = self.s[self.i:self.i + n]
+        if not n or len(h) != n or not re.match(r"[0-9A-Fa-f]+\Z", h) or int(h, 16) > 0x10FFFF:
+            raise _TomlError("a bad escape")
+        self.i += n
+        return chr(int(h, 16))
+
+    def _literal(self) -> str:
+        end = self.s.find("'", self.i + 1)
+        nl = self.s.find("\n", self.i + 1)
+        if end < 0 or 0 <= nl < end:
+            raise _TomlError("a string not closed")
+        v = self.s[self.i + 1:end]
+        self.i = end + 1
+        return v
+
+    def _multiline(self, q: str) -> str:
+        s, out = self.s, []
+        self.i += 3
+        if s.startswith("\n", self.i):
+            self.i += 1  # a break right after the opening quotes is not part of the text
+        while True:
+            if self.i >= len(s):
+                raise _TomlError("a string not closed")
+            if s.startswith(q, self.i):
+                extra = 0  # up to two more quotes belong to the text
+                while extra < 2 and s.startswith(q[0], self.i + 3 + extra):
+                    extra += 1
+                self.i += 3 + extra
+                return "".join(out) + q[0] * extra
+            c = s[self.i]
+            self.i += 1
+            if c == "\\" and q == '"""':
+                m = re.compile(r"[ \t]*\n[ \t\n]*").match(s, self.i)
+                if m:
+                    self.i = m.end()  # a backslash ending a line joins it to the next text
+                else:
+                    out.append(self._escape())
+            else:
+                out.append(c)
+
+
+def _toml(text: str) -> dict | None:
+    """A config.toml as a dict, or None where TOML cannot read it: tomllib on Python 3.11 and
+    later, else _Toml."""
+    try:
+        import tomllib
+    except ImportError:
+        try:
+            return _Toml(text).parse()
+        except (_TomlError, IndexError, RecursionError):
+            return None
+    try:
+        return tomllib.loads(text)
+    except ValueError:  # TOMLDecodeError is one
+        return None
+
+
+def _codex_toml() -> dict:
+    return _toml(read_text(codex_dir() / "config.toml") or "") or {}
+
+
+def _table(d, key) -> dict:
+    v = d.get(key) if isinstance(d, dict) else None
+    return v if isinstance(v, dict) else {}
+
+
+class _YNull(str):
+    """A plain ~, null, Null or NULL: no value where serde_yaml takes an Option, text in a key."""
+
+
+class _Fields(dict):
+    """A mapping that notes the keys it was given more than once."""
+
+    def __init__(self):
+        super().__init__()
+        self.twice: set = set()
+
+    def __setitem__(self, key, value):
+        if key in self:
+            self.twice.add(key)
+        super().__setitem__(key, value)
+
+
+class _YamlText(_Yaml):
+    """_Yaml as serde_yaml hands values to Codex's structs of strings: a plain value keeps its
+    text (123 and true stay text), and only an empty value or a null word means none."""
+    resolve = staticmethod(lambda s: _YNull(s) if s in ("~", "null", "Null", "NULL") else s or None)
+    mapping = _Fields
+
+
+def _codex_yaml(text: str):
+    """serde_yaml::from_str of one document, read as _YamlText; _YamlError for none or several."""
+    docs, cur = [], []
+    for line in text.replace("\r\n", "\n").split("\n"):
+        if line == "..." or line.startswith(("... ", "...\t")):
+            docs.append(cur)
+            cur = []
+        else:
+            cur.append(line)
+    docs.append(cur)
+    docs = [d for d in docs if any(x.strip(" \t") and not x.lstrip(" \t").startswith("#") for x in d)]
+    if len(docs) != 1:
+        raise _YamlError("several documents" if docs else "no document")
+    try:
+        return _YamlText("\n".join(docs[0])).parse()
+    except RecursionError:
+        raise _YamlError("nested too deep")
+
+
+def _serde_text(value, what: str):
+    """An Option<String>: None, or the text; a list or a mapping is an error."""
+    if value is None or isinstance(value, _YNull):
+        return None
+    if isinstance(value, str):
+        return value
+    raise _YamlError(what + " is not text")
+
+
+def _serde_fields(value, what: str, fields) -> dict:
+    """A struct with these fields: a mapping, or an empty value; a field given twice is an error."""
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise _YamlError(what + " is not a mapping")
+    if set(getattr(value, "twice", ())) & set(fields):
+        raise _YamlError(what + ": a field given twice")
+    return value
+
+
+def _codex_fields(block: str):
+    fm = _serde_fields(_codex_yaml(block), "frontmatter", ("name", "description", "metadata"))
+    meta = _serde_fields(fm.get("metadata"), "metadata", ("short-description",))
+    _serde_text(meta.get("short-description"), "metadata.short-description")
+    return _serde_text(fm.get("name"), "name"), _serde_text(fm.get("description"), "description")
+
+
+def _codex_repair(block: str) -> str | None:
+    """Codex's repair of frontmatter serde_yaml refused: a one-line value holding a colon and a
+    blank, or starting with [ { @ or ` as YAML cannot read, goes in single quotes; block values
+    and quoted values stay. None when nothing changed."""
+    changed, block_indent, out = False, None, []
+    for line in _rust_lines(block):
+        indent = len(line) - len(line.lstrip(" "))
+        if block_indent is not None:
+            if not line.strip(_RUST_WS) or indent > block_indent:
+                out.append(line)
+                continue
+            block_indent = None
+        key, colon, value = line.partition(":")
+        if not colon or not key.strip(_RUST_WS) or value and value[0] not in _RUST_WS:
+            out.append(line)
+            continue
+        rest = value.lstrip(_RUST_WS)
+        lead, scalar, comment = value[:len(value) - len(rest)], rest, ""
+        for k, ch in enumerate(rest):
+            if ch == "#" and (k == 0 or rest[k - 1] in _RUST_WS):
+                cut = len(rest[:k].rstrip(_RUST_WS))
+                scalar, comment = rest[:cut], rest[cut:]
+                break
+        scalar = scalar.rstrip(_RUST_WS)
+        if scalar[:1] in ("|", ">"):
+            block_indent = indent
+        if not scalar or scalar[0] in "|>'\"":
+            out.append(line)
+            continue
+        colon_blank = any(scalar[k] == ":" and scalar[k + 1] in _RUST_WS for k in range(len(scalar) - 1))
+        flow_like = False
+        if scalar[0] in "[{@`":
+            try:
+                _cc_yaml(scalar)
+            except _YamlError:
+                flow_like = True
+        if not (colon_blank or flow_like):
+            out.append(line)
+            continue
+        out.append(f"{key}:{lead}'" + scalar.replace("'", "''") + f"'{comment}")
+        changed = True
+    return "\n".join(out) if changed else None
+
+
+def _codex_frontmatter(text: str, default_name: str):
+    """(name, description) as Codex reads a SKILL.md, or None for a file it refuses: the first
+    line must be ---, a closing --- line must follow, and serde_yaml must read what is between,
+    as it is or after _codex_repair. Whitespace runs become one space; an empty name is the
+    folder's; a description is required."""
+    lines = _rust_lines(text)
+    if not lines or lines[0].strip(_RUST_WS) != "---":
+        return None
+    block = []
+    for line in lines[1:]:
+        if line.strip(_RUST_WS) == "---":
+            break
+        block.append(line)
+    else:
+        return None
+    if not block:
+        return None
+    yaml = "\n".join(block)
+    try:
+        name, desc = _codex_fields(yaml)
+    except _YamlError:
+        repaired = _codex_repair(yaml)
+        if repaired is None:
+            return None
+        try:
+            name, desc = _codex_fields(repaired)
+        except _YamlError:
+            return None
+    name = _rust_words(name or "") or default_name
+    desc = _rust_words(desc or "")
+    if not desc or len(name) > CODEX_NAME_MAX:
+        return None
+    return name, desc
+
+
+def _json_strict(path):
+    """A JSON file read as Codex reads one (UTF-8, no byte-order mark), or None."""
+    try:
+        return json.loads(Path(path).read_bytes().decode("utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def _codex_manifest_name(folder: Path) -> str | None:
+    """The plugin name of the first plugin.json under folder's .codex-plugin, .claude-plugin or
+    .cursor-plugin; a blank name is the folder's. None when there is none or it cannot be read."""
+    for d in _CODEX_MANIFEST_DIRS:
+        m = folder / d / "plugin.json"
+        if _is_file(m):
+            data = _json_strict(m)
+            name = data.get("name", "") if isinstance(data, dict) else None
+            if not isinstance(name, str):
+                return None
+            return name if name.strip(_RUST_WS) else folder.name
+    return None
+
+
+def _codex_lookup(start: Path) -> str | None:
+    """The plugin name of the nearest folder at or above `start` that has one."""
+    for d in [start, *start.parents]:
+        name = _codex_manifest_name(d)
+        if name is not None:
+            return name
+    return None
+
+
+def _under(path: Path, root: Path) -> bool:
+    return path == root or root in path.parents
+
+
+def _codex_namespacer(root: Path, skills, plugin_dirs):
+    """Codex's SkillNamespaceResolver for a root that is not a plugin's: skills take the plugin
+    name of the nearest folder at or above the root with a manifest, unless they sit under a
+    plugin folder found below it, or link out of the root to another folder."""
+    ancestors = {a for _, real in skills for a in real.parents}
+    linked = {real.parent for walked, real in skills if real != walked} - {root}
+    nested = [(r, _codex_lookup(r)) for r in linked]
+    for d in plugin_dirs:
+        if d in ancestors and d != root and d not in linked:
+            name = _codex_manifest_name(d)
+            if name is not None:
+                nested.append((d, name))
+    inherited = _codex_lookup(root)
+
+    def namespace(path: Path):
+        inside = _under(path, root)
+        fits = [(r, n) for r, n in nested if _under(path, r) and not (inside and _under(root, r))]
+        return max(fits, key=lambda t: len(t[0].parts))[1] if fits else inherited
+    return namespace
+
+
+def _codex_walk(root: Path, depth: int, follow: bool):
+    """Codex's scan of one skill root: breadth first, names in order, folders at most `depth`
+    below the root, 2,000 folders and 20,000 names at most; hidden folders are not entered,
+    folder links only when `follow`, and file links never. (SKILL.md paths as walked, the
+    folders that hold a plugin manifest folder)."""
+    skills, plugin_dirs = [], set()
+    queue = deque([(root, 0)])
+    seen = {os.path.realpath(root)}
+    dirs, names_read = 1, 0
+    while queue:
+        folder, level = queue.popleft()
+        try:
+            names = sorted(os.listdir(folder))
+        except OSError:
+            continue
+        for name in names:
+            if names_read >= CODEX_SCAN_ENTRIES:
+                return skills, plugin_dirs
+            names_read += 1
+            p = folder / name
+            try:
+                mode = os.lstat(p).st_mode
+                if stat.S_ISLNK(mode):
+                    if not (follow and os.path.isdir(p)):
+                        continue
+                    is_dir = True
+                else:
+                    is_dir = stat.S_ISDIR(mode)
+                    if not (is_dir or stat.S_ISREG(mode)):
+                        continue
+            except OSError:
+                continue
+            if not is_dir:
+                if name == "SKILL.md":
+                    skills.append(p)
+                continue
+            if name in _CODEX_MANIFEST_DIRS:
+                plugin_dirs.add(folder)
+            if level < depth and not name.startswith(".") and dirs < CODEX_SCAN_DIRS:
+                real = os.path.realpath(p)
+                if real not in seen:
+                    seen.add(real)
+                    dirs += 1
+                    queue.append((p, level + 1))
+    return skills, plugin_dirs
+
+
+def _codex_scan(root: Path, scope: str, namespace=None, plugin_root=None, depth=CODEX_SCAN_DEPTH):
+    """The skills Codex loads from one root: ([{name, desc, path (the real SKILL.md), shown (as
+    walked, with / between folders), scope}], how many it could not read)."""
+    if not _is_dir(root):
+        return [], 0
+    croot = Path(os.path.realpath(root))
+    walked, plugin_dirs = _codex_walk(croot, depth, follow=scope != "system")
+    pairs = []
+    for w in walked:
+        real = Path(os.path.realpath(w))
+        if plugin_root is not None and depth == 2:  # an Agent Plugins plugin: skills/<name>/SKILL.md only
+            proot = Path(os.path.realpath(plugin_root))
+            if w.parent.parent != croot or not _under(real, proot) or not os.path.isfile(real):
+                continue
+        pairs.append((w, real))
+    space = (lambda path: namespace) if namespace is not None else _codex_namespacer(croot, pairs, plugin_dirs)
+    out, bad = [], 0
+    for w, real in pairs:
+        try:
+            text = real.read_bytes().decode("utf-8")
+        except (OSError, ValueError):
+            bad += 1
+            continue
+        parsed = _codex_frontmatter(text, _rust_words(real.parent.name) or "skill")
+        ns = space(real) if parsed else None
+        name = parsed and (f"{ns}:{parsed[0]}" if ns else parsed[0])
+        if not parsed or len(name) > CODEX_QUALIFIED_MAX:
+            bad += 1
+            continue
+        out.append({"name": name, "desc": parsed[1], "path": str(real), "shown": str(w).replace(os.sep, "/"),
+                    "scope": scope, "root": str(croot).replace(os.sep, "/")})
+    return out, bad
+
+
+def _semver_key(v: str):
+    """semver's order for a version, or None for a string that is not one."""
+    m = re.match(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
+                 r"(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?\Z", v)
+    if not m:
+        return None
+
+    def ids(s):  # numbers sort before words, numbers by value
+        return [(0, int(x), "") if x.isdigit() else (1, 0, x) for x in s.split(".")] if s else []
+    pre = ids(m.group(4))
+    return int(m.group(1)), int(m.group(2)), int(m.group(3)), (0, pre) if pre else (1,), ids(m.group(5))
+
+
+def _codex_version_cmp(a: str, b: str) -> int:
+    ka, kb = _semver_key(a), _semver_key(b)
+    if ka is not None and kb is not None:
+        return (ka > kb) - (ka < kb)
+    return (a > b) - (a < b)
+
+
+def _codex_plugin_version(base: Path) -> str | None:
+    """The installed version Codex loads from a plugin's cache folder: "local" if there is one,
+    else the highest, as versions where both are versions, else as text."""
+    try:
+        names = [e.name for e in os.scandir(base) if e.is_dir(follow_symlinks=False)]
+    except OSError:
+        return None
+    names = [n for n in names if n not in (".", "..") and re.match(r"[A-Za-z0-9._+-]+\Z", n)]
+    if "local" in names:
+        return "local"
+    return sorted(names, key=functools.cmp_to_key(_codex_version_cmp))[-1] if names else None
+
+
+def _codex_plugin_path(root: Path, rel) -> Path | None:
+    """A manifest path: ./ and a path that stays in the plugin folder."""
+    if not isinstance(rel, str) or not rel.startswith("./") or rel == "./":
+        return None
+    rest = rel[2:]
+    parts = re.split(r"[/\\]", rest) if os.name == "nt" else rest.split("/")
+    if ".." in parts or rest.startswith(("/", "\\")) or re.match(r"[A-Za-z]:", rest):
+        return None
+    return root / rest
+
+
+def _codex_plugin(root: Path):
+    """(plugin name, skill roots, scan depth) for an installed plugin folder, or None where
+    Codex cannot load it. A root plugin.json with an agent-plugins.org $schema is an Agent
+    Plugins plugin: its skills are ./skills/<name>/SKILL.md. Otherwise the first of
+    .codex-plugin, .claude-plugin and .cursor-plugin holding a plugin.json names the skill
+    folders (default ./skills, plus .codex-plugin/migrated-command-skills)."""
+    agent = root / "plugin.json"
+    try:
+        mode = os.lstat(agent).st_mode
+    except FileNotFoundError:
+        mode = None
+    except OSError:
+        return None
+    if mode is not None:
+        if not stat.S_ISREG(mode):
+            return None
+        data = _json_strict(agent)
+        schema = data.get("$schema") if isinstance(data, dict) else None
+        if isinstance(schema, str) and schema.startswith("https://agent-plugins.org/schemas/"):
+            name = data.get("name")
+            if schema != _CODEX_AGENT_SCHEMA or not isinstance(name, str) or not re.match(r"[a-z0-9.-]+\Z", name):
+                return None
+            return name, [root / "skills"], 2
+    for d in _CODEX_MANIFEST_DIRS:
+        try:
+            if not stat.S_ISDIR(os.lstat(root / d).st_mode):
+                return None
+            mode = os.lstat(root / d / "plugin.json").st_mode
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return None
+        if not stat.S_ISREG(mode):
+            return None
+        data = _json_strict(root / d / "plugin.json")
+        name = data.get("name", "") if isinstance(data, dict) else None
+        if not isinstance(name, str):
+            return None
+        skills = data.get("skills")
+        listed = [skills] if isinstance(skills, str) else skills if isinstance(skills, list) and all(
+            isinstance(x, str) for x in skills) else []
+        roots = [p for p in (_codex_plugin_path(root, x) for x in listed) if p is not None]
+        if not roots and _is_dir(root / "skills"):
+            roots = [root / "skills"]
+        if _is_dir(root / ".codex-plugin" / "migrated-command-skills"):
+            roots.append(root / ".codex-plugin" / "migrated-command-skills")
+        return (name if name.strip(_RUST_WS) else root.name), sorted(set(roots)), CODEX_SCAN_DEPTH
+    return None
+
+
+def _codex_plugin_roots(cfg: dict) -> list:
+    """Skill roots of the plugins config.toml turns on, in path order:
+    [(root, plugin name, plugin folder, scan depth)]."""
+    table = _table(cfg, "plugins")
+    default = table.get("_default")
+    default_on = default.get("enabled", True) if isinstance(default, dict) else True
+    out, seen = [], set()
+    for key, entry in table.items():
+        if key == "_default" or not isinstance(entry, dict) or entry.get("enabled", default_on) is not True:
+            continue
+        plugin, _, market = key.partition("@")
+        if not plugin or not market or "/" in key or "\\" in key:
+            continue
+        base = codex_dir() / "plugins" / "cache" / market / plugin
+        version = _codex_plugin_version(base)
+        loaded = _codex_plugin(base / version) if version else None
+        if loaded:
+            name, roots, depth = loaded
+            for r in roots:
+                if r not in seen:
+                    seen.add(r)
+                    out.append((r, name, base / version, depth))
+    return sorted(out, key=lambda t: t[0])
+
+
+def _codex_project_root(here: Path, cfg: dict) -> Path:
+    """The nearest folder at or above `here` with one of project_root_markers (default .git);
+    `here` when none has one, or the list is empty."""
+    markers = cfg.get("project_root_markers", [".git"])
+    if not isinstance(markers, list) or not all(isinstance(m, str) for m in markers):
+        markers = [".git"]
+    for d in [here, *here.parents]:
+        if any(_exists(d / m) for m in markers):
+            return d
+    return here
+
+
+def _codex_roots(cwd, cfg: dict) -> list:
+    """Codex's skill roots in the order it reads them (a skill found twice keeps the first):
+    [(root, scope, plugin name or None, plugin folder or None, scan depth)]."""
+    here = Path(cwd).resolve()
+    project = _codex_project_root(here, cfg)
+    down = [d for d in top_down(here) if _under(d, project)]  # the project root ... cwd
+    xd = codex_dir()
+    bundled = _table(_table(cfg, "skills"), "bundled")
+    roots = [(d / ".codex" / "skills", "repo") for d in reversed(down)
+             if _is_dir(d / ".codex") and not _same_dir(d / ".codex", xd)]
+    roots += [(xd / "skills", "user"), (home() / ".agents" / "skills", "user")]
+    if bundled.get("enabled") is not False:
+        roots.append((xd / "skills" / ".system", "system"))
+    roots.append((_codex_admin_dir() / "skills", "admin"))
+    out = [(r, s, None, None, CODEX_SCAN_DEPTH) for r, s in roots]
+    out += [(r, "user", name, folder, depth) for r, name, folder, depth in _codex_plugin_roots(cfg)]
+    out += [(d / ".agents" / "skills", "repo", None, None, CODEX_SCAN_DEPTH) for d in down]
+    unique, seen = [], set()
+    for r in out:
+        key = os.path.realpath(r[0])
+        if key not in seen:
+            seen.add(key)
+            unique.append(r)
+    return unique
+
+
+def _codex_disabled(cfg: dict, skills) -> set:
+    """The SKILL.md paths [[skills.config]] turns off: a rule names a path or a skill, and the
+    last rule for each wins. Rules with a bad entry are all ignored, as Codex does."""
+    entries = _table(cfg, "skills").get("config")
+    if not isinstance(entries, list):
+        return set()
+    rules = []
+    for e in entries:
+        if not isinstance(e, dict) or not isinstance(e.get("enabled"), bool):
+            return set()
+        path, name = e.get("path"), e.get("name")
+        if path is not None and not (isinstance(path, str) and os.path.isabs(path)) or \
+                name is not None and not isinstance(name, str):
+            return set()
+        if (path is None) == (name is None):
+            continue
+        key = ("path", os.path.realpath(path)) if path is not None else ("name", name.strip(_RUST_WS))
+        if key[1]:
+            rules = [r for r in rules if r[0] != key] + [(key, e["enabled"])]
+    off: set = set()
+    for (kind, key), on in rules:
+        for p in [key] if kind == "path" else [s["path"] for s in skills if s["name"] == key]:
+            (off.discard if on else off.add)(p)
+    return off
+
+
+def _codex_policy(skill_dir: Path) -> tuple[bool, bool]:
+    """(listed, for Codex) from the skill's agents/openai.yaml: allow_implicit_invocation:
+    false keeps it out of the listing, and products without codex keeps it out of Codex. A
+    file Codex cannot read changes nothing."""
+    p = skill_dir / "agents" / "openai.yaml"
+    try:
+        doc = _cc_yaml(p.read_bytes().decode("utf-8")) if _is_file(p) else None
+    except (OSError, ValueError, _YamlError):
+        doc = None
+    policy = doc.get("policy") if isinstance(doc, dict) else None
+    if not isinstance(policy, dict):
+        return True, True
+    allow = policy.get("allow_implicit_invocation")
+    products = policy.get("products") or []
+    if allow is not None and not isinstance(allow, bool) or not isinstance(products, list) or \
+            any(x not in _CODEX_PRODUCTS for x in products if isinstance(x, str)) or \
+            not all(isinstance(x, str) for x in products):
+        return True, True
+    return allow is not False, not products or any(x.lower() == "codex" for x in products)
+
+
+def _codex_budget(cfg: dict, window: int | None) -> dict:
+    """Codex's listing budget, in tokens: skills.max_context_tokens (at most 10,000), else 2%
+    of the full window. Codex logs the window a session may fill, 95% of the full one."""
+    logged = _codex_window()
+    if logged:
+        w, src = -(-logged * 100 // CODEX_USABLE_PERCENT), "codex logs"
+    elif window:
+        w, src = window, "--window"  # Claude Code's window, when Codex left no logs
+    else:
+        w, src = CODEX_ASSUMED_WINDOW, "assumed"
+    cap = _table(cfg, "skills").get("max_context_tokens")
+    if isinstance(cap, int) and not isinstance(cap, bool) and cap > 0:
+        b = min(cap, CODEX_LISTING_MAX_TOKENS)
+        basis = "skills.max_context_tokens" + (f" {cap:,}, capped at {b:,}" if cap > b else "")
+        return {"budget": b, "budget_unit": "tokens", "window": None, "window_source": "config", "basis": basis}
+    return {"budget": max(w * CODEX_LISTING_PERCENT // 100, 1), "budget_unit": "tokens", "window": w,
+            "window_source": src, "basis": f"{CODEX_LISTING_PERCENT}% of a {fmt_k(w)}-token window"}
+
+
+def _codex_cost(line: str) -> int:
+    """What Codex charges for a listing line and its break: 4 bytes a token, rounded up."""
+    return -(-(len(line.encode("utf-8", "surrogatepass")) + 1) // 4)
+
+
+def _codex_line(name: str, desc: str, shown: str) -> str:
+    return f"- {name}: {desc} (file: {shown})" if desc else f"- {name}: (file: {shown})"
+
+
+# The prompt text around the listing differs when lines use root aliases: Codex charges the
+# difference to the listing (render.rs aliased_metadata_overhead_cost; catalog_prompt.rs).
+_CODEX_INTRO_BYTES = {"paths": 418, "aliases": 261}  # SKILLS_INTRO_WITH_SOURCE_LOCATORS, ..._WITH_HOST_ALIASES
+
+
+def _codex_market_base(root: PurePosixPath):
+    """The folder right under plugins/cache that holds `root`: one marketplace's plugins."""
+    cand = root
+    while cand.parent != cand:
+        parent = cand.parent
+        if not parent.name:
+            return None
+        if parent.name == "cache":
+            if parent.parent == parent or not parent.parent.name:
+                return None
+            if parent.parent.name == "plugins":
+                return cand
+        cand = parent
+    return None
+
+
+def _codex_plugin_version_base(root: PurePosixPath):
+    base = _codex_market_base(root)
+    if base is None:
+        return None
+    rel = root.parts[len(base.parts):]
+    return base.joinpath(*rel[:2]) if len(rel) >= 2 else None
+
+
+def _codex_aliases(listed) -> list:
+    """Codex's root aliases for the listed skills (host_aliases.rs, aliases.rs): the skill roots
+    in the order Codex read them, named r0, r1 ...; a plugin version with one listed skill
+    shares its marketplace folder. [(alias, root)]"""
+    order = {}
+    for s in listed:
+        order.setdefault(s["root"], s["order"])
+    ordered = sorted(listed, key=lambda s: s["order"])
+    roots = [PurePosixPath(s["root"]) for s in ordered]
+    count = Counter(v for v in map(_codex_plugin_version_base, roots) if v is not None)
+    out, seen = [], set()
+    for r in roots:
+        v = _codex_plugin_version_base(r)
+        shared = str((_codex_market_base(r) or r) if v is not None and count[v] <= 1 else r)
+        if shared not in seen:
+            seen.add(shared)
+            out.append((f"r{len(out)}", shared))
+    return out
+
+
+def _codex_shorten(locator: str, aliases) -> str:
+    """AliasPlan::shorten: the longest root the path is under, as its alias."""
+    fits = [(name, root) for name, root in aliases
+            if locator.startswith(root.rstrip("/")) and locator[len(root.rstrip("/")):].startswith("/")]
+    if not fits:
+        return locator
+    name, root = max(fits, key=lambda t: len(t[1]))
+    return name + locator[len(root.rstrip("/")):]
+
+
+def _codex_alias_cost(root_lines) -> int:
+    """What the roots table adds to the listing's cost, in tokens (never below 0)."""
+    frame = len("\n## Skills\n") + len("\n### Available skills\n")
+    paths = frame + _CODEX_INTRO_BYTES["paths"]
+    aliased = frame + _CODEX_INTRO_BYTES["aliases"] + len("\n### Skill roots") + sum(
+        1 + len(x.encode("utf-8", "surrogatepass")) for x in root_lines)
+    return max(0, -(-aliased // 4) - -(-paths // 4))
+
+
+def _codex_layout(rows, budget: int):
+    """One layout fitted to `budget`: (description characters kept per row or None,
+    lines listed, description characters lost, cost in tokens)."""
+    keep = _codex_fit(rows, budget)
+    listed = sum(k is not None for k in keep)
+    lost = sum(len(d) - (k or 0) for (_, d, _), k in zip(rows, keep))
+    cost = sum(_codex_cost(_codex_line(n, d[:k], p)) for (n, d, p), k in zip(rows, keep) if k is not None)
+    return keep, listed, lost, cost
+
+
+def _codex_fit(rows, budget: int) -> list:
+    """Codex's allocate_skill_lines: the description characters each (name, description, path)
+    line keeps, or None for a line left out. Every line whole if all fit; else every line
+    without its description, then characters handed out one per line per round while they
+    fit; else lines without descriptions in order while they fit."""
+    mins = [len(_codex_line(n, "", p).encode("utf-8", "surrogatepass")) + 1 for n, _, p in rows]
+    cost = lambda b: -(-b // 4)
+    if sum(_codex_cost(_codex_line(*r)) for r in rows) <= budget:
+        return [len(d) for _, d, _ in rows]
+    if sum(cost(b) for b in mins) > budget:
+        out, used = [], 0
+        for b in mins:
+            fits = used + cost(b) <= budget
+            used += cost(b) if fits else 0
+            out.append(0 if fits else None)
+        return out
+    left = budget - sum(cost(b) for b in mins)
+    sums = []
+    for _, d, _ in rows:
+        acc, s = 0, [0]
+        for ch in d:
+            acc += len(ch.encode("utf-8", "surrogatepass"))
+            s.append(acc)
+        sums.append(s)
+    keep, spent = [0] * len(rows), [0] * len(rows)
+    changed = True
+    while changed:
+        changed = False
+        for k, (_, d, _) in enumerate(rows):
+            if keep[k] < len(d):
+                nxt = cost(mins[k] + sums[k][keep[k] + 1] + 1) - cost(mins[k])
+                if nxt - spent[k] <= left:
+                    left -= nxt - spent[k]
+                    keep[k], spent[k], changed = keep[k] + 1, nxt, True
+    return keep
+
+
+def codex_listing(cwd, window: int | None = None) -> dict:
+    """The skill listing Codex builds in `cwd`, fitted to its budget: {"entries": its lines in
+    order, "hidden": skills it leaves out, by reason, ...}. Cloud, remote and executor skills
+    and extra roots are not on disk here and are not counted."""
+    cfg = _codex_toml()
+    found, seen, hidden = [], set(), Counter()
+    for order, (root, scope, name, folder, depth) in enumerate(_codex_roots(cwd, cfg)):
+        skills, bad = _codex_scan(root, scope, name, folder, depth)
+        if bad:
+            hidden["unreadable"] += bad
+        for s in skills:
+            if s["path"] not in seen:
+                seen.add(s["path"])
+                found.append({**s, "order": order})
+    off = _codex_disabled(cfg, found)
+    listed = []
+    for s in found:
+        shown, for_codex = _codex_policy(Path(s["path"]).parent)
+        reason = ("products" if not for_codex else "skills.config" if s["path"] in off
+                  else "allow_implicit_invocation" if not shown else None)
+        if reason:
+            hidden[reason] += 1
+        else:
+            listed.append(s)
+    if _table(cfg, "skills").get("include_instructions") is False:
+        hidden["skills.include_instructions"] += len(listed)
+        listed = []
+    listed.sort(key=lambda s: (_CODEX_SCOPES[s["scope"]], s["name"].encode("utf-8", "surrogatepass"), s["path"]))
+    rows = [(s["name"], s["desc"] if len(s["desc"]) <= CODEX_DESC_MAX else s["desc"][:CODEX_DESC_MAX - 3] + "...",
+             s["shown"]) for s in listed]
+    b = _codex_budget(cfg, window)
+    # Codex renders the lines twice, with full paths and with root aliases, and keeps the
+    # aliased one when it lists more skills, loses fewer description characters, or costs less.
+    aliases = _codex_aliases(listed) if listed else []
+    root_lines = [f"- `{a}` = `{r}`" for a, r in aliases]
+    extra = _codex_alias_cost(root_lines)
+    layout, roots_used = _codex_layout(rows, b["budget"]), []
+    if aliases and extra < b["budget"]:
+        short_rows = [(n, d, _codex_shorten(p, aliases)) for n, d, p in rows]
+        alt = _codex_layout(short_rows, b["budget"] - extra)
+        if (alt[1], -alt[2], -(alt[3] + extra)) > (layout[1], -layout[2], -layout[3]):
+            rows, layout, roots_used = short_rows, alt, root_lines
+    extra = extra if roots_used else 0
+    entries, losing, omitted = [], [], 0
+    for s, (n, d, p), k in zip(listed, rows, layout[0]):
+        if k is None:
+            omitted += 1
+            continue
+        if k < len(d):
+            losing.append(n)
+        entries.append({"name": n, "line": _codex_line(n, d[:k], p), "full": _codex_line(n, d, p),
+                        "path": s["path"], "scope": s["scope"], "desc_chars": len(d)})
+    used = extra + sum(_codex_cost(_codex_line(*r)) for r in rows)
+    heaviest = sorted(((est_tokens(_codex_line(*r)), r[0]) for r in rows), key=lambda t: (-t[0], t[1]))[:5]
+    text = roots_used + [e["line"] for e in entries]
+    return {"entries": entries, "roots": roots_used, "count": len(entries), "aliases": len(roots_used),
+            "tokens": sum(est_tokens(x + "\n") for x in text), "chars": len("\n".join(text)), "used": used,
+            "loaded": extra + layout[3], "desc_chars": sum(len(d) for _, d, _ in rows), **b,
+            "over_budget": used > b["budget"], "lose_descriptions": len(losing), "losing_descriptions": losing,
+            "omitted": omitted, "hidden": dict(hidden), "heaviest": [{"name": n, "tokens": t} for t, n in heaviest]}
+
+
 def _skill_dirs(cwd) -> dict[str, list[tuple[Path, str]]]:
     root = project_root(cwd)
     here = Path(cwd).resolve()
     upward = [d for d in [here, *here.parents] if d == root or root in d.parents]
     h = home()
-    cd, xd = claude_dir(), codex_dir()
+    cd = claude_dir()
 
     def proj(rel: str) -> list[tuple[Path, str]]:
         return [(d / rel, "") for d in upward]
 
     return {
-        "codex": [*proj(".agents/skills"), (h / ".agents" / "skills", ""), (xd / "skills", ""),
-                  (Path("/etc/codex/skills"), ""), (xd / "skills" / ".system", "")],
         "gemini": [*proj(".gemini/skills"), *proj(".agents/skills"), (h / ".gemini" / "skills", ""),
                    (h / ".agents" / "skills", "")],
         "opencode": [*proj(".opencode/skills"), *proj(".claude/skills"), *proj(".agents/skills"),
@@ -2134,27 +3116,16 @@ def _codex_window() -> int | None:
     return None
 
 
-def _listing_budget(h: str, window: int | None) -> dict:
-    """Budget for one harness's skill listing, with where each number came from."""
-    if h == "codex":
-        # Codex records its own window; --window is Claude Code's and only fills in when the logs have none.
-        w, w_src = _codex_window(), "codex logs"
-        if not w and window:
-            w, w_src = window, "--window"
-        if not w:
-            return {"budget": CODEX_LISTING_FALLBACK_CHARS, "budget_unit": "chars", "window": None,
-                    "window_source": "unknown", "basis": "window unknown"}
-        return {"budget": int(w * CODEX_LISTING_FRACTION), "budget_unit": "tokens", "window": w,
-                "window_source": w_src, "basis": f"2% of a {fmt_k(w)}-token window"}
-    return {"budget": None, "budget_unit": None, "window": None, "window_source": None, "basis": "no published budget"}
-
-
 def scan_skills(cwd, harnesses, window: int | None = None) -> dict:
     result = {}
     all_dirs = _skill_dirs(cwd)
     for h in harnesses:
         if h == "claude":
             result[h] = _claude_skills(cwd, window)
+            continue
+        if h == "codex":
+            result[h] = codex_listing(cwd, window)
+            del result[h]["entries"], result[h]["roots"]
             continue
         found: dict[str, dict] = {}
         for directory, prefix in all_dirs[h]:
@@ -2179,9 +3150,9 @@ def scan_skills(cwd, harnesses, window: int | None = None) -> dict:
                                "tokens": est_tokens(line)}
         tokens = sum(s["tokens"] for s in found.values())
         chars = sum(s["chars"] for s in found.values())
-        b = _listing_budget(h, window)
-        used = chars if b["budget_unit"] == "chars" else tokens
-        over = b["budget"] is not None and used > b["budget"]
+        b = {"budget": None, "budget_unit": None, "window": None, "window_source": None,
+             "basis": "no published budget"}
+        used, over = tokens, False
         heaviest = sorted(found.items(), key=lambda kv: -kv[1]["tokens"])[:5]
         result[h] = {"count": len(found), "tokens": tokens, "chars": chars, "used": used,
                      "desc_chars": sum(s["desc_chars"] for s in found.values()), **b, "over_budget": over,
@@ -3383,14 +4354,20 @@ def print_skills(result: dict) -> None:
             budget = r["basis"]
         flag = ""
         if r["over_budget"]:
-            lose = r.get("lose_descriptions")
-            flag = f"  OVER: at least {lose} lose their descriptions" if lose else "  OVER: descriptions get dropped"
+            lose, omitted = r.get("lose_descriptions"), r.get("omitted")
+            if h == "codex":
+                flag = (f"  OVER: {omitted} left out, the rest without descriptions" if omitted else
+                        f"  OVER: {lose} lose part of their descriptions")
+            else:
+                flag = f"  OVER: at least {lose} lose their descriptions" if lose else "  OVER: descriptions get dropped"
         print(f"{h:9} {r['count']:4} skills  ~{fmt_k(r['tokens'])} tokens listing  ({budget}){flag}")
         if r.get("hidden"):
             print("          not listed: " + ", ".join(f"{n} ({why})" for why, n in r["hidden"].items()))
         if r["heaviest"]:
             print("          heaviest: " + ", ".join(f"{x['name']} {fmt_k(x['tokens'])}" for x in r["heaviest"]))
-        if r["window_source"] == "assumed":
+        if r["window_source"] == "assumed" and h == "codex":
+            print(f"          window assumed {fmt_k(r['window'])} tokens: no Codex logs on this machine")
+        elif r["window_source"] == "assumed":
             print(f"          window assumed {fmt_k(r['window'])} tokens: no model in this project's logs or "
                   "settings. For a 200k-context model, pass --window 200000")
 

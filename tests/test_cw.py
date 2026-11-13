@@ -561,7 +561,7 @@ class CwTest(unittest.TestCase):
         write(self.home / ".claude" / "skills" / "big" / "SKILL.md",
               "---\nname: big\ndescription: >\n  " + "d" * 5_000 + "\n---\nbody")
         write(self.home / ".claude" / "skills" / ".trash" / "SKILL.md", "---\nname: trash\n---\n")
-        write(self.home / ".agents" / "skills" / "one" / "SKILL.md", "---\nname: one\ndescription: " + "e" * 600 + "\n---\n")
+        write(self.home / ".agents" / "skills" / "one" / "SKILL.md", "---\nname: one\ndescription: " + "e" * 1_000 + "\n---\n")
         res = self.cw_json("skills", str(self.repo), "--harness", "claude,codex", "--window", "10000")
         # Claude Code lists hidden folders too, .trash as "- .trash (trash): Skill"; Codex does not
         self.assertEqual(res["claude"]["count"], 2)
@@ -816,6 +816,209 @@ class CwTest(unittest.TestCase):
             except cw._YamlError:
                 got = None
             self.assertEqual(got, want, ascii(text))
+
+    # ------------------------------------------------------------------ Codex skill listing
+    def test_codex_frontmatter_reads_as_serde_yaml_does(self):
+        # Codex 0.166.0 reads SKILL.md frontmatter with serde_yaml 0.9.34 into
+        # {name, description, metadata: {short-description}}; None stands for a file it refuses.
+        cw = load_cw()
+        fm = "---\nname: a\ndescription: {}\n---\n"
+        for text, want in (
+                (fm.format("b"), ("a", "b")),
+                ("---\nname: 123\ndescription: true\n---\n", ("123", "true")),  # text, not numbers
+                ("---\nname: ~\ndescription: hi\n---\n", ("dir", "hi")),        # no name: the folder's
+                ("---\nname: '~'\ndescription: hi\n---\n", ("~", "hi")),
+                ("---\nname: a\nname: b\ndescription: hi\n---\n", None),         # a field given twice
+                ("---\nx: 1\nx: 2\nname: a\ndescription: hi\n---\n", ("a", "hi")),  # others may repeat
+                ("---\nname: a\ndescription: hi\nmetadata:\n---\n", ("a", "hi")),
+                ("---\nname: a\ndescription: hi\nmetadata: ~\n---\n", None),     # metadata must be a mapping
+                ("---\nname: a\ndescription: hi\nmetadata: [x]\n---\n", None),
+                ("---\nname: a\ndescription: hi\nmetadata:\n  short-description: [x]\n---\n", None),
+                ("---\nname: [a]\ndescription: hi\n---\n", None),
+                (fm.format("Build for AWS: ECS # note"), ("a", "Build for AWS: ECS")),  # repaired
+                (fm.format("@here"), ("a", "@here")),
+                (fm.format('"x"y'), None),
+                ("---\nname: a\ndescription: |\n  one: two\n  three\n---\n", ("a", "one: two three")),
+                (fm.format('"one\\u001ftwo\\u3000three"'), ("a", "one\x1ftwo three")),  # Rust's whitespace
+                ("---\nname: a\n---\n", None),                                   # a description is required
+                (fm.format("'  '"), None),
+                ("---\n# only a comment\n---\n", None),
+                ("---\n---\n", None),
+                ("---\nname: a\ndescription: hi\n", None),                       # never closed
+                ("﻿" + fm.format("hi"), None),                              # a BOM hides the frontmatter
+                ("  ---  \r\nname: a\r\ndescription: hi\r\n---\r\n", ("a", "hi")),
+                ("---\nname: " + "n" * 65 + "\ndescription: hi\n---\n", None),   # a name over 64 characters
+                ("---\nname: a\ndescription: x\n...\nname: b\n---\n", None),     # two documents
+                ("---\n- a\n- b\n---\n", None),
+        ):
+            self.assertEqual(cw._codex_frontmatter(text, "dir"), want, ascii(text))
+
+    def codex_listing(self, cwd=None, admin=None):
+        """Codex's listing, from cw.py in this process with this test's HOME and an empty
+        /etc/codex, or `admin`."""
+        cw = load_cw()
+        managed = Path(admin or self.tmp_path / "no-admin")
+        with mock.patch.dict(os.environ, self.env, clear=True), mock.patch.object(cw, "_codex_admin_dir", lambda: managed):
+            return cw.codex_listing(str(cwd or self.repo))
+
+    def codex_shown(self, text: str) -> str:
+        h = os.path.realpath(str(self.home)).replace(os.sep, "/")
+        r = os.path.realpath(str(self.repo)).replace(os.sep, "/")
+        return text.replace(r, "<repo>").replace(h, "~")
+
+    def codex_raw(self, cwd=None, admin=None):
+        """(the roots table, the lines) as Codex would write them, with this test's home as ~ and
+        the repo as <repo>."""
+        r = self.codex_listing(cwd, admin)
+        return [self.codex_shown(x) for x in r["roots"]], [self.codex_shown(e["line"]) for e in r["entries"]]
+
+    def codex_lines(self, cwd=None, admin=None):
+        """The lines Codex would list, in its order, each root alias written out in full."""
+        roots, lines = self.codex_raw(cwd, admin)
+        for root in roots:
+            alias, path = re.match(r"- `(r[0-9]+)` = `(.*)`\Z", root).groups()
+            lines = [x.replace(f"(file: {alias}/", f"(file: {path}/") for x in lines]
+        return lines
+
+    def symlink(self, link: Path, target: Path) -> bool:
+        """A folder symlink, or False where this system cannot make one (Windows without rights)."""
+        link.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.symlink(str(target), str(link), target_is_directory=True)
+            return True
+        except (OSError, NotImplementedError):
+            return False
+
+    def test_codex_listing_lines_follow_codex(self):
+        sk = self.home / ".agents" / "skills"
+        write(sk / "alpha" / "SKILL.md", "---\nname: alpha\ndescription: |\n  Does   x\n    and y\n---\nbody")
+        write(sk / "dir-name" / "SKILL.md", "---\ndescription: hi\n---\n")
+        write(sk / "colon" / "SKILL.md", "---\nname: colon\ndescription: Build for AWS: ECS # note\n---\n")
+        write(sk / "long" / "SKILL.md", "---\nname: long\ndescription: " + "w" * 2_000 + "\n---\n")
+        write(sk / "typed" / "SKILL.md", "---\nname: 123\ndescription: true\n---\n")
+        write(sk / "a" / "b" / "c" / "d" / "e" / "deep" / "SKILL.md", "---\nname: deep\ndescription: six folders down\n---\n")
+        write(sk / "a" / "b" / "c" / "d" / "e" / "f" / "deeper" / "SKILL.md", "---\nname: deeper\ndescription: seven\n---\n")
+        write(sk / ".hidden" / "x" / "SKILL.md", "---\nname: hidden\ndescription: no\n---\n")
+        write(sk / "lower" / "skill.md", "---\nname: lower\ndescription: no\n---\n")
+        write(sk / "nodesc" / "SKILL.md", "---\nname: nodesc\n---\n")
+        write(sk / "open" / "SKILL.md", "---\nname: open\ndescription: never closed\n")
+        write(sk / "bom" / "SKILL.md", "﻿---\nname: bom\ndescription: hi\n---\n")
+        write(sk / "twice" / "SKILL.md", "---\nname: twice\nname: again\ndescription: hi\n---\n")
+        # Paths are written from a root alias: Codex's roots table costs less than the full paths
+        self.assertEqual(self.codex_raw(), (["- `r0` = `~/.agents/skills`"], [
+            "- 123: true (file: r0/typed/SKILL.md)",
+            "- alpha: Does x and y (file: r0/alpha/SKILL.md)",
+            "- colon: Build for AWS: ECS (file: r0/colon/SKILL.md)",
+            "- deep: six folders down (file: r0/a/b/c/d/e/deep/SKILL.md)",
+            "- dir-name: hi (file: r0/dir-name/SKILL.md)",
+            "- long: " + "w" * 1_021 + "... (file: r0/long/SKILL.md)",
+        ]))
+        self.assertEqual(self.codex_listing()["hidden"], {"unreadable": 4})
+
+    def test_codex_roots_scopes_and_order(self):
+        codex = self.home / ".codex"
+        skill = "---\nname: {}\ndescription: hi\n---\n"
+        write(codex / "skills" / ".system" / "sys" / "SKILL.md", skill.format("zsys"))
+        admin = self.tmp_path / "admin"
+        write(admin / "skills" / "adm" / "SKILL.md", skill.format("yadm"))
+        write(self.repo / ".agents" / "skills" / "r1" / "SKILL.md", skill.format("xrepo"))
+        write(self.repo / "sub" / ".codex" / "skills" / "r2" / "SKILL.md", skill.format("wrepo"))
+        write(self.home / ".agents" / "skills" / "u1" / "SKILL.md", skill.format("a-user"))
+        write(codex / "skills" / "u2" / "SKILL.md", skill.format("b-user"))
+        sub = self.repo / "sub"
+        names = lambda **kw: [ln.split(":")[0][2:] for ln in self.codex_lines(**kw)]
+        # System, Admin, Repo, then User; by name within each
+        self.assertEqual(names(cwd=sub, admin=admin), ["zsys", "yadm", "wrepo", "xrepo", "a-user", "b-user"])
+        self.assertEqual(names(cwd=self.repo), ["zsys", "xrepo", "a-user", "b-user"])  # .codex/skills below cwd
+        write(codex / "config.toml", "project_root_markers = []\n\n[skills.bundled]\nenabled = false\n")
+        self.assertEqual(names(cwd=sub), ["wrepo", "a-user", "b-user"])  # the project root is now cwd
+        # One skill under two roots is listed once, from the root Codex reads first: the user's
+        # folders come before the repo's .agents/skills
+        if self.symlink(self.home / ".agents" / "skills" / "link", self.repo / ".agents" / "skills" / "r1"):
+            lines = self.codex_lines()
+            self.assertEqual([ln for ln in lines if "xrepo" in ln], ["- xrepo: hi (file: ~/.agents/skills/link/SKILL.md)"])
+
+    def test_codex_config_rules_and_openai_yaml(self):
+        sk = self.home / ".agents" / "skills"
+        for name in ("gone", "back", "quiet", "chat", "both", "broken", "plain"):
+            write(sk / name / "SKILL.md", f"---\nname: {name}\ndescription: hi\n---\n")
+        write(sk / "quiet" / "agents" / "openai.yaml", "policy:\n  allow_implicit_invocation: false\n")
+        write(sk / "chat" / "agents" / "openai.yaml", "policy:\n  products: [chatgpt]\n")
+        write(sk / "both" / "agents" / "openai.yaml", "policy:\n  products: [chatgpt, CODEX]\n")
+        write(sk / "broken" / "agents" / "openai.yaml", "policy: [\n")  # unreadable: the defaults apply
+        back = json.dumps(str(sk / "back" / "SKILL.md"))
+        write(self.home / ".codex" / "config.toml",
+              '[[skills.config]]\nname = "gone"\nenabled = false\n\n'
+              f"[[skills.config]]\npath = {back}\nenabled = false\n\n"
+              f"[[skills.config]]\npath = {back}\nenabled = true\n")  # the last rule for a path wins
+        r = self.codex_listing()
+        self.assertEqual([e["name"] for e in r["entries"]], ["back", "both", "broken", "plain"])
+        self.assertEqual(r["hidden"], {"skills.config": 1, "allow_implicit_invocation": 1, "products": 1})
+        write(self.home / ".codex" / "config.toml", "[skills]\ninclude_instructions = false\n")
+        r = self.codex_listing()
+        self.assertEqual((r["entries"], r["hidden"]), ([], {"allow_implicit_invocation": 1, "products": 1,
+                                                  "skills.include_instructions": 5}))
+
+    def test_codex_plugins_and_namespaces(self):
+        cache = self.home / ".codex" / "plugins" / "cache" / "market"
+        skill = "---\nname: {}\ndescription: hi\n---\n"
+        for version in ("1.0", "2.0", "local"):  # "local" wins over any version
+            write(cache / "tool" / version / ".codex-plugin" / "plugin.json", json.dumps({"name": "tool"}))
+            write(cache / "tool" / version / "skills" / version / "SKILL.md", skill.format("a" + version))
+        write(cache / "off" / "1.0" / ".codex-plugin" / "plugin.json", json.dumps({"name": "off"}))
+        write(cache / "off" / "1.0" / "skills" / "o" / "SKILL.md", skill.format("o"))
+        for version in ("1.2.0", "1.10.0"):  # the highest version, compared as versions
+            root = cache / "more" / version
+            write(root / ".claude-plugin" / "plugin.json", json.dumps({"name": "more", "skills": "./extra"}))
+            write(root / "extra" / "b" / "SKILL.md", skill.format("b"))
+            write(root / "skills" / "c" / "SKILL.md", skill.format("c"))  # not read: the manifest names ./extra
+        write(self.home / ".codex" / "config.toml",
+              '[plugins."tool@market"]\nenabled = true\n\n[plugins."off@market"]\nenabled = false\n\n'
+              '[plugins."more@market"]\nenabled = true\n')
+        write(self.repo / ".claude-plugin" / "plugin.json", json.dumps({"name": "mine"}))  # the repo is a plugin
+        write(self.repo / ".agents" / "skills" / "x" / "SKILL.md", skill.format("x"))
+        want = ["- mine:x: hi (file: <repo>/.agents/skills/x/SKILL.md)",
+                "- more:b: hi (file: ~/.codex/plugins/cache/market/more/1.10.0/extra/b/SKILL.md)",
+                "- tool:alocal: hi (file: ~/.codex/plugins/cache/market/tool/local/skills/local/SKILL.md)"]
+        self.assertEqual(self.codex_lines(), want)
+        # Plugin versions with one listed skill share their marketplace folder's alias
+        self.assertEqual(self.codex_raw()[0], ["- `r0` = `~/.codex/plugins/cache/market`",
+                                               "- `r1` = `<repo>/.agents/skills`"])
+        # A skill folder linked from a plugin's checkout takes that plugin's name
+        dev = self.tmp_path / "dev" / "plug"
+        write(dev / ".codex-plugin" / "plugin.json", json.dumps({"name": "dev"}))
+        write(dev / "skills" / "linked" / "SKILL.md", skill.format("linked"))
+        if self.symlink(self.home / ".agents" / "skills" / "linked", dev / "skills" / "linked"):
+            self.assertEqual(self.codex_lines(),
+                             [want[0], "- dev:linked: hi (file: ~/.agents/skills/linked/SKILL.md)", *want[1:]])
+
+    def test_codex_budget_cuts_descriptions_then_omits(self):
+        sk = self.home / ".agents" / "skills"
+        write(sk / "a" / "SKILL.md", "---\nname: a\ndescription: " + "x" * 400 + "\n---\n")
+        write(sk / "b" / "SKILL.md", "---\nname: b\ndescription: " + "y" * 40 + "\n---\n")
+        config = self.home / ".codex" / "config.toml"
+        cost = lambda line: -(-(len(line.encode()) + 1) // 4)  # Codex: a line and its break, 4 bytes a token
+        full = self.codex_listing()
+        self.assertEqual((full["budget"], full["budget_unit"], full["window_source"], full["aliases"]),
+                         (5_440, "tokens", "assumed", 1))
+        self.assertEqual(full["used"], sum(cost(e["line"]) for e in full["entries"]))
+        minimum = sum(cost(e["line"].split(": ", 1)[0] + ": " + e["line"][e["line"].index("(file: "):])
+                      for e in full["entries"])
+        write(config, f"[skills]\nmax_context_tokens = {minimum + 30}\n")
+        cut = self.codex_listing()
+        lines = {e["name"]: e["line"] for e in cut["entries"]}
+        self.assertIn("- b: " + "y" * 40 + " (file: ", lines["b"])           # the short one keeps all of it
+        self.assertNotIn("x" * 400, lines["a"])                              # the long one is cut
+        self.assertIn("- a: xxxx", lines["a"])
+        self.assertLessEqual(cut["loaded"], cut["budget"])  # what Codex sends fits
+        self.assertGreater(cut["used"], cut["budget"])  # what the skills ask for does not
+        self.assertEqual((cut["budget"], cut["over_budget"], cut["losing_descriptions"], cut["omitted"]),
+                         (minimum + 30, True, ["a"], 0))
+        write(config, "[skills]\nmax_context_tokens = 1\n")
+        none = self.codex_listing()
+        self.assertEqual((none["entries"], none["omitted"]), ([], 2))
+        write(config, "[skills]\nmax_context_tokens = 20000\n")
+        self.assertEqual(self.codex_listing()["budget"], 10_000)              # Codex caps it at 10,000
 
     # ------------------------------------------------------------------ sessions
     def _claude_log(self, name, cwd, ts, ctxs, dup_first=0, creation=0):
@@ -2112,13 +2315,14 @@ class CwTest(unittest.TestCase):
                 "total_token_usage": {"total_tokens": 1}, "last_token_usage": {"input_tokens": 1},
                 "model_context_window": 400_000}}}])
         s = self.cw_json("skills", str(self.repo), "--harness", "claude,codex")
-        self.assertEqual(s["codex"]["budget"], 8_000)              # 2% of the window Codex reported
+        # 2% of the full window: Codex logs the 95% it lets a session use, so 400,000 is 421,053
+        self.assertEqual(s["codex"]["budget"], 8_421)
         self.assertEqual(s["claude"]["window_source"], "assumed")  # no model in Claude logs or settings
         s = self.cw_json("skills", str(self.repo), "--harness", "claude,codex", "--window", "1000000")
         # Claude Code budgets the listing in columns: 1% of the window at 3 characters per token
         self.assertEqual((s["claude"]["budget"], s["claude"]["budget_unit"]), (30_000, "chars"))
         # Codex records its own window; --window must not override it (it once did: 20,000)
-        self.assertEqual((s["codex"]["budget"], s["codex"]["budget_unit"]), (8_000, "tokens"))
+        self.assertEqual((s["codex"]["budget"], s["codex"]["budget_unit"]), (8_421, "tokens"))
         self.assertEqual(s["codex"]["window_source"], "codex logs")
         write(self.home / ".claude" / "settings.json", json.dumps({"skillListingBudgetFraction": 0.02}))
         self.assertEqual(self.cw_json("skills", str(self.repo), "--harness", "claude")["claude"]["budget"], 60_000)
