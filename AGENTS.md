@@ -14,6 +14,10 @@
   Change both together, with a source and the date you checked it.
 - Use `_is_file` / `_is_dir` / `_exists`, not the `Path` methods: on Python 3.13 and older
   those raise `PermissionError` under an unreadable parent folder.
+- Read files through `read_text`, `_read_bytes` or `_open_file`, never `open()` or
+  `Path.read_bytes()`: opening a named pipe waits for a writer, and one pipe in `.claude/rules`
+  hung `files` from 0.3.2 on. `_open_file` opens without waiting and refuses anything but a
+  regular file.
 - A release bumps `VERSION` in `cw.py` and `version` in both `plugin.json` files; a test checks
   they match. Claude Code and Codex cache plugins by version, so an unbumped change never
   reaches people who installed the plugin.
