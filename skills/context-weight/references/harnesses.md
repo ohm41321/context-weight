@@ -1,22 +1,53 @@
 # What each harness loads at startup
 
-Checked against official docs on 2026-11-10. Harnesses change. If a number here
-disagrees with the harness's own docs, trust the docs and update this file and
-`scripts/cw.py`.
+Checked on 2026-11-13 against official docs and, where the docs say less, the
+harnesses' own code: Claude Code 2.1.322 and Codex 0.166.0 (`rust-v0.166.0`).
+Harnesses change. If a number here disagrees with the harness's own docs, trust
+the docs and update this file and `scripts/cw.py`.
 
 ## Claude Code
 
-Source: https://code.claude.com/docs/en/memory and https://code.claude.com/docs/en/skills
+Source: https://code.claude.com/docs/en/memory and https://code.claude.com/docs/en/skills,
+and Claude Code 2.1.322's own code (its built-in agents-md plugin, the skill
+listing), read on 2026-11-12.
 
 **Loaded at launch**
 
 - `~/.claude/CLAUDE.md`.
 - `CLAUDE.md`, `.claude/CLAUDE.md` and `CLAUDE.local.md` in the working
-  directory and in every directory above it.
+  directory and in every directory above it, short of the filesystem root.
 - `.claude/rules/*.md` files that have no `paths:` frontmatter, user-level
-  `~/.claude/rules/` first. Symlinked files and folders inside `rules/` are
-  followed; loops are detected. A symlink whose target is outside the working
-  directory loads only after the user approves external imports.
+  `~/.claude/rules/` first, then the `.claude/rules/` of each of those same
+  directories, from the top down. Symlinked files and folders inside `rules/`
+  are followed; loops are detected. A symlink whose target is outside the
+  working directory loads only after the user approves external imports.
+- A file that holds only whitespace loads nothing.
+
+**AGENTS.md** (Claude Code 2.1.277 and later, through its built-in agents-md
+plugin). Its `instructionFiles` option decides:
+
+- `claude-md-or-agents-md`, the default: `AGENTS.md` and `.claude/AGENTS.md`
+  in the same directories load only when no CLAUDE.md there or above
+  (`CLAUDE.md`, `.claude/CLAUDE.md`, `CLAUDE.local.md`; `~/.claude/CLAUDE.md`
+  does not count) holds any text.
+- `claude-md`: AGENTS.md never loads. `claude-md-and-agents-md`: it loads beside
+  CLAUDE.md. `managed-only`: no user or project file loads at all.
+- The option is read from user settings only:
+  `pluginConfigs["agents-md@builtin"].options.instructionFiles`. Its older
+  name, `projectInstructions`, took `none`, `claude`, `agents-fallback` and
+  `both`.
+- `enabledPlugins` can turn the plugin off in any settings file; the highest
+  one that names it decides (project local, project, user). Off means no
+  AGENTS.md.
+- An AGENTS.md that is a file already loaded (the same file through a link, or
+  one a CLAUDE.md imports), or holds the same text as a loaded project file,
+  is not loaded twice.
+
+**Git worktrees:** in a worktree inside its main checkout, as Claude Code makes
+them (`.claude/worktrees/<name>`), the main checkout's own folders are skipped:
+the worktree holds its own copy of their files. Folders above the main checkout
+still count. Sessions in a worktree belong to its repository, and auto memory
+is one per repository, shared by its worktrees.
 
 **Loaded on demand**
 
@@ -49,19 +80,38 @@ structure; they save no context.
 
 - Only the name and description are listed at startup. The body loads when the
   skill is used.
+- Where they come from: managed (policy) skills, `~/.claude/skills`,
+  `.claude/skills` from the working directory up to the git root (in a
+  worktree, the main checkout's too), commands in `commands/` folders, the
+  enabled plugins in the order settings name them (their `skills/`, the skill
+  paths in their manifest, their commands), and skills synced from the
+  claude.ai account Claude Code is signed in with. A file reached twice is
+  listed once.
+- Frontmatter is YAML as Bun's parser reads it (Bun 1.4.4, inside Claude Code
+  2.1.322). `cw.py` matches it on 341 of 344 cases; the other three
+  (integer-like key order, `?` complex keys, `---` between documents) cannot
+  occur in frontmatter.
 - `description` plus `when_to_use` is cut at 1,536 characters
-  (`skillListingMaxDescChars` changes it).
-- The whole listing has a **character** budget of 1% of the model's context
-  window. `skillListingBudgetFraction` in settings (for example `0.02`) or the
-  `SLASH_COMMAND_TOOL_CHAR_BUDGET` environment variable (a fixed character
-  count) raises it. Past the budget, the least-used skills lose their
-  descriptions; their names stay.
-- `cw.py` converts the window to characters at 4 per token: older docs gave an
-  8,000-character fallback, which is 1% of a 200k window at that rate. The
-  window is not in Claude Code's logs, so `cw.py` assumes 200k unless
-  `--window` says otherwise (use `--window 1000000` for 1M-context models).
-- Skill folders: `~/.claude/skills`, `.claude/skills` from the working
-  directory up to the repo root, and `skills/` inside each plugin.
+  (`skillListingMaxDescChars` changes it). Each line is cleaned as Claude Code
+  does and measured in terminal columns: a wide character takes two.
+- The whole listing has a budget of 1% of the model's context window, in
+  columns: the window times the characters per token Claude Code assumes for
+  the model (4 for older models, 3 for the rest and for today's default).
+  `skillListingBudgetFraction` in settings (for example `0.02`) or the
+  `SLASH_COMMAND_TOOL_CHAR_BUDGET` environment variable (a fixed count) changes
+  it.
+- The window comes from the model: 1M for models with a native 1M window or a
+  `[1m]` suffix, 200k for the rest. `CLAUDE_CODE_DISABLE_1M_CONTEXT` caps it at
+  200k. The model is not always in the logs; with none, `cw.py` assumes today's
+  default model's 1M window and says so (`--window 200000` for a 200k model).
+- Past the budget, lines set to `name-only` stay whole, every other line is cut
+  to its name, and descriptions come back in order of use while they fit.
+  Skills built into Claude Code keep theirs and are not on disk, so the number
+  `cw.py` gives for skills losing descriptions is a lower bound.
+- Levers: `skillOverrides` in settings (`{"name": "off"}` hides a skill,
+  `"name-only"` keeps only its name), `disable-model-invocation: true` in a
+  skill only run by hand, disabling unused plugins, shorter descriptions, or a
+  larger `skillListingBudgetFraction`.
 
 **Logs:** `~/.claude/projects/<slug>/<session>.jsonl` (or under
 `$CLAUDE_CONFIG_DIR`).
@@ -99,17 +149,39 @@ across nested directories. `cw.py` applies the cap to the project chain.
 
 **`@` imports:** not documented, so they are treated as plain text.
 
-**Skills**
+**Skills** (Codex 0.166.0's code, `codex-rs` core skills and host, read on
+2026-11-13; the docs give only the folders)
 
 - Name and description load at startup. The full SKILL.md loads when the skill
   is used.
-- Folders: `.agents/skills` from the working directory up to the repo root,
-  `~/.agents/skills`, `/etc/codex/skills`, and bundled system skills. Older
-  installs also used `~/.codex/skills`.
-- The listing budget is 2% of the context window, or 8,000 characters when the
-  window is unknown. `cw.py` reads the window from the newest rollout
-  (`model_context_window`). `--window` is Claude Code's window and never
-  overrides this; it fills in only when no rollout records a window.
+- Roots, in the order Codex reads them (a skill found twice keeps the first):
+  `.codex/skills` from the working directory up to the project root,
+  `$CODEX_HOME/skills`, `~/.agents/skills`, the bundled system skills
+  (`$CODEX_HOME/skills/.system`, unless `[skills.bundled] enabled = false`),
+  `/etc/codex/skills`, the plugins config.toml enables, then `.agents/skills`
+  from the project root down to the working directory. The project root is
+  the nearest folder with one of `project_root_markers` (default `.git`).
+- Each root is searched breadth first, at most 6 folders deep, 2,000 folders
+  and 20,000 names. Hidden folders are skipped.
+- SKILL.md frontmatter is read with serde_yaml. A skill with no description, or
+  with a name longer than 64 characters, is skipped. A plugin's skills are named
+  `plugin:skill` (at most 129 characters). The listing cuts a description at
+  1,024 characters.
+- Left out of the listing: skills a `[[skills.config]]` entry turns off (by
+  `path` or `name`, `enabled = false`, the last entry winning) and skills whose
+  `agents/openai.yaml` sets `policy: allow_implicit_invocation: false`.
+- Each line reads `- name: description (file: path)`. When it is cheaper, Codex
+  names the roots once (`### Skill roots`, `` - `r0` = `root` ``) and writes
+  `(file: r0/...)`.
+- The budget is 2% of the full context window in tokens, at 4 bytes a token,
+  or `[skills] max_context_tokens` (at most 10,000). Rollouts log
+  `model_context_window` as 95% of the full window, so `cw.py` divides by 0.95.
+  With no Codex logs it takes `--window`, or assumes 272k and says so.
+- Past the budget, Codex cuts description characters evenly, one per line per
+  round, then drops descriptions, then leaves lines out.
+- Checked by replay: on the skill set of a real rollout, `cw.py` drew the same
+  156 lines at the same cost (10,000 tokens).
+- Not counted: cloud, remote and executor skills, and extra roots an app adds.
 
 **Logs:** `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`.
 

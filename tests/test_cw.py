@@ -55,7 +55,9 @@ class CwTest(unittest.TestCase):
         # which would point the fixtures' git commands at the caller's own repository, and a global
         # git ignore file under XDG_CONFIG_HOME can hide the fixtures' files.
         drop = ("CLAUDE_CONFIG_DIR", "CODEX_HOME", "OPENCODE_DISABLE_CLAUDE_CODE", "SLASH_COMMAND_TOOL_CHAR_BUDGET",
-                "BROWSER", "XDG_CONFIG_HOME")
+                "BROWSER", "XDG_CONFIG_HOME", "ANTHROPIC_MODEL", "CLAUDE_CODE_DISABLE_1M_CONTEXT", "DISABLE_COMPACT",
+                "CLAUDE_CODE_MAX_CONTEXT_TOKENS", "CLAUDE_CODE_ORGANIZATION_UUID", "CLAUDE_CODE_ACCOUNT_UUID",
+                "CLAUDE_CODE_DISABLE_POLICY_SKILLS", "CLAUDE_CODE_DISABLE_AUTO_MEMORY", "CLAUDE_CODE_PROJECT_DIR_NAME")
         self.env = {k: v for k, v in os.environ.items() if k not in drop and not k.startswith("GIT_")}
         self.env["HOME"] = str(self.home)
         self.env["USERPROFILE"] = str(self.home)  # Windows: expanduser reads USERPROFILE, not HOME
@@ -186,8 +188,11 @@ class CwTest(unittest.TestCase):
         self.assertFalse(res.get("cross"))
         (self.repo / "CLAUDE.md").unlink()
         write(self.repo / "AGENTS.md", "a" * 30_000)
+        # Claude Code loads AGENTS.md where no CLAUDE.md is, unless set to read CLAUDE.md only.
+        write(self.home / ".claude" / "settings.json", json.dumps(
+            {"pluginConfigs": {"cc-plugin-agents-md@builtin": {"options": {"instructionFiles": "claude-md"}}}}))
         res = self.cw_json("files", str(self.repo), "--harness", "claude,codex")
-        self.assertTrue(res.get("cross"), "AGENTS.md with no CLAUDE.md went unflagged")
+        self.assertTrue(res.get("cross"), "AGENTS.md that only Codex reads went unflagged")
         (self.repo / "AGENTS.md").unlink()
         res = self.cw_json("files", str(self.repo), "--harness", "claude,codex")
         self.assertFalse(res.get("cross"))
@@ -234,6 +239,309 @@ class CwTest(unittest.TestCase):
         self.assertEqual([Path(f["path"]).relative_to(self.repo.resolve()).as_posix() for f in self.mine(r["files"])],
                          [".claude/CLAUDE.md"])
 
+    # ------------------------------------------------------------------ what Claude Code loads
+    _CLAUDE_NAMES = ("CLAUDE.md", ".claude/CLAUDE.md", "CLAUDE.local.md")
+
+    def _claude_md_above(self):
+        """A CLAUDE.md this machine keeps above the temp folder, if any. Claude Code reads
+        AGENTS.md only where no CLAUDE.md is in the start folder or above it."""
+        for d in self.tmp_path.resolve().parents:
+            if d == Path(d.anchor):
+                continue  # Claude Code does not read the filesystem root
+            for name in self._CLAUDE_NAMES:
+                try:
+                    if (d / name).is_file() and (d / name).read_text(encoding="utf-8", errors="replace").strip():
+                        return d / name
+                except OSError:
+                    pass
+        return None
+
+    def _skip_if_claude_md_above(self):
+        above = self._claude_md_above()
+        if above:
+            self.skipTest(f"{above} keeps AGENTS.md out of Claude Code on this machine")
+
+    def _claude_rel(self, files):
+        """(path under the test's temp folder, role) for each Claude Code entry in it."""
+        top = self.tmp_path.resolve()
+        return [(Path(f["path"]).resolve().relative_to(top).as_posix(), f["role"]) for f in self.mine(files)]
+
+    def _claude_loads(self, path):
+        return [rel for rel, _ in self._claude_rel(self.cw_json("files", str(path), "--harness", "claude")["claude"]["files"])]
+
+    def test_claude_reads_agents_md_when_no_claude_md(self):
+        # Claude Code 2.1.277+ loads AGENTS.md where no CLAUDE.md is: every AGENTS.md and
+        # .claude/AGENTS.md from the start folder up, with its @imports. The user's own
+        # ~/.claude/CLAUDE.md is not such a file; AGENTS.local.md, .agents/ and a subfolder's
+        # AGENTS.md do not load at startup.
+        self._skip_if_claude_md_above()
+        write(self.home / ".claude" / "CLAUDE.md", "my own rules\n")
+        write(self.repo / "AGENTS.md", rules("shared", 50) + "@docs/more.md\n")
+        write(self.repo / "docs" / "more.md", "more rules\n")
+        write(self.repo / ".claude" / "AGENTS.md", "kept under .claude\n")
+        write(self.repo.parent / "AGENTS.md", "workspace rules\n")
+        for name in ("AGENTS.local.md", ".agents/AGENTS.md", "sub/AGENTS.md"):
+            write(self.repo / name, "not read by Claude Code at startup\n")
+        res = self.cw_json("files", str(self.repo), "--harness", "claude,codex")
+        r = res["claude"]
+        self.assertEqual(self._claude_rel(r["files"]), [
+            ("home/.claude/CLAUDE.md", "user"),
+            ("work/AGENTS.md", "project"),
+            ("work/repo/AGENTS.md", "project"),
+            ("work/repo/docs/more.md", "project import"),
+            ("work/repo/.claude/AGENTS.md", "project"),
+        ])
+        self.assertTrue(any("AGENTS.md" in n and "no CLAUDE.md" in n for n in r["notes"]), r["notes"])
+        in_repo = [f for f, (rel, _) in zip(self.mine(r["files"]), self._claude_rel(r["files"]))
+                   if rel.startswith("work/repo/")]
+        self.assertEqual(r["repo_tokens"], sum(f["tokens"] for f in in_repo))
+        self.assertFalse(res.get("cross"))  # both agents read this AGENTS.md
+
+    def test_any_claude_md_up_the_tree_keeps_agents_md_out(self):
+        self._skip_if_claude_md_above()
+        write(self.repo / "AGENTS.md", "agents rules\n")
+        start = self.repo / "pkg"
+        start.mkdir()
+        for spot in ("work/repo/pkg/CLAUDE.md", "work/repo/.claude/CLAUDE.md", "work/repo/CLAUDE.local.md",
+                     "work/CLAUDE.md", "work/.claude/CLAUDE.md"):
+            p = write(self.tmp_path / spot, "claude rules\n")
+            self.assertEqual(self._claude_loads(start), [spot], spot)
+            p.unlink()
+        # A CLAUDE.md that holds nothing loads nothing, so it does not count.
+        write(self.repo / "CLAUDE.md", " \n\n")
+        self.assertEqual(self._claude_loads(start), ["work/repo/AGENTS.md"])
+        # The user's own CLAUDE.md does not count either, also for a repo inside the home folder,
+        # where it sits at the home folder's .claude/CLAUDE.md.
+        repo2 = self.home / "code" / "r2"
+        (repo2 / ".git").mkdir(parents=True)
+        write(repo2 / "AGENTS.md", "agents rules\n")
+        write(self.home / ".claude" / "CLAUDE.md", "my own rules\n")
+        self.assertEqual(self._claude_loads(repo2), ["home/.claude/CLAUDE.md", "home/code/r2/AGENTS.md"])
+
+    def _plugin_options(self, options, plugin="cc-plugin-agents-md@builtin", where=None):
+        settings = {"pluginConfigs": {plugin: {"options": options}}}
+        write(where or self.home / ".claude" / "settings.json", json.dumps(settings))
+
+    def test_instruction_files_setting_picks_what_claude_code_loads(self):
+        # Claude Code's built-in agents-md plugin reads its instructionFiles option (and the older
+        # projectInstructions) from user settings only, under either plugin id; /plugin can turn
+        # the plugin off in any settings file, and then AGENTS.md never loads.
+        self._skip_if_claude_md_above()
+        write(self.home / ".claude" / "CLAUDE.md", "my own rules\n")
+        write(self.repo / "CLAUDE.md", "claude rules\n")
+        write(self.repo / "AGENTS.md", "agents rules\n")
+        write(self.repo / ".claude" / "rules" / "r.md", "a rule\n")
+        slug = "".join(c if c.isascii() and c.isalnum() else "-" for c in str(self.repo.resolve()))
+        write(self.home / ".claude" / "projects" / slug / "memory" / "MEMORY.md", "remember this\n")
+        U, C, A, R = "home/.claude/CLAUDE.md", "work/repo/CLAUDE.md", "work/repo/AGENTS.md", "work/repo/.claude/rules/r.md"
+        M = f"home/.claude/projects/{slug}/memory/MEMORY.md"
+        modes = {"default": ([U, C, R, M], [U, R, A, M]), "claude-md": ([U, C, R, M], [U, R, M]),
+                 "and": ([U, C, R, A, M], [U, R, A, M]), "managed-only": ([M], [M])}
+        cases = [({}, "default"),
+                 ({"instructionFiles": "claude-md-or-agents-md"}, "default"),
+                 ({"instructionFiles": "claude-md"}, "claude-md"),
+                 ({"instructionFiles": "claude-md-and-agents-md"}, "and"),
+                 ({"instructionFiles": "managed-only"}, "managed-only"),
+                 ({"instructionFiles": "bogus"}, "default"),
+                 ({"projectInstructions": "none"}, "managed-only"),
+                 ({"projectInstructions": "claude"}, "claude-md"),
+                 ({"projectInstructions": "agents-fallback"}, "default"),
+                 ({"projectInstructions": "both"}, "and"),
+                 ({"projectInstructions": "bogus"}, "claude-md"),
+                 ({"projectInstructions": 7}, "claude-md"),
+                 ({"projectInstructions": None}, "claude-md"),
+                 # projectInstructions counts only while instructionFiles is the default
+                 ({"instructionFiles": "claude-md-and-agents-md", "projectInstructions": "none"}, "and"),
+                 ({"instructionFiles": "claude-md-or-agents-md", "projectInstructions": "both"}, "and")]
+        for options, mode in cases:
+            for plugin in ("cc-plugin-agents-md@builtin", "agents-md@builtin"):
+                self._plugin_options(options, plugin)
+                for with_claude_md, expect in zip((True, False), modes[mode]):
+                    if not with_claude_md:
+                        os.replace(self.repo / "CLAUDE.md", self.tmp_path / "parked.md")
+                    try:
+                        self.assertEqual(self._claude_loads(self.repo), expect, (options, plugin, with_claude_md))
+                    finally:
+                        if not with_claude_md:
+                            os.replace(self.tmp_path / "parked.md", self.repo / "CLAUDE.md")
+        # Project and local settings do not set the option.
+        write(self.home / ".claude" / "settings.json", "{}")
+        for name in ("settings.json", "settings.local.json"):
+            self._plugin_options({"instructionFiles": "managed-only"}, where=self.repo / ".claude" / name)
+            self.assertEqual(self._claude_loads(self.repo), modes["default"][0], name)
+            (self.repo / ".claude" / name).unlink()
+        # Turned off through enabledPlugins: the highest settings file that names it decides.
+        (self.repo / "CLAUDE.md").unlink()
+        off = [U, R, M]
+        for files, expect in (({"user": {"cc-plugin-agents-md@builtin": False}}, off),
+                              ({"project": {"agents-md@builtin": False}}, off),
+                              ({"user": {"cc-plugin-agents-md@builtin": False},
+                                "local": {"cc-plugin-agents-md@builtin": True}}, modes["default"][1]),
+                              ({"user": {"cc-plugin-agents-md@builtin": True}}, modes["default"][1])):
+            paths = {"user": self.home / ".claude" / "settings.json",
+                     "project": self.repo / ".claude" / "settings.json",
+                     "local": self.repo / ".claude" / "settings.local.json"}
+            for scope, value in files.items():
+                write(paths[scope], json.dumps({"enabledPlugins": value}))
+            self.assertEqual(self._claude_loads(self.repo), expect, files)
+            for p in paths.values():
+                if p.exists():
+                    p.unlink()
+
+    def test_agents_md_beside_claude_md_loads_once(self):
+        # claude-md-and-agents-md skips an AGENTS.md that CLAUDE.md already imports or links to,
+        # and one whose text is the same as a loaded project file.
+        self._plugin_options({"instructionFiles": "claude-md-and-agents-md"})
+        write(self.repo / "AGENTS.md", "agents rules\n")
+        for claude_md in ("@AGENTS.md\n", "agents rules\n\n"):
+            write(self.repo / "CLAUDE.md", claude_md)
+            names = [Path(rel).name for rel in self._claude_loads(self.repo)]
+            self.assertEqual(sorted(names), sorted({"@AGENTS.md\n": ["CLAUDE.md", "AGENTS.md"],
+                                                    "agents rules\n\n": ["CLAUDE.md"]}[claude_md]), claude_md)
+        if os.name != "nt":
+            (self.repo / "CLAUDE.md").unlink()
+            (self.repo / "CLAUDE.md").symlink_to("AGENTS.md")
+            self.assertEqual(len(self._claude_loads(self.repo)), 1)
+
+    def test_before_and_after_weighs_agents_md_as_claude_code_loaded_it(self):
+        self._skip_if_claude_md_above()
+        self._git_repo()
+        write(self.repo / ".gitignore", "CLAUDE.local.md\n")
+        write(self.repo / "AGENTS.md", rules("rule", 300), exact=True)  # 30,600 bytes, under Codex's 32 KiB
+        self._commit("rules", "2026-01-01T00:00:00+00:00")
+        write(self.repo / "AGENTS.md", "short\n", exact=True)
+        slim = self._commit("slim", "2026-02-01T00:00:00+00:00")
+        args = ("report", str(self.repo), "--days", "40000", "--harness", "claude,codex")
+        cut = {"before": 10_200, "after": 2, "now": 2}
+        # No CLAUDE.md anywhere: Claude Code loaded the old AGENTS.md too, though the old commit is
+        # weighed in a temp folder that here has a CLAUDE.md above it.
+        under = self.tmp_path / "under"
+        write(under / "CLAUDE.md", "not on this repo's path\n")
+        (under / "tmp").mkdir()
+        saved = dict(self.env)
+        self.env.update(TMPDIR=str(under / "tmp"), TEMP=str(under / "tmp"), TMP=str(under / "tmp"))
+        try:
+            c = self.cw_json(*args)["compare"]
+        finally:
+            self.env = saved
+        self.assertEqual((c["commit"], c["files"]), (slim, {"claude": cut, "codex": cut}))
+        # A CLAUDE.md above the repo, or a CLAUDE.local.md git ignores, kept AGENTS.md out for
+        # Claude Code then as it does now, though neither is in the old commit.
+        for spot in (self.repo.parent / "CLAUDE.md", self.repo / "CLAUDE.local.md"):
+            write(spot, "claude rules\n")
+            c = self.cw_json(*args)["compare"]
+            self.assertEqual((c["commit"], c["files"]), (slim, {"codex": cut}), spot)
+            spot.unlink()
+
+    def test_claude_rules_load_from_every_folder_up_the_tree(self):
+        start = self.repo / "packages" / "api"
+        for rel in ("work/.claude/rules/org.md", "work/repo/.claude/rules/root.md",
+                    "work/repo/packages/.claude/rules/mid.md", "work/repo/packages/api/.claude/rules/api.md"):
+            write(self.tmp_path / rel, "a rule\n")
+        write(start / ".claude" / "rules" / "scoped.md", "---\npaths:\n  - src/**\n---\nonly for src\n")
+        write(self.repo / "other" / ".claude" / "rules" / "off.md", "not on the path\n")
+        write(self.home / ".claude" / "rules" / "mine.md", "user rule\n")
+        write(self.home / ".claude" / "rules" / "scoped.md", "---\npaths:\n  - x/**\n---\nonly for x\n")
+        r = self.cw_json("files", str(start), "--harness", "claude")["claude"]
+        self.assertEqual(self._claude_rel(r["files"]), [
+            ("home/.claude/rules/mine.md", "user rule"),
+            ("work/.claude/rules/org.md", "project rule"),
+            ("work/repo/.claude/rules/root.md", "project rule"),
+            ("work/repo/packages/.claude/rules/mid.md", "project rule"),
+            ("work/repo/packages/api/.claude/rules/api.md", "project rule"),
+        ])
+        self.assertTrue(any("2 path-scoped" in n for n in r["notes"]), r["notes"])
+        # In a repo inside the home folder, ~/.claude/rules are the user's rules, counted once.
+        repo2 = self.home / "code" / "r2"
+        (repo2 / ".git").mkdir(parents=True)
+        r = self.cw_json("files", str(repo2), "--harness", "claude")["claude"]
+        self.assertEqual(self._claude_rel(r["files"]), [("home/.claude/rules/mine.md", "user rule")])
+        self.assertTrue(any("1 path-scoped" in n for n in r["notes"]), r["notes"])
+
+    def test_nested_worktree_skips_the_main_checkout_folders(self):
+        # Claude Code's own worktrees live inside the main checkout (.claude/worktrees/<name>) and
+        # hold their own copy of its files, so it skips the main checkout's folders there.
+        self._git_repo()
+        write(self.repo / "CLAUDE.md", "main rules\n")
+        write(self.repo / ".claude" / "rules" / "r.md", "a rule\n")
+        self._commit("start", "2026-01-01T00:00:00+00:00")
+        wt = self.repo / ".claude" / "worktrees" / "feat"
+        self._git("worktree", "add", "-q", "-b", "feat", str(wt))
+        write(self.repo.parent / "CLAUDE.md", "workspace rules\n")  # above the main checkout: still read
+        r = self.cw_json("files", str(wt), "--harness", "claude")["claude"]
+        self.assertEqual(self._claude_rel(r["files"]), [
+            ("work/CLAUDE.md", "project"),
+            ("work/repo/.claude/worktrees/feat/CLAUDE.md", "project"),
+            ("work/repo/.claude/worktrees/feat/.claude/rules/r.md", "project rule"),
+        ])
+
+    def test_auto_memory_follows_the_repository_and_its_switches(self):
+        # One auto memory per git repository, shared by its subfolders and worktrees; it can be
+        # turned off or moved.
+        self._git_repo()
+        write(self.repo / "README.md", "x\n")
+        self._commit("start", "2026-01-01T00:00:00+00:00")
+        wt = self.repo.parent / "repo-wt"
+        self._git("worktree", "add", "-q", "-b", "wt", str(wt))
+        (self.repo / "sub").mkdir()
+        slug = "".join(c if c.isascii() and c.isalnum() else "-" for c in str(self.repo.resolve()))
+        mem = write(self.home / ".claude" / "projects" / slug / "memory" / "MEMORY.md", "remember this\n").resolve()
+        user, project = self.home / ".claude" / "settings.json", self.repo / ".claude" / "settings.json"
+
+        def memory(path, **env):
+            saved = dict(self.env)
+            self.env.update(env)
+            try:
+                r = self.cw_json("files", str(path), "--harness", "claude")["claude"]
+            finally:
+                self.env = saved
+            return [Path(f["path"]).resolve() for f in r["files"] if f["role"] == "user memory"]
+
+        for where in (self.repo, self.repo / "sub", wt):
+            self.assertEqual(memory(where), [mem], where)
+        self.assertEqual(memory(self.repo, CLAUDE_CODE_DISABLE_AUTO_MEMORY="1"), [])
+        write(user, json.dumps({"autoMemoryEnabled": False}))
+        self.assertEqual(memory(self.repo), [])
+        self.assertEqual(memory(self.repo, CLAUDE_CODE_DISABLE_AUTO_MEMORY="0"), [mem])  # set but false: on
+        write(user, json.dumps({"autoMemoryEnabled": True}))
+        write(project, json.dumps({"autoMemoryEnabled": False}))
+        self.assertEqual(memory(self.repo), [])
+        project.unlink()
+        moved = write(self.tmp_path / "elsewhere" / "MEMORY.md", "moved\n").resolve()
+        write(user, json.dumps({"autoMemoryDirectory": str(moved.parent)}))
+        self.assertEqual(memory(self.repo), [moved])
+        notes = write(self.home / "notes" / "MEMORY.md", "notes\n").resolve()
+        write(project, json.dumps({"autoMemoryDirectory": "~/notes"}))  # project settings beat user ones
+        self.assertEqual(memory(self.repo), [notes])
+        project.unlink()
+        user.unlink()
+        # CLAUDE_CODE_PROJECT_DIR_NAME beside CLAUDE_CONFIG_DIR names the project folder.
+        named = write(self.home / ".claude" / "projects" / "shared" / "memory" / "MEMORY.md", "shared\n").resolve()
+        self.assertEqual(memory(self.repo, CLAUDE_CONFIG_DIR=str(self.home / ".claude"),
+                                CLAUDE_CODE_PROJECT_DIR_NAME="shared"), [named])
+        self.assertEqual(memory(self.repo, CLAUDE_CODE_PROJECT_DIR_NAME="shared"), [mem])  # needs both
+
+    def test_worktree_sessions_count_for_the_repository(self):
+        # A session started in a worktree, Claude Code's own (.claude/worktrees/<name>) or a
+        # sibling one, is a session in this repository.
+        self._git_repo()
+        self._slim_history()
+        nested = self.repo / ".claude" / "worktrees" / "feat"
+        sibling = self.repo.parent / "repo-wt"
+        self._git("worktree", "add", "-q", "-b", "feat", str(nested))
+        self._git("worktree", "add", "-q", "-b", "wt", str(sibling))
+        for i, day in enumerate(("10", "12", "14")):
+            self._claude_log(f"b{i}", self.repo, f"2026-01-{day}T12:00:00Z", [80_000])
+        for i, (where, day) in enumerate(((nested, "10"), (sibling, "12"), (nested, "14"))):
+            self._claude_log(f"a{i}", where, f"2026-02-{day}T12:00:00Z", [30_000])
+        for path in (self.repo, nested, sibling):
+            res = self.cw_json("report", str(path), "--days", "40000", "--harness", "claude")
+            self.assertEqual(res["sessions"]["claude"]["sessions"], 6, path)
+            s = res["compare"]["sessions"]["claude"]
+            self.assertEqual((s["before"]["sessions"], s["after"]["sessions"]), (3, 3), path)
+        groups = self.cw_json("sessions", "--harness", "claude", "--since", "2026-01-01")
+        self.assertEqual(sorted(groups), [f"claude {self.repo.resolve()}"])
+
     def test_opencode_fallbacks(self):
         write(self.home / ".claude" / "CLAUDE.md", "claude global")
         write(self.repo / "CLAUDE.md", "claude project")
@@ -253,13 +561,73 @@ class CwTest(unittest.TestCase):
         write(self.home / ".claude" / "skills" / "big" / "SKILL.md",
               "---\nname: big\ndescription: >\n  " + "d" * 5_000 + "\n---\nbody")
         write(self.home / ".claude" / "skills" / ".trash" / "SKILL.md", "---\nname: trash\n---\n")
-        write(self.home / ".agents" / "skills" / "one" / "SKILL.md", "---\nname: one\ndescription: " + "e" * 600 + "\n---\n")
+        write(self.home / ".agents" / "skills" / "one" / "SKILL.md", "---\nname: one\ndescription: " + "e" * 1_000 + "\n---\n")
         res = self.cw_json("skills", str(self.repo), "--harness", "claude,codex", "--window", "10000")
-        self.assertEqual(res["claude"]["count"], 1)
-        self.assertEqual(res["claude"]["desc_chars"], 1_536)      # truncated in the listing
-        self.assertTrue(res["claude"]["over_budget"])             # budget 100 tokens
+        # Claude Code lists hidden folders too, .trash as "- .trash (trash): Skill"; Codex does not
+        self.assertEqual(res["claude"]["count"], 2)
+        self.assertEqual(res["claude"]["desc_chars"], 1_536 + 5)  # truncated in the listing
+        self.assertTrue(res["claude"]["over_budget"])             # budget 300 columns
         self.assertEqual(res["codex"]["count"], 1)
         self.assertTrue(res["codex"]["over_budget"])              # budget 200 tokens
+
+    def test_a_huge_number_in_a_skill_or_config_does_not_crash(self):
+        # Python 3.11+ (and patched 3.8 to 3.10) refuse int() past 4,300 digits with ValueError.
+        digits = "1" * 5_000
+        write(self.home / ".claude" / "skills" / "big" / "SKILL.md", f"---\nname: big\ndescription: {digits}\n---\n")
+        write(self.home / ".agents" / "skills" / "big" / "SKILL.md", f"---\nname: big\ndescription: {digits}\n---\n")
+        write(self.home / ".codex" / "config.toml", f"other = {digits}\n")
+        res = self.cw_json("skills", str(self.repo))
+        self.assertEqual((res["claude"]["count"], res["codex"]["count"]), (1, 1))
+        cw = load_cw()
+        with self.assertRaises(cw._TomlError):  # the reader without tomllib: a value TOML cannot hold
+            cw._Toml(f"other = {digits}\n").parse()
+
+    def test_codex_count_includes_skills_left_out_for_room(self):
+        for name in ("one", "two"):
+            write(self.home / ".agents" / "skills" / name / "SKILL.md",
+                  f"---\nname: {name}\ndescription: The {name} helper.\n---\n")
+        write(self.home / ".codex" / "config.toml", "[skills]\nmax_context_tokens = 1\n")
+        r = self.cw_json("skills", str(self.repo), "--harness", "codex")["codex"]
+        self.assertEqual((r["count"], r["omitted"]), (2, 2))
+        found = self.cw_json("report", str(self.repo), "--harness", "codex")["findings"]
+        self.assertTrue(any(f.startswith("[codex] 2 skills need ") for f in found), found)
+
+    @unittest.skipIf(os.name == "nt", "needs a POSIX named pipe")
+    def test_a_named_pipe_is_never_read(self):
+        # Opening a named pipe to read waits for a writer: one pipe hung `files` and `report`.
+        write(self.home / ".claude" / "commands" / "real.md", "Run it.\n")
+        write(self.repo / "CLAUDE.md", "rules\n")
+        for pipe in (self.home / ".claude" / "commands" / "pipe.md", self.home / ".claude" / "rules" / "pipe.md",
+                     self.repo / ".claude" / "rules" / "pipe.md", self.repo / "AGENTS.md",
+                     self.home / ".claude" / "skills" / "p" / "SKILL.md", self.home / ".codex" / "config.toml",
+                     self.home / ".claude" / "projects" / "-x" / "pipe.jsonl",
+                     self.home / ".codex" / "sessions" / "2099" / "01" / "01" / "rollout-pipe.jsonl"):
+            pipe.parent.mkdir(parents=True, exist_ok=True)
+            os.mkfifo(str(pipe))
+        for args in (("skills", str(self.repo), "--harness", "claude"), ("files", str(self.repo)),
+                     ("report", str(self.repo)), ("sessions",)):
+            p = subprocess.run([sys.executable, str(CW), *args, "--json"], env=self.env, capture_output=True,
+                               text=True, encoding="utf-8", timeout=60)
+            self.assertEqual(p.returncode, 0, (args, p.stderr))
+        res = self.cw_json("skills", str(self.repo), "--harness", "claude")
+        self.assertEqual(res["claude"]["count"], 1)
+
+    def test_skill_findings_name_the_setting_that_fixes_them(self):
+        write(self.home / ".claude" / "skills" / "big" / "SKILL.md",
+              "---\nname: big\ndescription: " + "d" * 1_000 + "\n---\n")
+        write(self.home / ".agents" / "skills" / "one" / "SKILL.md", "---\nname: one\ndescription: " + "e" * 1_000 + "\n---\n")
+        found = self.cw_json("report", str(self.repo), "--harness", "claude,codex", "--window", "10000")["findings"]
+        claude = [f for f in found if f.startswith("[claude]") and "listing" in f]
+        codex = [f for f in found if f.startswith("[codex]") and "listing" in f]
+        self.assertEqual((len(claude), len(codex)), (1, 1), found)
+        for want in ("big", "over by", 'skillOverrides {"big": "off"}', "disable-model-invocation: true",
+                     "skillListingBudgetFraction"):
+            self.assertIn(want, claude[0])
+        for want in ("one", "over by", 'a [[skills.config]] entry with name = "one" and enabled = false',
+                     "allow_implicit_invocation: false", "max_context_tokens"):
+            self.assertIn(want, codex[0])
+        out = self.run_cw("skills", str(self.repo), "--harness", "claude,codex", "--window", "10000")
+        self.assertIn("fix: ", out)  # the plain output says it too
 
     def test_project_and_plugin_skills_are_listed(self):
         write(self.repo / ".claude" / "skills" / "local" / "SKILL.md", "---\nname: local\ndescription: hi\n---\n")
@@ -271,6 +639,445 @@ class CwTest(unittest.TestCase):
             write(self.home / ".claude" / "settings.json", json.dumps({"enabledPlugins": {"tool@market": enabled}}))
             s = self.cw_json("skills", str(self.repo), "--harness", "claude")["claude"]
             self.assertEqual(sorted(h["name"] for h in s["heaviest"]), names, enabled)
+
+    def claude_listing(self, cwd=None, policy=None):
+        """Claude Code's listing, from cw.py in this process with this test's HOME and an empty
+        managed folder, or `policy`."""
+        cw = load_cw()
+        managed = Path(policy or self.tmp_path / "no-policy")
+        with mock.patch.dict(os.environ, self.env, clear=True), mock.patch.object(cw, "_policy_dir", lambda: managed):
+            return cw.claude_listing(str(cwd or self.repo))
+
+    def claude_lines(self, cwd=None, policy=None):
+        """The lines Claude Code would list, sorted."""
+        return sorted(e["line"] for e in self.claude_listing(cwd, policy)["entries"])
+
+    def plugin(self, name, version="1.0"):
+        """A plugin folder in Claude Code's cache, recorded as installed (enable it in settings)."""
+        root = self.home / ".claude" / "plugins" / "cache" / "market" / name / version
+        index = self.home / ".claude" / "plugins" / "installed_plugins.json"
+        known = json.loads(index.read_text()) if index.exists() else {"plugins": {}}
+        known["plugins"][f"{name}@market"] = [{"version": version}]
+        write(index, json.dumps(known))
+        return root
+
+    def test_claude_listing_lines_follow_claude_code(self):
+        sk = self.home / ".claude" / "skills"
+        write(sk / "alpha" / "SKILL.md", "---\nname: alpha\ndescription: Does <b>x</b>\nwhen_to_use: Use it\n---\nbody")
+        write(sk / "dir-name" / "SKILL.md", "---\nname: real-name\ndescription: hi\n---\n")
+        write(sk / "spaced" / "SKILL.md", "---\nname: Spaced Name\ndescription: hi\n---\n")
+        write(sk / "titled" / "SKILL.md", "---\nname: titled\n---\n\n# Big Title\ntext\n")
+        write(sk / "wordy" / "SKILL.md", "---\nname: wordy\n---\n" + "v" * 150 + "\n")
+        write(sk / "empty" / "SKILL.md", "---\nname: empty\n---\n")
+        write(sk / "long" / "SKILL.md", '---\ndescription: "' + "w" * 2_000 + '"\n---\n')
+        write(sk / "block" / "SKILL.md", "---\ndescription: |\n  one\n  two\n---\n")
+        write(sk / "quoted" / "SKILL.md", "---\ndescription: 'it''s fine' # a comment\n---\n")
+        write(sk / "plain" / "SKILL.md", "---\ndescription: plain text # not part\n---\n")
+        write(sk / "escaped" / "SKILL.md", '---\ndescription: "tab\\there, \\e[31mred\\e[0m"\n---\n')
+        write(sk / "thai" / "SKILL.md", "---\ndescription: \"ภาษา\\u200bไทย\"\n---\n")
+        write(sk / "dashes" / "SKILL.md", "---\ndescription: cut---here\nname: never read\n---\n")
+        write(sk / "synced" / "x" / "SKILL.md", "---\ndescription: a folder Claude Code keeps for synced skills\n---\n")
+        self.assertEqual(self.claude_lines(), sorted([
+            "- alpha: Does &lt;b&gt;x&lt;/b&gt; - Use it",        # when_to_use joins with " - "; < and > escaped
+            "- dir-name (real-name): hi",                       # listed by folder, the name in brackets
+            "- spaced: hi",                                     # a name with a space is not shown
+            "- titled: Big Title",                              # no description: the first line, # dropped
+            "- wordy: " + "v" * 97 + "...",                     # ... cut at 100 characters
+            "- empty: Skill",                                   # or nothing at all
+            "- long: " + "w" * 1_535 + "…",                # descriptions stop at 1,536 characters
+            "- block: one two",                                 # line breaks become spaces
+            "- quoted: it's fine",
+            "- plain: plain text",
+            "- escaped: tab here, red",                         # tabs become spaces, terminal codes go
+            "- thai: ภาษา ไทย",                                 # so does a zero-width space
+            "- dashes: cut",                                    # frontmatter ends at the first ---
+        ]))
+
+    def test_claude_listing_leaves_out_what_claude_code_hides(self):
+        sk = self.home / ".claude" / "skills"
+        for name, extra in (("manual", "disable-model-invocation: true"), ("manual2", 'disable-model-invocation: "yes"'),
+                            ("auto", "disable-model-invocation: false"), ("off", ""), ("menu", ""), ("terse", ""),
+                            ("scoped", "paths: src/**"), ("anywhere", 'paths: "**"'), ("on", "")):
+            write(sk / name / "SKILL.md", f"---\ndescription: hi\n{extra}\n---\n")
+        tool = self.plugin("tool")
+        write(tool / "skills" / "helper" / "SKILL.md", "---\ndescription: hi\n---\n")
+        write(tool / "skills" / "bare" / "SKILL.md", "---\nname: bare\n---\nbody line\n")
+        write(tool / "skills" / "when" / "SKILL.md", "---\nwhen_to_use: on Mondays\n---\nbody line\n")
+        write(self.home / ".claude" / "settings.json", json.dumps({
+            "enabledPlugins": {"tool@market": True},
+            "skillOverrides": {"off": "off", "menu": "user-invocable-only", "terse": "name-only", "on": "on",
+                               "tool:helper": "off"}}))
+        self.assertEqual(self.claude_lines(), sorted([
+            "- anywhere: hi", "- auto: hi", "- on: hi", "- terse",
+            "- tool:helper: hi",                # plugin skills ignore skillOverrides
+            "- tool:when: body line - on Mondays"]))  # a plugin skill needs a description or when_to_use
+        s = self.cw_json("skills", str(self.repo), "--harness", "claude")["claude"]
+        self.assertEqual(s["hidden"], {"disable-model-invocation": 2, "skillOverrides": 2, "paths": 1,
+                                       "no description": 1})
+
+    def test_claude_listing_reads_every_place_claude_code_does(self):
+        sub = self.repo / "pkg" / "app"
+        sub.mkdir(parents=True)
+        write(self.repo / ".claude" / "skills" / "root-skill" / "SKILL.md", "---\ndescription: r\n---\n")
+        write(self.repo / "pkg" / ".claude" / "skills" / "pkg-skill" / "SKILL.md", "---\ndescription: p\n---\n")
+        write(self.repo.parent / ".claude" / "skills" / "above" / "SKILL.md", "---\ndescription: a\n---\n")
+        cmds = self.home / ".claude" / "commands"
+        write(cmds / "review.md", "---\ndescription: Review it\n---\nbody\n")
+        write(cmds / "git" / "commit.md", "Commit the staged work\n")
+        write(cmds / "blank.md", "")
+        write(self.repo / ".claude" / "commands" / "deploy" / "SKILL.md", "---\ndescription: d\n---\n")
+        tool = self.plugin("tool")
+        write(tool / "commands" / "go.md", "---\ndescription: Go\n---\n")
+        write(tool / "commands" / "quiet.md", "no frontmatter\n")
+        solo = self.plugin("solo", "2.0")
+        write(solo / "SKILL.md", "---\nname: solo\ndescription: s\n---\n")
+        extra = self.plugin("extra")
+        write(extra / ".claude-plugin" / "plugin.json", json.dumps({"name": "extra", "skills": ["./more"]}))
+        write(extra / "more" / "deep" / "SKILL.md", "---\ndescription: e\n---\n")
+        write(self.home / ".claude" / "settings.json", json.dumps(
+            {"enabledPlugins": {"tool@market": True, "solo@market": True, "extra@market": True}}))
+        expected = ["- root-skill: r", "- pkg-skill: p", "- review: Review it", "- git:commit: Commit the staged work",
+                    "- blank: Custom command", "- deploy: d", "- tool:go: Go", "- solo:solo: s"]
+        self.assertEqual(self.claude_lines(sub), sorted(expected + ["- extra:deep: e"]))
+        # enabledPlugins merge per plugin: the project's false beats the user's true
+        write(self.repo / ".claude" / "settings.json", json.dumps({"enabledPlugins": {"extra@market": False}}))
+        self.assertEqual(self.claude_lines(sub), sorted(expected))
+
+    def test_claude_listing_keeps_plugin_order_and_one_skill_per_name(self):
+        zeta, alpha = self.plugin("zeta"), self.plugin("alpha")
+        write(zeta / "commands" / "go.md", "---\ndescription: the command\n---\n")
+        write(zeta / "skills" / "go" / "SKILL.md", "---\ndescription: the skill\n---\n")
+        write(zeta / "skills" / "two" / "SKILL.md", "---\ndescription: z\n---\n")
+        write(alpha / "skills" / "one" / "SKILL.md", "---\ndescription: a\n---\n")
+        write(self.home / ".claude" / "settings.json",
+              json.dumps({"enabledPlugins": {"zeta@market": True, "alpha@market": True}}))
+        got = self.claude_listing()
+        # Plugins in the order settings name them, every plugin's commands before the skills;
+        # a second entry with a name already listed is not listed
+        self.assertEqual([e["line"] for e in got["entries"]], ["- zeta:go: the command", "- zeta:two: z", "- alpha:one: a"])
+        self.assertEqual(got["hidden"], {"same name": 1})
+
+    def test_claude_listing_reads_the_managed_folder(self):
+        policy = self.tmp_path / "policy"
+        write(policy / ".claude" / "skills" / "corp" / "SKILL.md", "---\ndescription: c\n---\n")
+        write(policy / ".claude" / "commands" / "audit.md", "---\ndescription: a\n---\n")
+        self.assertEqual(self.claude_lines(policy=policy), ["- audit: a", "- corp: c"])
+        self.env["CLAUDE_CODE_DISABLE_POLICY_SKILLS"] = "0"  # read as a yes or no, like Claude Code
+        self.assertEqual(self.claude_lines(policy=policy), ["- audit: a", "- corp: c"])
+        self.env["CLAUDE_CODE_DISABLE_POLICY_SKILLS"] = "1"  # managed skills off; managed commands stay
+        self.assertEqual(self.claude_lines(policy=policy), ["- audit: a"])
+
+    def test_claude_listing_in_a_worktree_reads_the_main_checkout(self):
+        write(self.repo / ".claude" / "skills" / "kept" / "SKILL.md", "---\ndescription: k\n---\n")
+        gitdir = self.repo / ".git" / "worktrees" / "wt"
+        write(gitdir / "commondir", "../..\n")
+        wt = self.tmp_path / "work" / "wt"
+        write(wt / ".git", f"gitdir: {gitdir}\n")
+        self.assertEqual(self.claude_lines(wt), ["- kept: k"])
+        write(wt / ".claude" / "skills" / "own" / "SKILL.md", "---\ndescription: o\n---\n")
+        self.assertEqual(self.claude_lines(wt), ["- own: o"])  # it has its own skills folder
+
+    def test_claude_listing_counts_the_account_synced_skills(self):
+        base = self.home / ".claude" / "skills" / "synced"
+        write(base / "org-1_acct-1" / "pdf" / "SKILL.md", "---\ndescription: p\n---\n")
+        write(base / "org-1_unbound" / "docx" / "SKILL.md", "---\ndescription: d\n---\n")
+        write(base / "org-2_acct-9" / "xlsx" / "SKILL.md", "---\ndescription: x\n---\n")
+        self.assertEqual(self.claude_lines(), [])  # no account: none of them
+        write(self.home / ".claude.json", json.dumps({"oauthAccount": {"organizationUuid": "ORG-1", "accountUuid": "ACCT-1"}}))
+        self.assertEqual(self.claude_lines(), ["- anthropic-skills:pdf: p"])
+        write(self.home / ".claude.json", json.dumps({"oauthAccount": {"organizationUuid": "org-1"}}))
+        self.assertEqual(self.claude_lines(), ["- anthropic-skills:docx: d"])
+
+    def test_claude_budget_follows_the_model(self):
+        write(self.home / ".claude" / "skills" / "one" / "SKILL.md", "---\ndescription: hi\n---\n")
+
+        def budget(*args):
+            s = self.cw_json("skills", str(self.repo), "--harness", "claude", *args)["claude"]
+            return s["budget"], s["window"], s["chars_per_token"], s["model"], s["window_source"]
+
+        # Nothing says which model: today's default, a 1M window at 3 characters per token.
+        self.assertEqual(budget(), (30_000, 1_000_000, 3, None, "assumed"))
+        settings = self.home / ".claude" / "settings.json"
+        write(settings, json.dumps({"model": "claude-haiku-4-5-20251001"}))
+        self.assertEqual(budget(), (8_000, 200_000, 4, "claude-haiku-4-5-20251001", "model"))
+        write(settings, json.dumps({"model": "claude-sonnet-4-6[1m]"}))
+        self.assertEqual(budget(), (40_000, 1_000_000, 4, "claude-sonnet-4-6[1m]", "model"))
+        self.env["ANTHROPIC_MODEL"] = "claude-new-9"   # beats settings; unknown: 200k at 3
+        self.assertEqual(budget(), (6_000, 200_000, 3, "claude-new-9", "model"))
+        del self.env["ANTHROPIC_MODEL"]
+        write(settings, json.dumps({"model": "opus"}))  # an alias names no model
+        self.assertEqual(budget(), (30_000, 1_000_000, 3, None, "assumed"))
+        write(self.home / ".claude" / "projects" / "-elsewhere" / "a.jsonl", json.dumps(
+            {"type": "assistant", "cwd": str(self.tmp_path), "requestedModel": "claude-opus-4-1",
+             "message": {"id": "a", "model": "claude-opus-4-1"}}) + "\n")
+        self.assertEqual(budget()[:4], (8_000, 200_000, 4, "claude-opus-4-1"))  # another project's last session
+        log = self.home / ".claude" / "projects" / "-repo" / "b.jsonl"
+        write(log, json.dumps({"type": "assistant", "cwd": str(self.repo), "requestedModel": "claude-opus-5-5",
+                               "message": {"id": "b", "model": "claude-opus-5-5"}}) + "\n")
+        os.utime(log, (1, 1))  # older, but from this project
+        self.assertEqual(budget(), (30_000, 1_000_000, 3, "claude-opus-5-5", "model"))
+        self.assertEqual(budget("--window", "400000")[:2], (12_000, 400_000))
+        write(settings, json.dumps({"env": {"CLAUDE_CODE_DISABLE_1M_CONTEXT": "1"}}))
+        self.assertEqual(budget()[:2], (6_000, 200_000))
+        write(settings, json.dumps({"env": {"DISABLE_COMPACT": "1", "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "50000"}}))
+        self.assertEqual(budget()[:2], (1_500, 50_000))
+        write(settings, json.dumps({"env": {"SLASH_COMMAND_TOOL_CHAR_BUDGET": "12k"}}))  # read as Claude Code does: 12
+        self.assertEqual(budget()[0], 12)
+
+    def test_claude_listing_over_budget_says_how_many_lose_descriptions(self):
+        sk = self.home / ".claude" / "skills"
+        for name, size in (("aa", 100), ("bb", 200), ("cc", 300)):
+            write(sk / name / "SKILL.md", f"---\ndescription: {'d' * size}\n---\n")
+        # Lines of 106, 206 and 306 columns and two line breaks: 620. A line that loses its
+        # description is "- aa", 4 columns.
+        for budget, losing in (("1000", []), ("400", ["cc"]), ("300", ["bb", "cc"]), ("10", ["aa", "bb", "cc"])):
+            self.env["SLASH_COMMAND_TOOL_CHAR_BUDGET"] = budget
+            s = self.cw_json("skills", str(self.repo), "--harness", "claude")["claude"]
+            self.assertEqual((s["used"], s["over_budget"], s["lose_descriptions"], s["losing_descriptions"]),
+                             (620, bool(losing), len(losing), losing), budget)
+        # Descriptions go back to the most used first, by Claude Code's record: cc ran today
+        now = dt.datetime.now(dt.timezone.utc).timestamp() * 1000
+        write(self.home / ".claude.json", json.dumps({"skillUsage": {"cc": {"usageCount": 3, "lastUsedAt": now}}}))
+        self.env["SLASH_COMMAND_TOOL_CHAR_BUDGET"] = "400"
+        s = self.cw_json("skills", str(self.repo), "--harness", "claude")["claude"]
+        self.assertEqual(s["losing_descriptions"], ["aa", "bb"])
+
+    def test_listing_width_counts_columns_as_claude_code(self):
+        cw = load_cw()
+        for text, cols in (("abc", 3), ("กิน", 2), ("漢字", 4), ("👍🏽", 2), ("🇹🇭", 2), ("é", 1),
+                           ("❤️", 2), ("1️⃣", 2), ("👨‍👩‍👧", 2), ("​", 0), ("a\tb", 2)):
+            self.assertEqual(cw.str_width(text), cols, ascii(text))
+
+    def test_frontmatter_yaml_reads_as_bun_does(self):
+        # Each expected value is what Bun.YAML.parse (Bun 1.4.4, inside Claude Code 2.1.322)
+        # returned for the same text; None stands for an error.
+        cw = load_cw()
+        for text, want in (
+                ("a: 1\na: 2", {"a": 2}),                      # a repeated key keeps the last value
+                ("a: {b: 1, b: 2}", {"a": {"b": 2}}),
+                ("a: |+\n  one\n\n\n", {"a": "one\n\n\n"}),    # the last break ends a line, not adds one
+                ("a: 'one\n  two'", {"a": "one two"}),
+                ("a: 'one\ntwo'", None),                       # a quoted value's next line must be indented
+                ("a: [b\n  c]", {"a": ["b c"]}),
+                ("a: [b,\nc]", None),                          # so must a flow list's
+                ("a: [\n  b\n]", {"a": ["b"]}),                # except its closing bracket
+                ("a: [b, &x c, *x]", {"a": ["b", "c", "c"]}),
+                ("a: ,b", {"a": ",b"}),
+                ("a: !!str", {"a": ""}),
+                ("a: b: c", None),
+                ("...\na: b", [None, {"a": "b"}]),             # ... ends a document
+                ("...\n...\na: b", [None, {"a": "b"}]),
+                ('a: "x\\uD83D\\uDE00y"', {"a": "x\U0001F600y"}),
+                ('a: "x\\uD83Dy"', None),                      # half of a surrogate pair
+        ):
+            try:
+                got = cw._cc_yaml(text)
+            except cw._YamlError:
+                got = None
+            self.assertEqual(got, want, ascii(text))
+
+    # ------------------------------------------------------------------ Codex skill listing
+    def test_codex_frontmatter_reads_as_serde_yaml_does(self):
+        # Codex 0.166.0 reads SKILL.md frontmatter with serde_yaml 0.9.34 into
+        # {name, description, metadata: {short-description}}; None stands for a file it refuses.
+        cw = load_cw()
+        fm = "---\nname: a\ndescription: {}\n---\n"
+        for text, want in (
+                (fm.format("b"), ("a", "b")),
+                ("---\nname: 123\ndescription: true\n---\n", ("123", "true")),  # text, not numbers
+                ("---\nname: ~\ndescription: hi\n---\n", ("dir", "hi")),        # no name: the folder's
+                ("---\nname: '~'\ndescription: hi\n---\n", ("~", "hi")),
+                ("---\nname: a\nname: b\ndescription: hi\n---\n", None),         # a field given twice
+                ("---\nx: 1\nx: 2\nname: a\ndescription: hi\n---\n", ("a", "hi")),  # others may repeat
+                ("---\nname: a\ndescription: hi\nmetadata:\n---\n", ("a", "hi")),
+                ("---\nname: a\ndescription: hi\nmetadata: ~\n---\n", None),     # metadata must be a mapping
+                ("---\nname: a\ndescription: hi\nmetadata: [x]\n---\n", None),
+                ("---\nname: a\ndescription: hi\nmetadata:\n  short-description: [x]\n---\n", None),
+                ("---\nname: [a]\ndescription: hi\n---\n", None),
+                (fm.format("Build for AWS: ECS # note"), ("a", "Build for AWS: ECS")),  # repaired
+                (fm.format("@here"), ("a", "@here")),
+                (fm.format('"x"y'), None),
+                ("---\nname: a\ndescription: |\n  one: two\n  three\n---\n", ("a", "one: two three")),
+                (fm.format('"one\\u001ftwo\\u3000three"'), ("a", "one\x1ftwo three")),  # Rust's whitespace
+                ("---\nname: a\n---\n", None),                                   # a description is required
+                (fm.format("'  '"), None),
+                ("---\n# only a comment\n---\n", None),
+                ("---\n---\n", None),
+                ("---\nname: a\ndescription: hi\n", None),                       # never closed
+                ("﻿" + fm.format("hi"), None),                              # a BOM hides the frontmatter
+                ("  ---  \r\nname: a\r\ndescription: hi\r\n---\r\n", ("a", "hi")),
+                ("---\nname: " + "n" * 65 + "\ndescription: hi\n---\n", None),   # a name over 64 characters
+                ("---\nname: a\ndescription: x\n...\nname: b\n---\n", None),     # two documents
+                ("---\n- a\n- b\n---\n", None),
+        ):
+            self.assertEqual(cw._codex_frontmatter(text, "dir"), want, ascii(text))
+
+    def codex_listing(self, cwd=None, admin=None):
+        """Codex's listing, from cw.py in this process with this test's HOME and an empty
+        /etc/codex, or `admin`."""
+        cw = load_cw()
+        managed = Path(admin or self.tmp_path / "no-admin")
+        with mock.patch.dict(os.environ, self.env, clear=True), mock.patch.object(cw, "_codex_admin_dir", lambda: managed):
+            return cw.codex_listing(str(cwd or self.repo))
+
+    def codex_shown(self, text: str) -> str:
+        h = os.path.realpath(str(self.home)).replace(os.sep, "/")
+        r = os.path.realpath(str(self.repo)).replace(os.sep, "/")
+        return text.replace(r, "<repo>").replace(h, "~")
+
+    def codex_raw(self, cwd=None, admin=None):
+        """(the roots table, the lines) as Codex would write them, with this test's home as ~ and
+        the repo as <repo>."""
+        r = self.codex_listing(cwd, admin)
+        return [self.codex_shown(x) for x in r["roots"]], [self.codex_shown(e["line"]) for e in r["entries"]]
+
+    def codex_lines(self, cwd=None, admin=None):
+        """The lines Codex would list, in its order, each root alias written out in full."""
+        roots, lines = self.codex_raw(cwd, admin)
+        for root in roots:
+            alias, path = re.match(r"- `(r[0-9]+)` = `(.*)`\Z", root).groups()
+            lines = [x.replace(f"(file: {alias}/", f"(file: {path}/") for x in lines]
+        return lines
+
+    def symlink(self, link: Path, target: Path) -> bool:
+        """A folder symlink, or False where this system cannot make one (Windows without rights)."""
+        link.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.symlink(str(target), str(link), target_is_directory=True)
+            return True
+        except (OSError, NotImplementedError):
+            return False
+
+    def test_codex_listing_lines_follow_codex(self):
+        sk = self.home / ".agents" / "skills"
+        write(sk / "alpha" / "SKILL.md", "---\nname: alpha\ndescription: |\n  Does   x\n    and y\n---\nbody")
+        write(sk / "dir-name" / "SKILL.md", "---\ndescription: hi\n---\n")
+        write(sk / "colon" / "SKILL.md", "---\nname: colon\ndescription: Build for AWS: ECS # note\n---\n")
+        write(sk / "long" / "SKILL.md", "---\nname: long\ndescription: " + "w" * 2_000 + "\n---\n")
+        write(sk / "typed" / "SKILL.md", "---\nname: 123\ndescription: true\n---\n")
+        write(sk / "a" / "b" / "c" / "d" / "e" / "deep" / "SKILL.md", "---\nname: deep\ndescription: six folders down\n---\n")
+        write(sk / "a" / "b" / "c" / "d" / "e" / "f" / "deeper" / "SKILL.md", "---\nname: deeper\ndescription: seven\n---\n")
+        write(sk / ".hidden" / "x" / "SKILL.md", "---\nname: hidden\ndescription: no\n---\n")
+        write(sk / "lower" / "skill.md", "---\nname: lower\ndescription: no\n---\n")
+        write(sk / "nodesc" / "SKILL.md", "---\nname: nodesc\n---\n")
+        write(sk / "open" / "SKILL.md", "---\nname: open\ndescription: never closed\n")
+        write(sk / "bom" / "SKILL.md", "﻿---\nname: bom\ndescription: hi\n---\n")
+        write(sk / "twice" / "SKILL.md", "---\nname: twice\nname: again\ndescription: hi\n---\n")
+        # Paths are written from a root alias: Codex's roots table costs less than the full paths
+        self.assertEqual(self.codex_raw(), (["- `r0` = `~/.agents/skills`"], [
+            "- 123: true (file: r0/typed/SKILL.md)",
+            "- alpha: Does x and y (file: r0/alpha/SKILL.md)",
+            "- colon: Build for AWS: ECS (file: r0/colon/SKILL.md)",
+            "- deep: six folders down (file: r0/a/b/c/d/e/deep/SKILL.md)",
+            "- dir-name: hi (file: r0/dir-name/SKILL.md)",
+            "- long: " + "w" * 1_021 + "... (file: r0/long/SKILL.md)",
+        ]))
+        self.assertEqual(self.codex_listing()["hidden"], {"unreadable": 4})
+
+    def test_codex_roots_scopes_and_order(self):
+        codex = self.home / ".codex"
+        skill = "---\nname: {}\ndescription: hi\n---\n"
+        write(codex / "skills" / ".system" / "sys" / "SKILL.md", skill.format("zsys"))
+        admin = self.tmp_path / "admin"
+        write(admin / "skills" / "adm" / "SKILL.md", skill.format("yadm"))
+        write(self.repo / ".agents" / "skills" / "r1" / "SKILL.md", skill.format("xrepo"))
+        write(self.repo / "sub" / ".codex" / "skills" / "r2" / "SKILL.md", skill.format("wrepo"))
+        write(self.home / ".agents" / "skills" / "u1" / "SKILL.md", skill.format("a-user"))
+        write(codex / "skills" / "u2" / "SKILL.md", skill.format("b-user"))
+        sub = self.repo / "sub"
+        names = lambda **kw: [ln.split(":")[0][2:] for ln in self.codex_lines(**kw)]
+        # System, Admin, Repo, then User; by name within each
+        self.assertEqual(names(cwd=sub, admin=admin), ["zsys", "yadm", "wrepo", "xrepo", "a-user", "b-user"])
+        self.assertEqual(names(cwd=self.repo), ["zsys", "xrepo", "a-user", "b-user"])  # .codex/skills below cwd
+        write(codex / "config.toml", "project_root_markers = []\n\n[skills.bundled]\nenabled = false\n")
+        self.assertEqual(names(cwd=sub), ["wrepo", "a-user", "b-user"])  # the project root is now cwd
+        # One skill under two roots is listed once, from the root Codex reads first: the user's
+        # folders come before the repo's .agents/skills
+        if self.symlink(self.home / ".agents" / "skills" / "link", self.repo / ".agents" / "skills" / "r1"):
+            lines = self.codex_lines()
+            self.assertEqual([ln for ln in lines if "xrepo" in ln], ["- xrepo: hi (file: ~/.agents/skills/link/SKILL.md)"])
+
+    def test_codex_config_rules_and_openai_yaml(self):
+        sk = self.home / ".agents" / "skills"
+        for name in ("gone", "back", "quiet", "chat", "both", "broken", "plain"):
+            write(sk / name / "SKILL.md", f"---\nname: {name}\ndescription: hi\n---\n")
+        write(sk / "quiet" / "agents" / "openai.yaml", "policy:\n  allow_implicit_invocation: false\n")
+        write(sk / "chat" / "agents" / "openai.yaml", "policy:\n  products: [chatgpt]\n")
+        write(sk / "both" / "agents" / "openai.yaml", "policy:\n  products: [chatgpt, CODEX]\n")
+        write(sk / "broken" / "agents" / "openai.yaml", "policy: [\n")  # unreadable: the defaults apply
+        back = json.dumps(str(sk / "back" / "SKILL.md"))
+        write(self.home / ".codex" / "config.toml",
+              '[[skills.config]]\nname = "gone"\nenabled = false\n\n'
+              f"[[skills.config]]\npath = {back}\nenabled = false\n\n"
+              f"[[skills.config]]\npath = {back}\nenabled = true\n")  # the last rule for a path wins
+        r = self.codex_listing()
+        self.assertEqual([e["name"] for e in r["entries"]], ["back", "both", "broken", "plain"])
+        self.assertEqual(r["hidden"], {"skills.config": 1, "allow_implicit_invocation": 1, "products": 1})
+        write(self.home / ".codex" / "config.toml", "[skills]\ninclude_instructions = false\n")
+        r = self.codex_listing()
+        self.assertEqual((r["entries"], r["hidden"]), ([], {"allow_implicit_invocation": 1, "products": 1,
+                                                  "skills.include_instructions": 5}))
+
+    def test_codex_plugins_and_namespaces(self):
+        cache = self.home / ".codex" / "plugins" / "cache" / "market"
+        skill = "---\nname: {}\ndescription: hi\n---\n"
+        for version in ("1.0", "2.0", "local"):  # "local" wins over any version
+            write(cache / "tool" / version / ".codex-plugin" / "plugin.json", json.dumps({"name": "tool"}))
+            write(cache / "tool" / version / "skills" / version / "SKILL.md", skill.format("a" + version))
+        write(cache / "off" / "1.0" / ".codex-plugin" / "plugin.json", json.dumps({"name": "off"}))
+        write(cache / "off" / "1.0" / "skills" / "o" / "SKILL.md", skill.format("o"))
+        for version in ("1.2.0", "1.10.0"):  # the highest version, compared as versions
+            root = cache / "more" / version
+            write(root / ".claude-plugin" / "plugin.json", json.dumps({"name": "more", "skills": "./extra"}))
+            write(root / "extra" / "b" / "SKILL.md", skill.format("b"))
+            write(root / "skills" / "c" / "SKILL.md", skill.format("c"))  # not read: the manifest names ./extra
+        write(self.home / ".codex" / "config.toml",
+              '[plugins."tool@market"]\nenabled = true\n\n[plugins."off@market"]\nenabled = false\n\n'
+              '[plugins."more@market"]\nenabled = true\n')
+        write(self.repo / ".claude-plugin" / "plugin.json", json.dumps({"name": "mine"}))  # the repo is a plugin
+        write(self.repo / ".agents" / "skills" / "x" / "SKILL.md", skill.format("x"))
+        want = ["- mine:x: hi (file: <repo>/.agents/skills/x/SKILL.md)",
+                "- more:b: hi (file: ~/.codex/plugins/cache/market/more/1.10.0/extra/b/SKILL.md)",
+                "- tool:alocal: hi (file: ~/.codex/plugins/cache/market/tool/local/skills/local/SKILL.md)"]
+        self.assertEqual(self.codex_lines(), want)
+        # Plugin versions with one listed skill share their marketplace folder's alias
+        self.assertEqual(self.codex_raw()[0], ["- `r0` = `~/.codex/plugins/cache/market`",
+                                               "- `r1` = `<repo>/.agents/skills`"])
+        # A skill folder linked from a plugin's checkout takes that plugin's name
+        dev = self.tmp_path / "dev" / "plug"
+        write(dev / ".codex-plugin" / "plugin.json", json.dumps({"name": "dev"}))
+        write(dev / "skills" / "linked" / "SKILL.md", skill.format("linked"))
+        if self.symlink(self.home / ".agents" / "skills" / "linked", dev / "skills" / "linked"):
+            self.assertEqual(self.codex_lines(),
+                             [want[0], "- dev:linked: hi (file: ~/.agents/skills/linked/SKILL.md)", *want[1:]])
+
+    def test_codex_budget_cuts_descriptions_then_omits(self):
+        sk = self.home / ".agents" / "skills"
+        write(sk / "a" / "SKILL.md", "---\nname: a\ndescription: " + "x" * 400 + "\n---\n")
+        write(sk / "b" / "SKILL.md", "---\nname: b\ndescription: " + "y" * 40 + "\n---\n")
+        config = self.home / ".codex" / "config.toml"
+        cost = lambda line: -(-(len(line.encode()) + 1) // 4)  # Codex: a line and its break, 4 bytes a token
+        full = self.codex_listing()
+        self.assertEqual((full["budget"], full["budget_unit"], full["window_source"], full["aliases"]),
+                         (5_440, "tokens", "assumed", 1))
+        self.assertEqual(full["used"], sum(cost(e["line"]) for e in full["entries"]))
+        minimum = sum(cost(e["line"].split(": ", 1)[0] + ": " + e["line"][e["line"].index("(file: "):])
+                      for e in full["entries"])
+        write(config, f"[skills]\nmax_context_tokens = {minimum + 30}\n")
+        cut = self.codex_listing()
+        lines = {e["name"]: e["line"] for e in cut["entries"]}
+        self.assertIn("- b: " + "y" * 40 + " (file: ", lines["b"])           # the short one keeps all of it
+        self.assertNotIn("x" * 400, lines["a"])                              # the long one is cut
+        self.assertIn("- a: xxxx", lines["a"])
+        self.assertLessEqual(cut["loaded"], cut["budget"])  # what Codex sends fits
+        self.assertGreater(cut["used"], cut["budget"])  # what the skills ask for does not
+        self.assertEqual((cut["budget"], cut["over_budget"], cut["losing_descriptions"], cut["omitted"]),
+                         (minimum + 30, True, ["a"], 0))
+        write(config, "[skills]\nmax_context_tokens = 1\n")
+        none = self.codex_listing()
+        self.assertEqual((none["entries"], none["omitted"]), ([], 2))
+        write(config, "[skills]\nmax_context_tokens = 20000\n")
+        self.assertEqual(self.codex_listing()["budget"], 10_000)              # Codex caps it at 10,000
 
     # ------------------------------------------------------------------ sessions
     def _claude_log(self, name, cwd, ts, ctxs, dup_first=0, creation=0):
@@ -712,7 +1519,8 @@ class CwTest(unittest.TestCase):
         c = self.cw_json(*args, "--compare-at", "2150-01-01")["compare"]  # git reads no date that late
         self.assertEqual(c["files"]["claude"]["before"], 40_000)
         c = self.cw_json(*args, "--compare-at", "2026-08-19 22:00Z")["compare"]
-        self.assertEqual(c["files"]["claude"]["before"], 0)          # no CLAUDE.md yet
+        # No CLAUDE.md yet, so Claude Code read AGENTS.md, unless a CLAUDE.md sits above.
+        self.assertEqual(c["files"]["claude"]["before"], 0 if self._claude_md_above() else 2)
         self.assertEqual(c["files"]["claude"]["after"], 40_000)      # no cut since: today
         self.assertIn("did not shrink", self.run_cw(*args, "--compare-at", "2026-08-19 22:00Z"))
         c = self.cw_json(*args, "--compare-at", slim)["compare"]
@@ -1004,6 +1812,41 @@ class CwTest(unittest.TestCase):
         self.assertIn(f"Picture: {out}", text_out)
         self.assertIn("prefers-color-scheme: dark", out.read_text(encoding="utf-8"))  # auto follows the viewer
 
+    def test_report_leads_with_a_verdict_and_at_most_three_actions(self):
+        write(self.repo / "CLAUDE.md", "a" * 60_000)
+        write(self.repo / "AGENTS.md", "b" * 40_000)  # Codex cuts it
+        write(self.home / ".claude" / "skills" / "big" / "SKILL.md", "---\nname: big\ndescription: " + "d" * 1_000 + "\n---\n")
+        write(self.repo / "GEMINI.md", "c" * 30_000)
+        self._claude_log("s", self.repo, "2099-01-01T00:00:00Z", [90_000, 95_000])
+        out = self.tmp_path / "pic.svg"
+        res = self.cw_json("report", str(self.repo), "--days", "40000", "--window", "10000", "--svg", str(out))
+        v = res["verdict"]
+        self.assertEqual(v["level"], "crit")
+        self.assertTrue(v["headline"].startswith("Fix this first: "), v)
+        self.assertGreater(len(res["findings"]), 3)
+        root, texts = self._svg_texts(out)
+        ns = "{http://www.w3.org/2000/svg}"
+        order = ["".join(t.itertext()) for t in root.iter(ns + "text")]
+        at = lambda s: next(i for i, t in enumerate(order) if s in t)
+        self.assertLess(at(v["headline"]), at("Where the startup tokens come from"))
+        self.assertLess(at("Where the startup tokens come from"), at("What to do"))
+        self.assertLess(at("What to do"), at("Details"))
+        self.assertIn("1.", order)
+        self.assertIn("3.", order)
+        self.assertNotIn("4.", order)
+        self.assertIn(f"{len(res['findings']) - 3} more in the text report", texts)
+        tips = [t.text for t in root.iter(ns + "title")]
+        self.assertTrue(any(t and "; skill listing ~" in t for t in tips), tips)
+        self.assertIn("skill listing ~", texts)  # also written out, not only in a tooltip
+        text = self.run_cw("report", str(self.repo), "--days", "40000", "--window", "10000")
+        self.assertEqual(text.splitlines()[2], "Verdict: " + v["headline"])
+
+    def test_report_verdict_when_all_is_well(self):
+        write(self.repo / "AGENTS.md", "Run the tests.\n")
+        res = self.cw_json("report", str(self.repo), "--harness", "codex")
+        self.assertEqual((res["verdict"]["level"], res["findings"]), ("good", []))
+        self.assertIn("within target", res["verdict"]["headline"])
+
     def test_report_svg_hero_row_describes_one_agent(self):
         # Claude has the heavy file; Codex has more input. The tiles once mixed the two.
         write(self.repo / "CLAUDE.md", "a" * 60_000)
@@ -1100,8 +1943,8 @@ class CwTest(unittest.TestCase):
         rep = {"project": bad, "since": "2026-01-01", "days": 30, "target": 5000, "sessions": {},
                "files": {"claude": {"files": [{"path": bad + "/CLAUDE.md", "role": "project", "tokens": 9000}],
                                     "total_tokens": 9000, "repo_tokens": 9000, "warnings": [], "notes": []}},
-               "skills": {"claude": {"budget": 8000, "budget_unit": "chars", "chars": 8320, "tokens": 2000,
-                                     "window_source": "window"}},
+               "skills": {"claude": {"budget": 8000, "budget_unit": "chars", "chars": 8320, "used": 8320,
+                                     "tokens": 2000, "window_source": "--window"}},
                "findings": ["[claude] odd \x03 character"]}
         out = cw.write_picture(rep, str(self.tmp_path / "odd.svg"), "auto")
         _, texts = self._svg_texts(out)
@@ -1479,7 +2322,7 @@ class CwTest(unittest.TestCase):
         r = self.cw_json("files", str(self.repo), "--harness", "claude")["claude"]
         self.assertEqual(self.mine(r["files"]), [])
         s = self.cw_json("skills", str(self.repo), "--harness", "claude")["claude"]
-        self.assertEqual([h["name"] for h in s["heaviest"]], ["real-name"])
+        self.assertEqual([h["name"] for h in s["heaviest"]], ["dir-name (real-name)"])
 
     @unittest.skipIf(os.name == "nt" or (hasattr(os, "geteuid") and os.geteuid() == 0), "needs POSIX permissions")
     def test_unreadable_folder_does_not_crash(self):
@@ -1566,16 +2409,17 @@ class CwTest(unittest.TestCase):
                 "total_token_usage": {"total_tokens": 1}, "last_token_usage": {"input_tokens": 1},
                 "model_context_window": 400_000}}}])
         s = self.cw_json("skills", str(self.repo), "--harness", "claude,codex")
-        self.assertEqual(s["codex"]["budget"], 8_000)              # 2% of the window Codex reported
-        self.assertEqual(s["claude"]["window_source"], "default")  # no window in Claude logs: assumed
+        # 2% of the full window: Codex logs the 95% it lets a session use, so 400,000 is 421,053
+        self.assertEqual(s["codex"]["budget"], 8_421)
+        self.assertEqual(s["claude"]["window_source"], "assumed")  # no model in Claude logs or settings
         s = self.cw_json("skills", str(self.repo), "--harness", "claude,codex", "--window", "1000000")
-        # Claude Code budgets the listing in characters: 1% of the window at ~4 chars per token
-        self.assertEqual((s["claude"]["budget"], s["claude"]["budget_unit"]), (40_000, "chars"))
+        # Claude Code budgets the listing in columns: 1% of the window at 3 characters per token
+        self.assertEqual((s["claude"]["budget"], s["claude"]["budget_unit"]), (30_000, "chars"))
         # Codex records its own window; --window must not override it (it once did: 20,000)
-        self.assertEqual((s["codex"]["budget"], s["codex"]["budget_unit"]), (8_000, "tokens"))
+        self.assertEqual((s["codex"]["budget"], s["codex"]["budget_unit"]), (8_421, "tokens"))
         self.assertEqual(s["codex"]["window_source"], "codex logs")
         write(self.home / ".claude" / "settings.json", json.dumps({"skillListingBudgetFraction": 0.02}))
-        self.assertEqual(self.cw_json("skills", str(self.repo), "--harness", "claude")["claude"]["budget"], 16_000)
+        self.assertEqual(self.cw_json("skills", str(self.repo), "--harness", "claude")["claude"]["budget"], 60_000)
         self.env["SLASH_COMMAND_TOOL_CHAR_BUDGET"] = "123456"
         s = self.cw_json("skills", str(self.repo), "--harness", "claude")["claude"]
         self.assertEqual((s["budget"], s["basis"]), (123_456, "SLASH_COMMAND_TOOL_CHAR_BUDGET"))
