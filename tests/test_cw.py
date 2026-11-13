@@ -407,9 +407,9 @@ class CwTest(unittest.TestCase):
         self._skip_if_claude_md_above()
         self._git_repo()
         write(self.repo / ".gitignore", "CLAUDE.local.md\n")
-        write(self.repo / "AGENTS.md", rules("rule", 300))  # 30,600 bytes, under Codex's 32 KiB
+        write(self.repo / "AGENTS.md", rules("rule", 300), exact=True)  # 30,600 bytes, under Codex's 32 KiB
         self._commit("rules", "2026-01-01T00:00:00+00:00")
-        write(self.repo / "AGENTS.md", "short\n")
+        write(self.repo / "AGENTS.md", "short\n", exact=True)
         slim = self._commit("slim", "2026-02-01T00:00:00+00:00")
         args = ("report", str(self.repo), "--days", "40000", "--harness", "claude,codex")
         cut = {"before": 10_200, "after": 2, "now": 2}
